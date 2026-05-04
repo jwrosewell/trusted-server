@@ -16,7 +16,9 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
 fn provider_error_message(error: &Report<TrustedServerError>) -> String {
-    format!("{error:?}")
+    error
+        .current_context()
+        .to_string()
         .chars()
         .take(PROVIDER_ERROR_MESSAGE_CHARS)
         .collect()
@@ -739,7 +741,8 @@ mod tests {
     fn provider_error_response_includes_diagnostic_metadata() {
         let error = Report::new(TrustedServerError::Auction {
             message: "parse failed".to_string(),
-        });
+        })
+        .attach("internal/source.rs:12:34");
 
         let response = super::provider_error_response("prebid", 37, "parse_response", &error);
 
@@ -753,11 +756,37 @@ mod tests {
             serde_json::json!("parse_response"),
             "should include the provider error classification"
         );
+
+        let message = response.metadata["message"]
+            .as_str()
+            .expect("should include provider error message");
         assert!(
-            response.metadata["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("parse failed")),
-            "should include capped diagnostic detail"
+            message.contains("parse failed"),
+            "should include user-safe diagnostic detail"
+        );
+        assert!(
+            !message.contains("internal/source.rs"),
+            "should not include attached internal details"
+        );
+    }
+
+    #[test]
+    fn provider_error_message_truncates_user_safe_context() {
+        let long_message = "x".repeat(super::PROVIDER_ERROR_MESSAGE_CHARS + 100);
+        let error = Report::new(TrustedServerError::Auction {
+            message: long_message,
+        });
+
+        let message = super::provider_error_message(&error);
+
+        assert_eq!(
+            message.chars().count(),
+            super::PROVIDER_ERROR_MESSAGE_CHARS,
+            "should cap provider error messages"
+        );
+        assert!(
+            message.starts_with("Auction error: "),
+            "should preserve the current context display text"
         );
     }
 
