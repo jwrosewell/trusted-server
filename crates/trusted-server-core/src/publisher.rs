@@ -516,20 +516,24 @@ pub fn handle_publisher_request(
     let ec_allowed = allows_ec_creation(&consent_context);
     log::debug!("Proxy ec_allowed: {}", ec_allowed);
 
-    let backend_name = BackendConfig::from_url(
+    let origin_host_header = settings.publisher.origin_host_header_value();
+    let origin_rewrite_url = settings.publisher.origin_rewrite_url();
+    let backend_name = BackendConfig::from_url_with_first_byte_timeout_and_override_host(
         &settings.publisher.origin_url,
         settings.proxy.certificate_check,
+        crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT,
+        Some(&origin_host_header),
     )?;
-    let origin_host = settings.publisher.origin_host();
 
     log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
+        "Proxying to dynamic backend: {} (from {}, Host: {})",
         backend_name,
-        settings.publisher.origin_url
+        settings.publisher.origin_url,
+        origin_host_header
     );
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
-    req.set_header("host", &origin_host);
+    req.set_header("host", &origin_host_header);
 
     let mut response = req
         .send(&backend_name)
@@ -614,7 +618,7 @@ pub fn handle_publisher_request(
         ResponseRoute::Stream => {
             log::debug!(
                 "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-                content_type, content_encoding, request_host, origin_host
+                content_type, content_encoding, request_host, origin_host_header
             );
 
             let body = response.take_body();
@@ -625,8 +629,8 @@ pub fn handle_publisher_request(
                 body,
                 params: OwnedProcessResponseParams {
                     content_encoding,
-                    origin_host,
-                    origin_url: settings.publisher.origin_url.clone(),
+                    origin_host: origin_host_header,
+                    origin_url: origin_rewrite_url,
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
@@ -636,14 +640,14 @@ pub fn handle_publisher_request(
         ResponseRoute::BufferedProcessed => {
             log::debug!(
                 "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-                content_type, content_encoding, request_host, origin_host
+                content_type, content_encoding, request_host, origin_host_header
             );
 
             let body = response.take_body();
             let params = ProcessResponseParams {
                 content_encoding: &content_encoding,
-                origin_host: &origin_host,
-                origin_url: &settings.publisher.origin_url,
+                origin_host: &origin_host_header,
+                origin_url: &origin_rewrite_url,
                 request_host,
                 request_scheme,
                 settings,

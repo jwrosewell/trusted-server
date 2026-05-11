@@ -15,8 +15,8 @@ use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
@@ -207,6 +207,10 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
+    let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+        .then(|| settings.asset_route_for_path(&path))
+        .flatten();
+
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
         // Serve the tsjs library
@@ -263,62 +267,72 @@ async fn route_request(
                 }))
             }),
 
-        // No known route matched, proxy to publisher origin as fallback
+        // No known route matched, proxy to an asset origin or publisher origin as fallback
         _ => {
-            log::info!(
-                "No known route matched for path: {}, proxying to publisher origin",
-                path
-            );
+            if let Some(asset_route) = matched_asset_route {
+                log::info!(
+                    "No explicit route matched for path: {}, proxying via asset route prefix {} to {}",
+                    path,
+                    asset_route.prefix,
+                    asset_route.origin_url
+                );
+                handle_asset_proxy_request(settings, runtime_services, req, asset_route).await
+            } else {
+                log::info!(
+                    "No known route matched for path: {}, proxying to publisher origin",
+                    path
+                );
 
-            match runtime_services_for_consent_route(settings, runtime_services) {
-                Ok(publisher_services) => {
-                    match handle_publisher_request(
-                        settings,
-                        integration_registry,
-                        &publisher_services,
-                        req,
-                    ) {
-                        Ok(PublisherResponse::Stream {
-                            mut response,
-                            body,
-                            params,
-                        }) => {
-                            // Streaming path: finalize headers, then stream body to client.
-                            finalize_response(settings, geo_info.as_ref(), &mut response);
-                            let mut streaming_body = response.stream_to_client();
-                            if let Err(e) = stream_publisher_body(
+                match runtime_services_for_consent_route(settings, runtime_services) {
+                    Ok(publisher_services) => {
+                        match handle_publisher_request(
+                            settings,
+                            integration_registry,
+                            &publisher_services,
+                            req,
+                        ) {
+                            Ok(PublisherResponse::Stream {
+                                mut response,
                                 body,
-                                &mut streaming_body,
-                                &params,
-                                settings,
-                                integration_registry,
-                            ) {
-                                // Headers already committed. Log and abort — client
-                                // sees a truncated response. Standard proxy behavior.
-                                log::error!("Streaming processing failed: {e:?}");
-                                drop(streaming_body);
-                            } else if let Err(e) = streaming_body.finish() {
-                                log::error!("Failed to finish streaming body: {e}");
+                                params,
+                            }) => {
+                                // Streaming path: finalize headers, then stream body to client.
+                                finalize_response(settings, geo_info.as_ref(), &mut response);
+                                let mut streaming_body = response.stream_to_client();
+                                if let Err(e) = stream_publisher_body(
+                                    body,
+                                    &mut streaming_body,
+                                    &params,
+                                    settings,
+                                    integration_registry,
+                                ) {
+                                    // Headers already committed. Log and abort — client
+                                    // sees a truncated response. Standard proxy behavior.
+                                    log::error!("Streaming processing failed: {e:?}");
+                                    drop(streaming_body);
+                                } else if let Err(e) = streaming_body.finish() {
+                                    log::error!("Failed to finish streaming body: {e}");
+                                }
+                                // Response already sent via stream_to_client()
+                                return None;
                             }
-                            // Response already sent via stream_to_client()
-                            return None;
-                        }
-                        Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                            // Binary pass-through: reattach body and send via send_to_client().
-                            // This preserves Content-Length and avoids chunked encoding overhead.
-                            // Fastly streams the body from its internal buffer — no WASM
-                            // memory buffering occurs.
-                            response.set_body(body);
-                            Ok(response)
-                        }
-                        Ok(PublisherResponse::Buffered(response)) => Ok(response),
-                        Err(e) => {
-                            log::error!("Failed to proxy to publisher origin: {:?}", e);
-                            Err(e)
+                            Ok(PublisherResponse::PassThrough { mut response, body }) => {
+                                // Binary pass-through: reattach body and send via send_to_client().
+                                // This preserves Content-Length and avoids chunked encoding overhead.
+                                // Fastly streams the body from its internal buffer — no WASM
+                                // memory buffering occurs.
+                                response.set_body(body);
+                                Ok(response)
+                            }
+                            Ok(PublisherResponse::Buffered(response)) => Ok(response),
+                            Err(e) => {
+                                log::error!("Failed to proxy to publisher origin: {:?}", e);
+                                Err(e)
+                            }
                         }
                     }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
         }
     };

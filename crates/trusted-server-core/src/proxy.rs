@@ -18,7 +18,7 @@ use crate::error::TrustedServerError;
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices,
 };
-use crate::settings::Settings;
+use crate::settings::{ProxyAssetRoute, Settings};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
@@ -37,6 +37,25 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_ACCEPT_LANGUAGE,
     HEADER_REFERER,
     HEADER_X_FORWARDED_FOR,
+];
+
+/// Curated request headers preserved for asset proxying.
+///
+/// Unlike the HTML publisher fallback, asset requests need cache validation and
+/// byte-range semantics to keep 304/206 responses working for browsers.
+const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 12] = [
+    HEADER_USER_AGENT,
+    HEADER_ACCEPT,
+    HEADER_ACCEPT_ENCODING,
+    HEADER_ACCEPT_LANGUAGE,
+    HEADER_REFERER,
+    HEADER_X_FORWARDED_FOR,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_MATCH,
+    header::IF_UNMODIFIED_SINCE,
+    header::RANGE,
+    header::IF_RANGE,
 ];
 
 /// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
@@ -492,6 +511,156 @@ pub async fn proxy_request(
         stream_passthrough,
     )
     .await
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn build_asset_proxy_target_url(
+    route: &ProxyAssetRoute,
+    path: &str,
+    query: &str,
+) -> Result<url::Url, Report<TrustedServerError>> {
+    let mut target_url =
+        url::Url::parse(&route.origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("Invalid asset origin_url: {}", route.origin_url),
+        })?;
+
+    let scheme = target_url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: format!("Unsupported asset origin_url scheme: {scheme}"),
+        }));
+    }
+
+    if target_url.host_str().is_none() {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset origin_url".to_string(),
+        }));
+    }
+
+    let target_path = route.target_path_for(path)?;
+    target_url.set_path(&target_path);
+    if query.is_empty() {
+        target_url.set_query(None);
+    } else {
+        target_url.set_query(Some(query));
+    }
+
+    Ok(target_url)
+}
+
+fn asset_origin_host_header(
+    target_url: &url::Url,
+) -> Result<HeaderValue, Report<TrustedServerError>> {
+    let scheme = target_url.scheme();
+    let host = target_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset target URL".to_string(),
+        })
+    })?;
+    let resolved_port = target_url.port_or_known_default().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: format!("Unsupported asset target URL scheme: {scheme}"),
+        })
+    })?;
+    let host_header = if Some(resolved_port) == default_port_for_scheme(scheme) {
+        host.to_string()
+    } else {
+        format!("{host}:{resolved_port}")
+    };
+
+    HeaderValue::from_str(&host_header).change_context(TrustedServerError::InvalidHeaderValue {
+        message: format!("invalid asset Host header value: {host_header}"),
+    })
+}
+
+/// Proxy a configured first-party asset path to its matched asset origin.
+///
+/// This is a lean raw pass-through path: it preserves status/body/headers,
+/// does not follow redirects, and bypasses publisher-page processing.
+///
+/// # Errors
+///
+/// Returns an error if the configured origin URL is invalid, backend
+/// registration fails, or the upstream request cannot be sent.
+pub async fn handle_asset_proxy_request(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: Request,
+    route: &ProxyAssetRoute,
+) -> Result<Response, Report<TrustedServerError>> {
+    let target_url =
+        build_asset_proxy_target_url(route, req.get_path(), req.get_query_str().unwrap_or(""))?;
+    let scheme = target_url.scheme();
+    let host = target_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset target URL".to_string(),
+        })
+    })?;
+
+    let backend_name = services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port: target_url.port(),
+            certificate_check: settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "asset backend registration failed".to_string(),
+        })?;
+
+    let mut builder = edge_request_builder().method(req.get_method().clone()).uri(
+        target_url
+            .as_str()
+            .parse::<EdgeUri>()
+            .change_context(TrustedServerError::Proxy {
+                message: "invalid asset target URL".to_string(),
+            })?,
+    );
+
+    let mut outbound_headers = http::HeaderMap::new();
+    for header_name in ASSET_PROXY_FORWARD_HEADERS {
+        if let Some(value) = req.get_header(&header_name) {
+            outbound_headers.insert(header_name, value.clone());
+        }
+    }
+    outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
+
+    for (name, value) in &outbound_headers {
+        builder = builder.header(name, value);
+    }
+
+    let edge_req =
+        builder
+            .body(EdgeBody::from(Vec::new()))
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to build asset proxy request".to_string(),
+            })?;
+
+    let platform_resp = services
+        .http_client()
+        .send(PlatformHttpRequest::new(edge_req, backend_name))
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to proxy asset request".to_string(),
+        })?;
+
+    let mut response = platform_response_to_fastly(platform_resp)?;
+
+    // Asset origins must not be able to set first-party cookies or publisher
+    // domain transport security policy through this proxy path.
+    response.remove_header(header::SET_COOKIE);
+    response.remove_header(header::STRICT_TRANSPORT_SECURITY);
+
+    Ok(response)
 }
 
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
@@ -1250,6 +1419,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
+        asset_origin_host_header, build_asset_proxy_target_url, handle_asset_proxy_request,
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
@@ -1258,11 +1428,14 @@ mod tests {
     use crate::constants::HEADER_ACCEPT;
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::{build_services_with_http_client, noop_services};
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
         PlatformResponse, PlatformSelectResult,
     };
+    use crate::settings::ProxyAssetRoute;
     use crate::test_support::tests::create_test_settings;
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
@@ -2086,6 +2259,265 @@ mod tests {
             header_value("accept-encoding").as_deref(),
             Some(SUPPORTED_ENCODINGS),
             "should override Accept-Encoding with supported encodings"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_preserves_path_and_query() {
+        let route = ProxyAssetRoute {
+            prefix: "/.images/".to_string(),
+            origin_url: "https://assets.example.com".to_string(),
+            ..Default::default()
+        };
+        let target_url =
+            build_asset_proxy_target_url(&route, "/.images/foo.jpg", "auto=webp&width=800")
+                .expect("should build asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://assets.example.com/.images/foo.jpg?auto=webp&width=800",
+            "should preserve the incoming path and query exactly"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_applies_cdn_style_rewrite() {
+        let route = ProxyAssetRoute {
+            prefix: "/.image/".to_string(),
+            origin_url: "https://assets-cdn.example.com".to_string(),
+            path_pattern: Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string()),
+            target_path: Some("/image/upload/$1.$2".to_string()),
+        };
+        let target_url = build_asset_proxy_target_url(
+            &route,
+            "/.image/c_fit,w_1440/MjA/example.jpg",
+            "auto=webp",
+        )
+        .expect("should build rewritten asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://assets-cdn.example.com/image/upload/c_fit,w_1440/MjA.jpg?auto=webp",
+            "should rewrite the path generically while preserving query parameters"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_applies_static_prefix_rewrite() {
+        let route = ProxyAssetRoute {
+            prefix: "/_next/static/".to_string(),
+            origin_url: "https://static-assets.example.com".to_string(),
+            path_pattern: Some(r"^(.*)$".to_string()),
+            target_path: Some("/_network$1".to_string()),
+        };
+        let target_url = build_asset_proxy_target_url(&route, "/_next/static/chunks/app.js", "")
+            .expect("should build rewritten static asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://static-assets.example.com/_network/_next/static/chunks/app.js",
+            "should prepend the configured upstream path prefix"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_errors_when_rewrite_pattern_misses() {
+        let route = ProxyAssetRoute {
+            prefix: "/.image/".to_string(),
+            origin_url: "https://assets.example.com".to_string(),
+            path_pattern: Some(r"^/\.image/(.*)\.jpg$".to_string()),
+            target_path: Some("/image/upload/$1.jpg".to_string()),
+        };
+        let err = build_asset_proxy_target_url(&route, "/.image/foo.png", "")
+            .expect_err("should reject paths that do not match the configured rewrite");
+
+        assert!(
+            format!("{err:?}").contains("did not match path_pattern"),
+            "should explain the rewrite miss: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_errors_when_rewrite_omits_leading_slash() {
+        let route = ProxyAssetRoute {
+            prefix: "/assets/".to_string(),
+            origin_url: "https://assets.example.com".to_string(),
+            path_pattern: Some(r"^/assets/(.*)$".to_string()),
+            target_path: Some("$1".to_string()),
+        };
+        let err = build_asset_proxy_target_url(&route, "/assets/app.js", "")
+            .expect_err("should reject rewritten paths without a leading slash");
+
+        assert!(
+            format!("{err:?}").contains("must start with '/'"),
+            "should explain the invalid rewritten path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn asset_origin_host_header_omits_standard_port() {
+        let target_url = url::Url::parse("https://assets.example.com/.images/foo.jpg")
+            .expect("should parse URL");
+        let host = asset_origin_host_header(&target_url).expect("should compute Host header");
+        assert_eq!(
+            host.to_str().expect("should serialize Host header"),
+            "assets.example.com",
+            "should omit standard HTTPS port from Host header"
+        );
+    }
+
+    #[test]
+    fn asset_origin_host_header_includes_non_standard_port() {
+        let target_url = url::Url::parse("https://assets.example.com:8443/.images/foo.jpg")
+            .expect("should parse URL");
+        let host = asset_origin_host_header(&target_url).expect("should compute Host header");
+        assert_eq!(
+            host.to_str().expect("should serialize Host header"),
+            "assets.example.com:8443",
+            "should include non-standard port in Host header"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_asset_proxy_request_forwards_asset_headers_and_host() {
+        use crate::platform::test_support::StubHttpClient;
+
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let mut req = Request::new(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?auto=webp",
+        );
+        req.set_header(header::USER_AGENT, "asset-agent/1.0");
+        req.set_header(header::ACCEPT, "image/avif,image/webp,image/*,*/*;q=0.8");
+        req.set_header(header::ACCEPT_ENCODING, "gzip, br");
+        req.set_header(header::ACCEPT_LANGUAGE, "en-US");
+        req.set_header(header::REFERER, "https://www.example.com/article");
+        req.set_header(header::IF_NONE_MATCH, "\"asset-etag\"");
+        req.set_header(header::IF_MODIFIED_SINCE, "Thu, 13 Mar 2025 08:00:00 GMT");
+        req.set_header(header::IF_MATCH, "\"asset-precondition\"");
+        req.set_header(header::IF_UNMODIFIED_SINCE, "Thu, 13 Mar 2025 09:00:00 GMT");
+        req.set_header(header::RANGE, "bytes=0-1023");
+        req.set_header(header::IF_RANGE, "\"asset-range\"");
+        req.set_header(header::HeaderName::from_static("x-custom-test"), "drop-me");
+
+        let route = ProxyAssetRoute {
+            prefix: "/.images/".to_string(),
+            origin_url: "https://assets.example.com:8443".to_string(),
+            ..Default::default()
+        };
+        let response = handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy asset request");
+        assert_eq!(response.get_status(), StatusCode::OK);
+
+        let all_headers = stub.recorded_request_headers();
+        assert_eq!(all_headers.len(), 1, "should have captured one request");
+        let sent = &all_headers[0];
+        let header_value = |name: &str| -> Option<String> {
+            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            header_value("user-agent").as_deref(),
+            Some("asset-agent/1.0"),
+            "should forward User-Agent"
+        );
+        assert_eq!(
+            header_value("accept-encoding").as_deref(),
+            Some("gzip, br"),
+            "should preserve the incoming Accept-Encoding"
+        );
+        assert_eq!(
+            header_value("if-none-match").as_deref(),
+            Some("\"asset-etag\""),
+            "should forward conditional ETag validation headers"
+        );
+        assert_eq!(
+            header_value("if-modified-since").as_deref(),
+            Some("Thu, 13 Mar 2025 08:00:00 GMT"),
+            "should forward conditional date validation headers"
+        );
+        assert_eq!(
+            header_value("if-match").as_deref(),
+            Some("\"asset-precondition\""),
+            "should forward precondition headers"
+        );
+        assert_eq!(
+            header_value("if-unmodified-since").as_deref(),
+            Some("Thu, 13 Mar 2025 09:00:00 GMT"),
+            "should forward date precondition headers"
+        );
+        assert_eq!(
+            header_value("range").as_deref(),
+            Some("bytes=0-1023"),
+            "should forward byte-range requests"
+        );
+        assert_eq!(
+            header_value("if-range").as_deref(),
+            Some("\"asset-range\""),
+            "should forward range validators"
+        );
+        assert_eq!(
+            header_value("host").as_deref(),
+            Some("assets.example.com:8443"),
+            "should override Host to the asset origin host"
+        );
+        assert!(
+            header_value("x-custom-test").is_none(),
+            "should not forward unrelated custom headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_asset_proxy_request_strips_unsafe_response_headers() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            Vec::new(),
+            vec![
+                (header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure"),
+                (header::SET_COOKIE.as_str(), "other=2; Path=/; Secure"),
+                (
+                    header::STRICT_TRANSPORT_SECURITY.as_str(),
+                    "max-age=31536000; includeSubDomains; preload",
+                ),
+                (header::ETAG.as_str(), "\"asset-etag\""),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+
+        let route = ProxyAssetRoute {
+            prefix: "/.images/".to_string(),
+            origin_url: "https://assets.example.com".to_string(),
+            ..Default::default()
+        };
+        let response = handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy asset request");
+
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "should strip upstream Set-Cookie headers from asset responses"
+        );
+        assert!(
+            response
+                .get_header(header::STRICT_TRANSPORT_SECURITY)
+                .is_none(),
+            "should strip upstream HSTS headers from asset responses"
+        );
+        assert_eq!(
+            response.get_header_str(header::ETAG),
+            Some("\"asset-etag\""),
+            "should preserve safe cache validator headers on asset responses"
         );
     }
 
