@@ -35,6 +35,12 @@ fn provider_error_response(
         .with_metadata("message", serde_json::json!(provider_error_message(error)))
 }
 
+fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!("launch_failed"))
+        .with_metadata("message", serde_json::json!("Provider launch failed"))
+}
+
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,
@@ -382,11 +388,9 @@ impl AuctionOrchestrator {
                         provider.provider_name(),
                         e
                     );
-                    responses.push(provider_error_response(
+                    responses.push(provider_launch_failed_response(
                         provider.provider_name(),
                         response_time_ms,
-                        "launch_failed",
-                        &e,
                     ));
                 }
             }
@@ -767,6 +771,27 @@ mod tests {
         assert!(
             !message.contains("internal/source.rs"),
             "should not include attached internal details"
+        );
+    }
+
+    #[test]
+    fn launch_failed_response_has_safe_static_message() {
+        let response = super::provider_launch_failed_response("prebid", 58);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark launch failures as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("launch_failed"),
+            "should include launch_failed classification"
+        );
+        assert_eq!(
+            response.metadata["message"],
+            serde_json::json!("Provider launch failed"),
+            "should use a safe, stable public launch failure message"
         );
     }
 
