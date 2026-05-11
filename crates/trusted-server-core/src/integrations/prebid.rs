@@ -45,8 +45,14 @@ const DEFAULT_CURRENCY: &str = "USD";
 /// debug-facing `body_preview` metadata.
 const PREBID_ERROR_BODY_PREVIEW_CHARS: usize = 1000;
 
+/// Maximum number of bytes processed when constructing debug-facing upstream
+/// failure previews.
+const PREBID_ERROR_BODY_PREVIEW_BYTES: usize = PREBID_ERROR_BODY_PREVIEW_CHARS * 4;
+
 fn prebid_body_preview(body: &[u8]) -> String {
-    String::from_utf8_lossy(body)
+    let bounded_body = &body[..body.len().min(PREBID_ERROR_BODY_PREVIEW_BYTES)];
+
+    String::from_utf8_lossy(bounded_body)
         .chars()
         .take(PREBID_ERROR_BODY_PREVIEW_CHARS)
         .collect()
@@ -1493,22 +1499,23 @@ impl AuctionProvider for PrebidAuctionProvider {
         let body_bytes = response.take_body_bytes();
 
         if !status.is_success() {
-            let body_preview = prebid_body_preview(&body_bytes);
             log::warn!(
                 "Prebid returned non-success status: {status}; {} bytes",
                 body_bytes.len()
             );
-            if self.config.debug && !body_preview.is_empty() {
-                log::debug!("Prebid non-success response body: {body_preview}");
-            }
 
             let mut auction_response =
                 AuctionResponse::error(PREBID_INTEGRATION_ID, response_time_ms)
                     .with_metadata("error_type", serde_json::json!("http_status"))
                     .with_metadata("http_status", serde_json::json!(status.as_u16()));
-            if self.config.debug && !body_preview.is_empty() {
-                auction_response =
-                    auction_response.with_metadata("body_preview", serde_json::json!(body_preview));
+
+            if self.config.debug {
+                let body_preview = prebid_body_preview(&body_bytes);
+                if !body_preview.is_empty() {
+                    log::debug!("Prebid non-success response body: {body_preview}");
+                    auction_response = auction_response
+                        .with_metadata("body_preview", serde_json::json!(body_preview));
+                }
             }
 
             return Ok(auction_response);
@@ -3173,6 +3180,24 @@ server_url = "https://prebid.example"
         assert_eq!(
             preview, "ok\u{fffd}!",
             "should replace invalid UTF-8 bytes without panicking"
+        );
+    }
+
+    #[test]
+    fn prebid_body_preview_ignores_bytes_after_bounded_slice() {
+        let mut body = vec![b'x'; PREBID_ERROR_BODY_PREVIEW_BYTES];
+        body.extend_from_slice(&[0xff, b't', b'a', b'i', b'l']);
+
+        let preview = prebid_body_preview(&body);
+
+        assert_eq!(
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should keep the public preview capped"
+        );
+        assert!(
+            !preview.contains('\u{fffd}') && !preview.contains("tail"),
+            "should not process bytes beyond the bounded preview slice"
         );
     }
 
