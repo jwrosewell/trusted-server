@@ -359,7 +359,7 @@ mod tests {
                 page_url: Some("https://test-publisher.com".to_string()),
             },
             user: UserInfo {
-                id: "synthetic-id".to_string(),
+                id: "ec-id".to_string(),
                 fresh_id: "fresh-id".to_string(),
                 consent: Some(ConsentContext::default()),
             },
@@ -634,7 +634,7 @@ mod tests {
         );
         assert_eq!(
             response.get_header_str(HEADER_X_TS_EC),
-            Some("synthetic-id"),
+            Some("ec-id"),
             "should set EC ID header"
         );
         assert_eq!(
