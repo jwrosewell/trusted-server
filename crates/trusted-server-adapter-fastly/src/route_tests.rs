@@ -7,7 +7,6 @@ use fastly::http::{header, StatusCode};
 use fastly::Request;
 use serde_json::json;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
-use trusted_server_core::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -388,64 +387,14 @@ fn valid_auction_request_with_no_providers_returns_bad_gateway() {
 }
 
 #[test]
-fn valid_auction_request_with_unregistered_provider_returns_success_empty_openrtb_response() {
+fn valid_auction_request_with_unregistered_provider_returns_bad_gateway() {
     let settings = create_auction_test_settings_without_consent_store(r#"["missing-provider"]"#);
 
-    let mut response = route_auction(&settings, valid_banner_ad_unit_body());
+    let response = route_auction(&settings, valid_banner_ad_unit_body());
 
     assert_eq!(
         response.get_status(),
-        StatusCode::OK,
-        "should produce a successful empty OpenRTB response when configured providers are skipped"
-    );
-    assert_eq!(
-        response.get_header_str(header::CONTENT_TYPE),
-        Some("application/json"),
-        "should return JSON for successful auction responses"
-    );
-    assert!(
-        response.get_header_str(HEADER_X_TS_EC).is_some(),
-        "should include the auction EC identifier header"
-    );
-    assert!(
-        response.get_header_str(HEADER_X_TS_EC_FRESH).is_some(),
-        "should include the fresh EC identifier header"
-    );
-
-    let body: serde_json::Value = serde_json::from_str(&response.take_body_str())
-        .expect("should parse successful auction response JSON");
-    assert!(
-        body.get("id").and_then(serde_json::Value::as_str).is_some(),
-        "should include an OpenRTB response id"
-    );
-    assert!(
-        body.get("seatbid")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(Vec::is_empty),
-        "should not include bid entries when there are no bids"
-    );
-    assert!(
-        body.pointer("/ext/orchestrator/strategy")
-            .and_then(serde_json::Value::as_str)
-            .is_some(),
-        "should include orchestrator strategy metadata"
-    );
-    assert_eq!(
-        body.pointer("/ext/orchestrator/providers")
-            .and_then(serde_json::Value::as_u64),
-        Some(0),
-        "should report no provider responses"
-    );
-    assert_eq!(
-        body.pointer("/ext/orchestrator/total_bids")
-            .and_then(serde_json::Value::as_u64),
-        Some(0),
-        "should report no bids"
-    );
-    assert!(
-        body.pointer("/ext/orchestrator/time_ms")
-            .and_then(serde_json::Value::as_u64)
-            .is_some(),
-        "should include orchestration timing metadata"
+        StatusCode::BAD_GATEWAY,
+        "should fail when configured providers cannot be launched"
     );
 }

@@ -362,6 +362,12 @@ impl AuctionOrchestrator {
             }
         }
 
+        if pending_requests.is_empty() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: "No provider requests launched".to_string(),
+            }));
+        }
+
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
         log::info!(
             "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
