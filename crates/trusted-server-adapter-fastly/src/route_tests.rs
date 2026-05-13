@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::StatusCode;
-use fastly::Request;
+use fastly::http::{header, StatusCode};
+use fastly::{Request, Response};
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
@@ -118,7 +118,18 @@ impl PlatformGeo for NoopGeo {
 }
 
 fn create_test_settings() -> Settings {
-    let settings = Settings::from_toml(
+    create_test_settings_with_consent_store(Some("missing-consent-store"))
+}
+
+fn create_test_settings_without_consent_store() -> Settings {
+    create_test_settings_with_consent_store(None)
+}
+
+fn create_test_settings_with_consent_store(consent_store: Option<&str>) -> Settings {
+    let consent_config = consent_store
+        .map(|store| format!("\n            [consent]\n            consent_store = \"{store}\"\n"))
+        .unwrap_or_default();
+    let settings = Settings::from_toml(&format!(
         r#"
             [[handlers]]
             path = "^/admin"
@@ -138,10 +149,7 @@ fn create_test_settings() -> Settings {
             enabled = false
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
-
-            [consent]
-            consent_store = "missing-consent-store"
-
+            {consent_config}
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
@@ -151,7 +159,7 @@ fn create_test_settings() -> Settings {
             providers = ["prebid"]
             timeout_ms = 2000
         "#,
-    )
+    ))
     .expect("should parse adapter route test settings");
 
     assert_eq!(
@@ -160,6 +168,32 @@ fn create_test_settings() -> Settings {
     );
 
     settings
+}
+
+fn build_route_stack(
+    settings: &Settings,
+) -> (
+    trusted_server_core::auction::AuctionOrchestrator,
+    IntegrationRegistry,
+) {
+    let orchestrator = build_orchestrator(settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(settings).expect("should create integration registry");
+
+    (orchestrator, integration_registry)
+}
+
+fn route_with_settings(settings: &Settings, req: Request) -> Option<Response> {
+    let (orchestrator, integration_registry) = build_route_stack(settings);
+    let runtime_services = test_runtime_services(&req);
+
+    futures::executor::block_on(route_request(
+        settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        req,
+    ))
 }
 
 fn test_runtime_services(req: &Request) -> RuntimeServices {
@@ -179,21 +213,110 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
 }
 
 #[test]
+fn static_tsjs_route_serves_unified_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=tsjs-unified.min.js");
+
+    let mut resp = route_with_settings(&settings, req).expect("should route static tsjs request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should serve the unified static bundle"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CONTENT_TYPE),
+        Some("application/javascript; charset=utf-8"),
+        "should serve the unified bundle as JavaScript"
+    );
+    assert!(
+        !resp.take_body_str().is_empty(),
+        "should serve non-empty unified bundle content"
+    );
+}
+
+#[test]
+fn static_tsjs_route_returns_not_found_for_unknown_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=unknown.js");
+
+    let resp = route_with_settings(&settings, req).expect("should route static tsjs request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::NOT_FOUND,
+        "should let the static tsjs branch own unknown bundle paths"
+    );
+}
+
+#[test]
+fn discovery_route_is_public() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/.well-known/trusted-server.json");
+
+    let resp = route_with_settings(&settings, req).expect("should route discovery request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should keep discovery available without authentication"
+    );
+}
+
+#[test]
+fn admin_route_rejects_unauthenticated_request() {
+    let settings = create_test_settings();
+    let req = Request::post("https://test.com/admin/keys/rotate");
+
+    let resp = route_with_settings(&settings, req).expect("should route admin request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::UNAUTHORIZED,
+        "should reject unauthenticated admin requests before handler dispatch"
+    );
+    assert!(
+        resp.get_header_str(header::WWW_AUTHENTICATE).is_some(),
+        "should advertise the Basic auth challenge"
+    );
+}
+
+#[test]
+fn auction_route_dispatches_to_consent_dependent_path() {
+    let settings = create_test_settings();
+    let req = Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#);
+
+    let resp = route_with_settings(&settings, req).expect("should route auction request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "should reach the auction route and fail opening configured consent persistence"
+    );
+}
+
+#[test]
+fn unknown_route_falls_back_to_publisher_proxy_path() {
+    let settings = create_test_settings_without_consent_store();
+    let req = Request::get("https://test.com/articles/example");
+
+    let resp = route_with_settings(&settings, req).expect("should route publisher fallback");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should reach publisher proxy fallback and fail as an origin proxy error"
+    );
+}
+
+#[test]
 fn configured_missing_consent_store_only_breaks_consent_routes() {
     let settings = create_test_settings();
-    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
-    let integration_registry =
-        IntegrationRegistry::new(&settings).expect("should create integration registry");
 
-    let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
-    let discovery_services = test_runtime_services(&discovery_req);
-    let discovery_resp = futures::executor::block_on(route_request(
+    let discovery_resp = route_with_settings(
         &settings,
-        &orchestrator,
-        &integration_registry,
-        &discovery_services,
-        discovery_req,
-    ))
+        Request::get("https://test.com/.well-known/trusted-server.json"),
+    )
     .expect("should route discovery request");
     assert_eq!(
         discovery_resp.get_status(),
@@ -201,15 +324,10 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         "should keep discovery available when the consent store is unavailable"
     );
 
-    let admin_req = Request::post("https://test.com/admin/keys/rotate");
-    let admin_services = test_runtime_services(&admin_req);
-    let admin_resp = futures::executor::block_on(route_request(
+    let admin_resp = route_with_settings(
         &settings,
-        &orchestrator,
-        &integration_registry,
-        &admin_services,
-        admin_req,
-    ))
+        Request::post("https://test.com/admin/keys/rotate"),
+    )
     .expect("should route admin request");
     assert_eq!(
         admin_resp.get_status(),
@@ -217,15 +335,10 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         "should keep admin auth behavior unchanged when the consent store is unavailable"
     );
 
-    let auction_req = Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#);
-    let auction_services = test_runtime_services(&auction_req);
-    let auction_resp = futures::executor::block_on(route_request(
+    let auction_resp = route_with_settings(
         &settings,
-        &orchestrator,
-        &integration_registry,
-        &auction_services,
-        auction_req,
-    ))
+        Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#),
+    )
     .expect("should return an error response for auction requests");
     assert_eq!(
         auction_resp.get_status(),
@@ -233,16 +346,9 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         "should fail auction requests when consent persistence is configured but unavailable"
     );
 
-    let publisher_req = Request::get("https://test.com/articles/example");
-    let publisher_services = test_runtime_services(&publisher_req);
-    let publisher_resp = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &publisher_services,
-        publisher_req,
-    ))
-    .expect("should return an error response for publisher fallback");
+    let publisher_resp =
+        route_with_settings(&settings, Request::get("https://test.com/articles/example"))
+            .expect("should return an error response for publisher fallback");
     assert_eq!(
         publisher_resp.get_status(),
         StatusCode::SERVICE_UNAVAILABLE,
