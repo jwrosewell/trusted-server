@@ -37,7 +37,7 @@ pub async fn handle_auction(
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse request body
     let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Auction {
+        TrustedServerError::BadRequest {
             message: "Failed to parse auction request body".to_string(),
         },
     )?;

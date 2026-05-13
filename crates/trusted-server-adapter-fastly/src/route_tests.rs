@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::StatusCode;
+use fastly::http::{header, StatusCode};
 use fastly::Request;
-use trusted_server_core::auction::build_orchestrator;
+use serde_json::json;
+use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -162,6 +164,46 @@ fn create_test_settings() -> Settings {
     settings
 }
 
+fn create_auction_test_settings_without_consent_store(providers: &str) -> Settings {
+    let config = format!(
+        r#"
+            [[handlers]]
+            path = "^/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [edge_cookie]
+            secret_key = "test-secret-key"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [auction]
+            enabled = true
+            providers = {providers}
+            timeout_ms = 2000
+        "#,
+    );
+
+    Settings::from_toml(&config).expect("should parse adapter auction route test settings")
+}
+
+fn build_route_stack(settings: &Settings) -> (AuctionOrchestrator, IntegrationRegistry) {
+    let orchestrator = build_orchestrator(settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(settings).expect("should create integration registry");
+
+    (orchestrator, integration_registry)
+}
+
 fn test_runtime_services(req: &Request) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(StubJwksConfigStore))
@@ -176,6 +218,45 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
             tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
         })
         .build()
+}
+
+fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
+    let (orchestrator, integration_registry) = build_route_stack(settings);
+    let req = Request::post("https://test.com/auction")
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_body(body.into());
+    let services = test_runtime_services(&req);
+
+    futures::executor::block_on(route_request(
+        settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route auction request")
+}
+
+fn valid_banner_ad_unit_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "adUnits": [
+            {
+                "code": "div-gpt-ad-1",
+                "mediaTypes": {
+                    "banner": {
+                        "sizes": [[300, 250]]
+                    }
+                },
+                "bids": [
+                    {
+                        "bidder": "missing-provider",
+                        "params": {}
+                    }
+                ]
+            }
+        ]
+    }))
+    .expect("should serialize valid auction route test body")
 }
 
 #[test]
@@ -247,5 +328,124 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         publisher_resp.get_status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "should scope consent store failures to the consent-dependent routes"
+    );
+}
+
+#[test]
+fn malformed_auction_json_returns_bad_request() {
+    let settings = create_auction_test_settings_without_consent_store(r#"["missing-provider"]"#);
+
+    let mut response = route_auction(&settings, "{not-json");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject malformed JSON as a client request error"
+    );
+    assert!(
+        response.take_body_str().contains("Bad request"),
+        "should return a client-facing bad request message"
+    );
+}
+
+#[test]
+fn invalid_auction_banner_size_returns_bad_request() {
+    let settings = create_auction_test_settings_without_consent_store(r#"["missing-provider"]"#);
+    let body = serde_json::to_vec(&json!({
+        "adUnits": [
+            {
+                "code": "div-gpt-ad-1",
+                "mediaTypes": {
+                    "banner": {
+                        "sizes": [[300]]
+                    }
+                }
+            }
+        ]
+    }))
+    .expect("should serialize invalid auction route test body");
+
+    let response = route_auction(&settings, body);
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject semantically invalid banner sizes as a client request error"
+    );
+}
+
+#[test]
+fn valid_auction_request_with_no_providers_returns_bad_gateway() {
+    let settings = create_auction_test_settings_without_consent_store("[]");
+
+    let response = route_auction(&settings, valid_banner_ad_unit_body());
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should surface no-provider orchestration failures as gateway errors"
+    );
+}
+
+#[test]
+fn valid_auction_request_with_unregistered_provider_returns_success_empty_openrtb_response() {
+    let settings = create_auction_test_settings_without_consent_store(r#"["missing-provider"]"#);
+
+    let mut response = route_auction(&settings, valid_banner_ad_unit_body());
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should produce a successful empty OpenRTB response when configured providers are skipped"
+    );
+    assert_eq!(
+        response.get_header_str(header::CONTENT_TYPE),
+        Some("application/json"),
+        "should return JSON for successful auction responses"
+    );
+    assert!(
+        response.get_header_str(HEADER_X_TS_EC).is_some(),
+        "should include the auction EC identifier header"
+    );
+    assert!(
+        response.get_header_str(HEADER_X_TS_EC_FRESH).is_some(),
+        "should include the fresh EC identifier header"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str())
+        .expect("should parse successful auction response JSON");
+    assert!(
+        body.get("id").and_then(serde_json::Value::as_str).is_some(),
+        "should include an OpenRTB response id"
+    );
+    assert!(
+        body.get("seatbid")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "should not include bid entries when there are no bids"
+    );
+    assert!(
+        body.pointer("/ext/orchestrator/strategy")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "should include orchestrator strategy metadata"
+    );
+    assert_eq!(
+        body.pointer("/ext/orchestrator/providers")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "should report no provider responses"
+    );
+    assert_eq!(
+        body.pointer("/ext/orchestrator/total_bids")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "should report no bids"
+    );
+    assert!(
+        body.pointer("/ext/orchestrator/time_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "should include orchestration timing metadata"
     );
 }
