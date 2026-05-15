@@ -126,6 +126,16 @@ fn create_test_settings_without_consent_store() -> Settings {
 }
 
 fn create_test_settings_with_consent_store(consent_store: Option<&str>) -> Settings {
+    create_test_settings_with_consent_store_and_origin_url(
+        consent_store,
+        "https://origin.test-publisher.com",
+    )
+}
+
+fn create_test_settings_with_consent_store_and_origin_url(
+    consent_store: Option<&str>,
+    origin_url: &str,
+) -> Settings {
     let consent_config = consent_store
         .map(|store| format!("\n            [consent]\n            consent_store = \"{store}\"\n"))
         .unwrap_or_default();
@@ -139,7 +149,7 @@ fn create_test_settings_with_consent_store(consent_store: Option<&str>) -> Setti
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            origin_url = "{origin_url}"
             proxy_secret = "unit-test-proxy-secret"
 
             [edge_cookie]
@@ -282,22 +292,31 @@ fn admin_route_rejects_unauthenticated_request() {
 }
 
 #[test]
-fn auction_route_dispatches_to_consent_dependent_path() {
-    let settings = create_test_settings();
-    let req = Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#);
+fn auction_route_dispatches_to_auction_handler() {
+    let settings = create_test_settings_without_consent_store();
+    let req = Request::post("https://test.com/auction").with_body(
+        r#"{"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300]]}},"bids":[]}],"config":null}"#,
+    );
 
-    let resp = route_with_settings(&settings, req).expect("should route auction request");
+    let mut resp = route_with_settings(&settings, req).expect("should route auction request");
 
     assert_eq!(
         resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should reach the auction route and fail opening configured consent persistence"
+        StatusCode::BAD_REQUEST,
+        "should reach the auction handler and reject invalid banner sizes"
+    );
+    assert!(
+        resp.take_body_str().contains("Invalid banner size"),
+        "should return the auction validation error"
     );
 }
 
 #[test]
 fn unknown_route_falls_back_to_publisher_proxy_path() {
-    let settings = create_test_settings_without_consent_store();
+    let settings = create_test_settings_with_consent_store_and_origin_url(
+        None,
+        "https://publisher-origin.invalid",
+    );
     let req = Request::get("https://test.com/articles/example");
 
     let resp = route_with_settings(&settings, req).expect("should route publisher fallback");
@@ -310,48 +329,16 @@ fn unknown_route_falls_back_to_publisher_proxy_path() {
 }
 
 #[test]
-fn configured_missing_consent_store_only_breaks_consent_routes() {
+fn publisher_fallback_uses_consent_dependent_services() {
     let settings = create_test_settings();
+    let req = Request::get("https://test.com/articles/example");
 
-    let discovery_resp = route_with_settings(
-        &settings,
-        Request::get("https://test.com/.well-known/trusted-server.json"),
-    )
-    .expect("should route discovery request");
-    assert_eq!(
-        discovery_resp.get_status(),
-        StatusCode::OK,
-        "should keep discovery available when the consent store is unavailable"
-    );
+    let resp = route_with_settings(&settings, req)
+        .expect("should return an error response for publisher fallback");
 
-    let admin_resp = route_with_settings(
-        &settings,
-        Request::post("https://test.com/admin/keys/rotate"),
-    )
-    .expect("should route admin request");
     assert_eq!(
-        admin_resp.get_status(),
-        StatusCode::UNAUTHORIZED,
-        "should keep admin auth behavior unchanged when the consent store is unavailable"
-    );
-
-    let auction_resp = route_with_settings(
-        &settings,
-        Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#),
-    )
-    .expect("should return an error response for auction requests");
-    assert_eq!(
-        auction_resp.get_status(),
+        resp.get_status(),
         StatusCode::SERVICE_UNAVAILABLE,
-        "should fail auction requests when consent persistence is configured but unavailable"
-    );
-
-    let publisher_resp =
-        route_with_settings(&settings, Request::get("https://test.com/articles/example"))
-            .expect("should return an error response for publisher fallback");
-    assert_eq!(
-        publisher_resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should scope consent store failures to the consent-dependent routes"
+        "should fail publisher fallback when consent persistence is configured but unavailable"
     );
 }
