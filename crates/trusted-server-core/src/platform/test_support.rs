@@ -9,8 +9,9 @@ use rand::rngs::OsRng;
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -215,6 +216,8 @@ pub(crate) struct StubHttpClient {
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
+    image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    request_uris: Mutex<Vec<String>>,
 }
 
 struct StubHttpResponse {
@@ -229,6 +232,8 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            image_optimizer_options: Mutex::new(Vec::new()),
+            request_uris: Mutex::new(Vec::new()),
         }
     }
 
@@ -272,6 +277,22 @@ impl StubHttpClient {
             .expect("should lock request_headers")
             .clone()
     }
+
+    /// Return Image Optimizer metadata captured per `send` call, in order.
+    pub fn recorded_image_optimizer_options(&self) -> Vec<Option<PlatformImageOptimizerOptions>> {
+        self.image_optimizer_options
+            .lock()
+            .expect("should lock image optimizer options")
+            .clone()
+    }
+
+    /// Return request URIs captured per `send` call, in order.
+    pub fn recorded_request_uris(&self) -> Vec<String> {
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .clone()
+    }
 }
 
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
@@ -285,6 +306,15 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(request.backend_name.clone());
+
+        self.image_optimizer_options
+            .lock()
+            .expect("should lock image optimizer options")
+            .push(request.image_optimizer.clone());
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .push(request.request.uri().to_string());
 
         let headers: Vec<(String, String)> = request
             .request
@@ -479,9 +509,17 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
 pub(crate) fn build_services_with_http_client(
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
+    build_services_with_secret_and_http_client(NoopSecretStore, http_client)
+}
+
+/// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
+pub(crate) fn build_services_with_secret_and_http_client(
+    secret_store: impl PlatformSecretStore + 'static,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
+        .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)

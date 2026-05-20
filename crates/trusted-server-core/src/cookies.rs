@@ -273,7 +273,7 @@ pub(crate) fn try_build_ec_cookie_value(settings: &Settings, ec_id: &str) -> Opt
 /// # Panics
 ///
 /// Does not panic in practice — the cookie value is validated by
-/// [`ec_cookie_value_is_safe`] (early return if invalid) before
+/// `ec_cookie_value_is_safe` (early return if invalid) before
 /// [`http::HeaderValue::from_str`] is called, so the expect is unreachable.
 /// Listed here only because clippy cannot prove it statically.
 pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
