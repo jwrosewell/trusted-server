@@ -76,6 +76,7 @@ pub mod tdl;
 pub mod test_support;
 pub mod tester_cookie;
 pub mod tsjs;
+pub mod tsjs_bundle;
 
 #[cfg(test)]
 mod migration_guards;
