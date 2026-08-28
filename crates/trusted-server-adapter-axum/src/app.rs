@@ -282,7 +282,7 @@ async fn dispatch_fallback(
     let publisher_response = handle_publisher_request(
         AppContext {
             settings: &state.settings,
-            integrations: &state.registry,
+            integration_registry: &state.registry,
         },
         services,
         None,
