@@ -486,12 +486,12 @@ fn health_response() -> Response {
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
-fn build_ec_context(
+async fn build_ec_context(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    EcContext::read_from_request_resolving_geo(settings, req, services)
+    EcContext::read_from_request_resolving_geo(settings, req, services).await
 }
 
 fn admin_key_management_not_supported() -> Response {
@@ -722,7 +722,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // closed for consented users. When identity cannot be
                 // established at all, answer with an error rather than running
                 // the auction with no identity.
-                let ec_context = match build_ec_context(&s.settings, &services, &req) {
+                let ec_context = match build_ec_context(&s.settings, &services, &req).await {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -753,7 +753,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Identity could not be established (for example the selected
                 // Edge Cookie provider is unavailable). Answer with an error
                 // rather than re-running the auction with no identity.
-                let ec_context = match build_ec_context(&s.settings, &services, &req) {
+                let ec_context = match build_ec_context(&s.settings, &services, &req).await {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -879,7 +879,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Identity could not be established (for example the selected
                 // Edge Cookie provider is unavailable). Answer with an error
                 // rather than serving the page with no identity.
-                let mut ec_context = match build_ec_context(&state.settings, &services, &req) {
+                let mut ec_context = match build_ec_context(&state.settings, &services, &req).await
+                {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -1090,8 +1091,8 @@ mod tests {
     /// parsed directly, bypassing the composition root's startup check, so the
     /// per-request behavior can be exercised with a selection the adapter
     /// cannot supply.
-    #[test]
-    fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
+    #[tokio::test]
+    async fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
         let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
             .expect("should parse settings selecting an uninjected provider");
         let req = request_builder()
@@ -1107,6 +1108,7 @@ mod tests {
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
+            .await
             .expect_err("an unavailable Edge Cookie provider must fail the request");
 
         assert!(
