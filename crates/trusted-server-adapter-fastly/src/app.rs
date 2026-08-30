@@ -1724,9 +1724,12 @@ mod tests {
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         // Resolved the same way the composition root resolves it, so this
         // router behaves like a served one.
-        let ec_provider =
-            trusted_server_core::ec::provider::build_reusable_provider(&settings.ec, None, None)
-                .expect("should resolve the Edge Cookie provider selection");
+        let resolved_ec_provider = trusted_server_core::ec::provider::build_reusable_provider(
+            &settings.ec,
+            None,
+            registry.ec_provider(),
+        )
+        .expect("should resolve the Edge Cookie provider selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
@@ -1735,9 +1738,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-            ec_provider,
-            // These tests exercise routing, and a request with no signal
-            // provider resolves at the place baseline.
+            resolved_ec_provider,
             permission_signal_providers: Arc::default(),
         });
         TrustedServerApp::routes_for_state(&state)
