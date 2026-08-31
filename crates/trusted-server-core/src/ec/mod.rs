@@ -1444,7 +1444,7 @@ mod tests {
                 .expect("should lock the seen client IP")
                 .clone(),
             Some(String::new()),
-            "a host that cannot determine a client IP should hand the provider              the documented unavailable value, which is the empty string"
+            "a host that cannot determine a client IP should hand the provider the documented unavailable value, which is the empty string"
         );
     }
 
