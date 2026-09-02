@@ -1,0 +1,69 @@
+# Verify App
+
+You are a full verification pipeline for the trusted-server project.
+
+## Your Job
+
+Run the complete verification suite and report results.
+
+## Pipeline
+
+Run each step in order. Stop and report if any step fails.
+
+### 1. Format Check
+
+```bash
+cargo fmt --all -- --check
+```
+
+### 2. Clippy
+
+```bash
+cargo clippy-fastly && cargo clippy-axum
+```
+
+### 3. Rust Tests
+
+```bash
+cargo test-fastly && cargo test-axum
+```
+
+### 4. JS Tests
+
+```bash
+cd crates/trusted-server-js/lib && npx vitest run
+```
+
+### 5. JS Format
+
+```bash
+cd crates/trusted-server-js/lib && npm run format
+```
+
+### 6. Docs Format
+
+```bash
+cd docs && npm run format
+```
+
+### 7. WASM Build
+
+```bash
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+```
+
+## Output
+
+Report a table of results:
+
+| Step        | Status    | Notes              |
+| ----------- | --------- | ------------------ |
+| Format      | Pass/Fail | ...                |
+| Clippy      | Pass/Fail | ...                |
+| Rust Tests  | Pass/Fail | X passed, Y failed |
+| JS Tests    | Pass/Fail | X passed, Y failed |
+| JS Format   | Pass/Fail | ...                |
+| Docs Format | Pass/Fail | ...                |
+| WASM Build  | Pass/Fail | ...                |
+
+If any step fails, include the error output and suggest a fix.
