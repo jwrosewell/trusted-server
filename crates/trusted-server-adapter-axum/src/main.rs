@@ -1,4 +1,5 @@
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_core::addr::resolve_bind_addr;
 use edgezero_core::app::Hooks as _;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
@@ -8,15 +9,24 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let config = match port_from_env() {
-        // When PORT is set, bind to a specific address so integration tests
-        // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
-        Some(port) => AxumDevServerConfig {
-            addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            enable_ctrl_c: true,
-        },
-        // Normal development path: read bind address from axum.toml.
-        None => AxumDevServerConfig::default(),
+    // The bind host comes from `EDGEZERO__ADAPTER__HOST` through EdgeZero's
+    // shared resolver, the same one the CLI dev server uses, and falls back to
+    // loopback so an existing deployment sees no change. Binding loopback
+    // unconditionally left the adapter unreachable through a published
+    // container port, because a port publisher forwards to the container's
+    // external address rather than to its loopback.
+    //
+    // `PORT` keeps its own reader rather than being handed to the resolver as
+    // the environment port, because an unparseable `PORT` must exit rather
+    // than warn and fall back. See `port_from_env`.
+    let env_host = std::env::var("EDGEZERO__ADAPTER__HOST").ok();
+    let resolution = resolve_bind_addr(env_host.as_deref(), None, None, port_from_env());
+    for warning in &resolution.warnings {
+        log::warn!("{warning}");
+    }
+    let config = AxumDevServerConfig {
+        addr: resolution.addr,
+        enable_ctrl_c: true,
     };
 
     log::info!("Listening on http://{}", config.addr);
