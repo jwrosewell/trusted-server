@@ -637,6 +637,32 @@ struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
 }
 
+/// Third-party origins to rewrite inside proxied assets, paired with the
+/// first-party prefix that serves them.
+///
+/// Empty unless [`proxy.rewrite_asset_urls`](crate::settings::ProxySettings::rewrite_asset_urls)
+/// is enabled, so an existing deployment rewrites nothing new. Each entry comes
+/// from a configured asset route, which means a host is only made first-party
+/// when the operator has already said how to serve it.
+fn asset_route_rewrites(settings: &Settings) -> Vec<(String, String)> {
+    if !settings.proxy.rewrite_asset_urls {
+        return Vec::new();
+    }
+
+    settings
+        .proxy
+        .asset_routes
+        .iter()
+        .map(|route| {
+            // Trailing slashes on either side would produce a doubled slash
+            // once the asset's own path is appended.
+            let origin = route.origin_url.trim_end_matches('/').to_owned();
+            let prefix = route.prefix.trim_end_matches('/').to_owned();
+            (origin, prefix)
+        })
+        .collect()
+}
+
 impl PublisherBodyProcessor {
     fn new(
         params: &OwnedProcessResponseParams,
@@ -673,6 +699,7 @@ impl PublisherBodyProcessor {
                 &params.origin_url,
                 &params.request_host,
                 &params.request_scheme,
+                &asset_route_rewrites(settings),
             ))
         };
 
@@ -762,6 +789,7 @@ fn process_response_streaming<W: Write>(
             params.origin_url,
             params.request_host,
             params.request_scheme,
+            &asset_route_rewrites(params.settings),
         );
         StreamingPipeline::new(config, replacer)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
