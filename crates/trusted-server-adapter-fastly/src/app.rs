@@ -121,6 +121,7 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::proxy::asset_response_carries_body;
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -881,19 +882,6 @@ async fn dispatch_fallback(
 
     let response = result.unwrap_or_else(|e| http_error(&e));
     attach_dispatch_extensions(response, ec, effects)
-}
-
-/// Returns `true` when an asset response should carry a (streamed) body.
-///
-/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
-/// representation length in their `Content-Length` header while carrying no
-/// body. Attaching the origin stream would either contradict that header or
-/// stream bytes a client does not expect, so those responses drop the stream and
-/// keep the origin's `Content-Length` untouched.
-fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
-    *method != Method::HEAD
-        && status != StatusCode::NO_CONTENT
-        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
