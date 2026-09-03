@@ -784,6 +784,31 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
         element_content_handlers,
+        // `lol_html` defaults `strict` to true, which aborts the rewrite when
+        // markup drives its tree-builder simulator into a state it cannot
+        // resolve, for example an unclosed `select` followed by an `iframe`.
+        // The abort is not a truncation here: the whole response fails, and
+        // because this adapter buffers the body the visitor gets a 502 with no
+        // document at all.
+        //
+        // What actually reaches that state was measured rather than assumed. A
+        // `noscript`/`iframe` pair in otherwise clean markup returns 200 in
+        // both the head and the body, so the tag-manager shape widely blamed
+        // for this is not the trigger. The unclosed tag in front of it is: the
+        // same pair placed after an unclosed `select` returns 502, and the two
+        // cases differ by nothing else.
+        //
+        // Measured against the rewriting corpus on 3 September 2026: turning
+        // strict off makes that page a complete, correctly rewritten 200 and
+        // changes no other page in the corpus by a single byte.
+        //
+        // The library gives a security rationale for aborting, which is that
+        // without certainty about its context the rewriter may misjudge whether
+        // it is inside a script element, and this rewriter injects script. That
+        // risk is accepted here deliberately rather than inherited. The
+        // durable fix is a document tree, which removes the ambiguity instead
+        // of tolerating it.
+        strict: false,
         ..RewriterSettings::default()
     };
 
