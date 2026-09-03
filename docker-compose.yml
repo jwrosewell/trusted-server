@@ -1,0 +1,116 @@
+# Trusted Server appliance demo stack.
+#
+#   docker compose up
+#
+# Two containers. The appliance runs the native Axum adapter; the origin serves
+# the twelve-page rewriting corpus as a plain static site, standing in for a
+# publisher's own web server.
+#
+#   appliance  published on the host as 3010
+#   origin     published on the host as 8090
+#
+# Ports 3001, 8081, 8000 and 8443 are deliberately avoided: other work on this
+# machine owns them.
+
+name: ts-appliance
+
+services:
+  appliance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trusted-server-appliance:dev
+
+    # 8787 is what the process binds inside the container (PORT in the
+    # Dockerfile). 3010 is where it appears on the Windows host.
+    #
+    # Read this before concluding the stack is broken: the adapter binds
+    # 127.0.0.1, not 0.0.0.0, on both of its code paths
+    # (crates/trusted-server-adapter-axum/src/main.rs:14-19). A process on
+    # container loopback is not reachable through a published port, so this
+    # mapping is correct and inert at the same time. It starts working, with no
+    # change here, as soon as the adapter can be told to bind 0.0.0.0. The
+    # one-line change is written up in .claude/findings-C.md, Discovery 1.
+    # Nothing in this stack works around it, on purpose.
+    ports:
+      - "3010:8787"
+
+    # Configuration, supplied exactly the way the Axum adapter documents it in
+    # docs/guide/getting-started.md ("Option B — Axum dev server"): environment
+    # variables, from a file the operator writes. `cp .env.dev .env`, then put
+    # the app-config blob envelope in it under
+    #   TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG
+    # as one line. That variable name is not a typo; the prefix, the store name
+    # and the key all resolve to the same default id. See .claude/findings-C.md,
+    # Discovery 4, for where each part comes from, and note that the value is a
+    # signed JSON envelope rather than TOML.
+    #
+    # For this stack the config's origin must point at http://origin.example.com,
+    # which resolves to the origin service below.
+    #
+    # Marked not required so `docker compose up` still starts, and fails in the
+    # appliance's own words, rather than compose refusing to run at all.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # The entry point refuses to start when this is above 1. That is not
+      # caution: the Axum adapter wires UnavailableKvStore
+      # (crates/trusted-server-adapter-axum/src/platform.rs:570-572), so
+      # identity and consent state have nowhere to live but this process's
+      # memory. Two instances would split a visitor's identity and lose a
+      # consent withdrawal, both silently.
+      TS_APPLIANCE_REPLICAS: "1"
+
+    # Stated as well as enforced, so `docker compose config` shows the intent.
+    deploy:
+      replicas: 1
+
+    depends_on:
+      origin:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    networks:
+      - appliance
+
+  origin:
+    # The publisher's web server, standing in. Pinned rather than :alpine so
+    # the stack does not change under us between runs.
+    image: nginx:1.29-alpine
+
+    # The corpus pages carry absolute URLs to http://origin.example.com, so
+    # that name has to resolve to this container for the rewriting to be
+    # exercised at all. Inside a compose network it can, through an alias,
+    # which is worth noting because on the Windows host it cannot without
+    # editing the hosts file. Both `origin` and `origin.example.com` resolve
+    # here.
+    networks:
+      appliance:
+        aliases:
+          - origin.example.com
+
+    ports:
+      - "8090:80"
+
+    # Mounted read-only. The twelve pages live in the main worktree and are
+    # another package's source material; this stack reads them and must not be
+    # able to write them, hence :ro rather than trust.
+    volumes:
+      - ../trusted-server/.claude/pm/corpus:/usr/share/nginx/html:ro
+
+    # wget, not curl: this is busybox.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/index.html"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+    restart: unless-stopped
+
+networks:
+  appliance:
+    driver: bridge
