@@ -1,7 +1,7 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use lol_html::{
     text,
 };
 
+use crate::host_rewrite::{rewrite_bare_host_at_boundaries, rewrite_origin_authority};
 use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
@@ -304,7 +305,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
 
-    // Simplified URL patterns structure - stores only core data and generates variants on-demand
+    // Holds the origin and request identity that every URL rewrite needs. The
+    // per-scheme string builders that used to live here were removed with the
+    // `str::replace` chains that consumed them, because building
+    // `https://<origin>` as a literal is what made the matching unbounded.
+    // Boundary-aware rewriting works from the host alone.
     struct UrlPatterns {
         origin_host: String,
         request_host: String,
@@ -312,41 +317,24 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     impl UrlPatterns {
-        fn https_origin(&self) -> String {
-            format!("https://{}", self.origin_host)
-        }
-
-        fn http_origin(&self) -> String {
-            format!("http://{}", self.origin_host)
-        }
-
-        fn protocol_relative_origin(&self) -> String {
-            format!("//{}", self.origin_host)
-        }
-
-        fn replacement_url(&self) -> String {
-            format!("{}://{}", self.request_scheme, self.request_host)
-        }
-
-        fn protocol_relative_replacement(&self) -> String {
-            format!("//{}", self.request_host)
-        }
-
         fn rewrite_url_value(&self, value: &str) -> Option<String> {
             if !value.contains(&self.origin_host) {
                 return None;
             }
 
-            let https_origin = self.https_origin();
-            let http_origin = self.http_origin();
-            let protocol_relative_origin = self.protocol_relative_origin();
-            let replacement_url = self.replacement_url();
-            let protocol_relative_replacement = self.protocol_relative_replacement();
-
-            let mut rewritten = value
-                .replace(&https_origin, &replacement_url)
-                .replace(&http_origin, &replacement_url)
-                .replace(&protocol_relative_origin, &protocol_relative_replacement);
+            // Boundary checked, so a longer hostname that merely starts with
+            // the origin (`origin.example.com.cdn.example`) is left alone. The
+            // chain of `str::replace` calls this replaced matched the origin as
+            // a plain substring and rewrote the front of such hostnames, and
+            // the guard below could not catch it because it ran on a string
+            // that had already been corrupted.
+            let mut rewritten = rewrite_origin_authority(
+                value,
+                &self.origin_host,
+                &self.request_host,
+                &self.request_scheme,
+            )
+            .unwrap_or_else(|| value.to_owned());
 
             if rewritten.starts_with(&self.origin_host) {
                 let suffix = &rewritten[self.origin_host.len()..];
@@ -632,14 +620,25 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut srcset) = el.get_attribute("srcset") {
                     let original_srcset = srcset.clone();
-                    let new_srcset = srcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        )
-                        .replace(&patterns.origin_host, &patterns.request_host);
+                    // A srcset is a list of URLs, so a bare host in it really
+                    // is an authority and is rewritten as well. Both passes are
+                    // boundary checked. The bare `str::replace` this replaced
+                    // rewrote the front of any longer hostname sharing the
+                    // origin's prefix.
+                    let mut new_srcset = rewrite_origin_authority(
+                        &srcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                        &patterns.request_scheme,
+                    )
+                    .unwrap_or_else(|| srcset.clone());
+                    if let Some(bare) = rewrite_bare_host_at_boundaries(
+                        &new_srcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                    ) {
+                        new_srcset = bare;
+                    }
                     if new_srcset != srcset {
                         srcset = new_srcset;
                     }
@@ -678,13 +677,16 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
                     let original_imagesrcset = imagesrcset.clone();
-                    let new_imagesrcset = imagesrcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        );
+                    // Boundary checked, as for `srcset`. This attribute never
+                    // carried the bare-host pass that `srcset` had, so the two
+                    // behaved differently on the same markup.
+                    let new_imagesrcset = rewrite_origin_authority(
+                        &imagesrcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                        &patterns.request_scheme,
+                    )
+                    .unwrap_or_else(|| imagesrcset.clone());
                     if new_imagesrcset != imagesrcset {
                         imagesrcset = new_imagesrcset;
                     }
@@ -713,6 +715,45 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         el.set_attribute("imagesrcset", &imagesrcset)?;
                     }
                 }
+                Ok(())
+            }
+        }),
+        // `noscript` content is raw text to the parser rather than markup, so
+        // no element handler above can ever see inside it and every URL there
+        // reached the origin directly. That is where tag managers, analytics
+        // fallbacks and tracking pixels put their markup, so the bypass covered
+        // exactly the requests this proxy exists to carry.
+        //
+        // The parser gives no choice about this: `lol_html` classifies
+        // `noscript` as raw text unconditionally, alongside `style` and
+        // `iframe`, so the content arrives as text chunks and rewriting it as
+        // text is the only route.
+        text!("noscript", {
+            let patterns = patterns.clone();
+            // A text node arrives in chunks, and a URL can straddle two of
+            // them, so the node is accumulated and rewritten once complete.
+            let buffered = Rc::new(RefCell::new(String::new()));
+            move |chunk| {
+                buffered.borrow_mut().push_str(chunk.as_str());
+                if !chunk.last_in_text_node() {
+                    // Held back rather than emitted, so the rewrite below sees
+                    // the whole node and the content is not duplicated.
+                    chunk.remove();
+                    return Ok(());
+                }
+
+                let text = std::mem::take(&mut *buffered.borrow_mut());
+                let rewritten = rewrite_origin_authority(
+                    &text,
+                    &patterns.origin_host,
+                    &patterns.request_host,
+                    &patterns.request_scheme,
+                )
+                .unwrap_or(text);
+                // Emitted as HTML rather than text, because the content is
+                // markup that the parser merely declined to parse. Escaping it
+                // would show the reader the tags.
+                chunk.replace(&rewritten, ContentType::Html);
                 Ok(())
             }
         }),
