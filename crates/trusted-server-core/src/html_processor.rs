@@ -13,6 +13,7 @@ use lol_html::{
     text,
 };
 
+use crate::host_rewrite::{rewrite_bare_host_at_boundaries, rewrite_origin_authority};
 use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
@@ -304,7 +305,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
 
-    // Simplified URL patterns structure - stores only core data and generates variants on-demand
+    // Holds the origin and request identity that every URL rewrite needs. The
+    // per-scheme string builders that used to live here were removed with the
+    // `str::replace` chains that consumed them, because building
+    // `https://<origin>` as a literal is what made the matching unbounded.
+    // Boundary-aware rewriting works from the host alone.
     struct UrlPatterns {
         origin_host: String,
         request_host: String,
@@ -312,41 +317,24 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     impl UrlPatterns {
-        fn https_origin(&self) -> String {
-            format!("https://{}", self.origin_host)
-        }
-
-        fn http_origin(&self) -> String {
-            format!("http://{}", self.origin_host)
-        }
-
-        fn protocol_relative_origin(&self) -> String {
-            format!("//{}", self.origin_host)
-        }
-
-        fn replacement_url(&self) -> String {
-            format!("{}://{}", self.request_scheme, self.request_host)
-        }
-
-        fn protocol_relative_replacement(&self) -> String {
-            format!("//{}", self.request_host)
-        }
-
         fn rewrite_url_value(&self, value: &str) -> Option<String> {
             if !value.contains(&self.origin_host) {
                 return None;
             }
 
-            let https_origin = self.https_origin();
-            let http_origin = self.http_origin();
-            let protocol_relative_origin = self.protocol_relative_origin();
-            let replacement_url = self.replacement_url();
-            let protocol_relative_replacement = self.protocol_relative_replacement();
-
-            let mut rewritten = value
-                .replace(&https_origin, &replacement_url)
-                .replace(&http_origin, &replacement_url)
-                .replace(&protocol_relative_origin, &protocol_relative_replacement);
+            // Boundary checked, so a longer hostname that merely starts with
+            // the origin (`origin.example.com.cdn.example`) is left alone. The
+            // chain of `str::replace` calls this replaced matched the origin as
+            // a plain substring and rewrote the front of such hostnames, and
+            // the guard below could not catch it because it ran on a string
+            // that had already been corrupted.
+            let mut rewritten = rewrite_origin_authority(
+                value,
+                &self.origin_host,
+                &self.request_host,
+                &self.request_scheme,
+            )
+            .unwrap_or_else(|| value.to_owned());
 
             if rewritten.starts_with(&self.origin_host) {
                 let suffix = &rewritten[self.origin_host.len()..];
@@ -632,14 +620,25 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut srcset) = el.get_attribute("srcset") {
                     let original_srcset = srcset.clone();
-                    let new_srcset = srcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        )
-                        .replace(&patterns.origin_host, &patterns.request_host);
+                    // A srcset is a list of URLs, so a bare host in it really
+                    // is an authority and is rewritten as well. Both passes are
+                    // boundary checked. The bare `str::replace` this replaced
+                    // rewrote the front of any longer hostname sharing the
+                    // origin's prefix.
+                    let mut new_srcset = rewrite_origin_authority(
+                        &srcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                        &patterns.request_scheme,
+                    )
+                    .unwrap_or_else(|| srcset.clone());
+                    if let Some(bare) = rewrite_bare_host_at_boundaries(
+                        &new_srcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                    ) {
+                        new_srcset = bare;
+                    }
                     if new_srcset != srcset {
                         srcset = new_srcset;
                     }
@@ -678,13 +677,16 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
                     let original_imagesrcset = imagesrcset.clone();
-                    let new_imagesrcset = imagesrcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        );
+                    // Boundary checked, as for `srcset`. This attribute never
+                    // carried the bare-host pass that `srcset` had, so the two
+                    // behaved differently on the same markup.
+                    let new_imagesrcset = rewrite_origin_authority(
+                        &imagesrcset,
+                        &patterns.origin_host,
+                        &patterns.request_host,
+                        &patterns.request_scheme,
+                    )
+                    .unwrap_or_else(|| imagesrcset.clone());
                     if new_imagesrcset != imagesrcset {
                         imagesrcset = new_imagesrcset;
                     }
@@ -834,6 +836,32 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    /// A third party host that merely begins with the origin host must not be
+    /// rewritten. Before the boundary check, the chain of `str::replace` calls
+    /// matched the origin as a plain substring and rewrote the front of such a
+    /// hostname, sending the visitor to a host nobody configured.
+    #[test]
+    fn a_longer_hostname_starting_with_the_origin_is_left_alone() {
+        let config = create_test_config();
+        let html = r#"<!DOCTYPE html><html><head></head><body><a href="https://origin.example.com.cdn.example/asset.js">x</a></body></html>"#;
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process HTML");
+        let result = String::from_utf8(output).expect("should be valid UTF-8");
+        assert!(
+            result.contains("https://origin.example.com.cdn.example/asset.js"),
+            "a third party host that merely starts with the origin must be left alone, got: {result}"
+        );
     }
 
     #[test]
