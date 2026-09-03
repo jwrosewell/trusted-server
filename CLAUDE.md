@@ -89,6 +89,28 @@ cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --featu
 spin up --from crates/trusted-server-adapter-spin
 ```
 
+### JavaScript bundles and hermetic builds
+
+`cargo build` does not run npm. `crates/trusted-server-js/build.rs` builds the
+TypeScript bundles only when asked, so an ordinary build reaches no network and
+needs no Node toolchain, which is what lets a container or an offline machine
+build the workspace. The bundles are not committed, so a clean checkout has an
+empty `crates/trusted-server-js/dist` and the build stops with a message naming
+both ways to fill it:
+
+```bash
+# Once, on a machine with Node. Every later cargo build is then hermetic.
+cd crates/trusted-server-js/lib && npm ci && npm run build
+
+# Or let one cargo run build them. Needs Node and the npm registry.
+TSJS_BUILD=1 cargo build-fastly
+
+# Same switch as a Cargo feature, for a build that selects the package.
+cargo build -p trusted-server-js --features trusted-server-js/build-js
+```
+
+`TSJS_SKIP_BUILD=1` still wins over both and stops npm running at all.
+
 ### Testing & Quality
 
 ```bash

@@ -16,6 +16,16 @@ doctest = false
 name = "trusted_server_js"
 path = "src/lib.rs"
 
+[features]
+# Build the TypeScript bundles from source during `cargo build`.
+#
+# Off by default so an ordinary `cargo build` is hermetic: it reads no network
+# and needs no Node toolchain. With the feature on, `build.rs` runs `npm ci`
+# and `npm run build` in `lib/`, which reaches the npm registry. The cargo
+# aliases in `.cargo/config.toml` turn it on, so the documented developer and
+# CI workflows are unchanged.
+build-js = []
+
 [build-dependencies]
 build-print = { workspace = true }
 hex = { workspace = true }

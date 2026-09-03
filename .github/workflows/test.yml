@@ -8,6 +8,15 @@ on:
     branches: [main]
   pull_request:
 
+# The TypeScript bundles are built during `cargo build` only when asked, so an
+# ordinary build is hermetic and needs neither Node nor the npm registry (see
+# `crates/trusted-server-js/build.rs`). CI is exactly the caller that wants the
+# bundles built from source, and it has both, so it asks here. Set once for the
+# whole workflow rather than on each cargo step, because several steps call
+# cargo directly instead of through a `.cargo/config.toml` alias.
+env:
+  TSJS_BUILD: "1"
+
 jobs:
   test-rust:
     name: cargo test

@@ -16,6 +16,14 @@
 # concatenation, doubling every token ("check ... check ...").
 # String values are overridden by the deeper config instead of merged.
 
+# The TypeScript bundles embedded by `trusted-server-js` are NOT rebuilt by
+# these aliases. `crates/trusted-server-js/build.rs` runs npm only when asked,
+# either by the `trusted-server-js/build-js` feature or by `TSJS_BUILD=1`, so an
+# ordinary `cargo build` reaches no network and needs no Node toolchain. Build
+# the bundles once with `cd crates/trusted-server-js/lib && npm ci && npm run
+# build`, or set `TSJS_BUILD=1` for a cargo run that should build them itself.
+# Without either, the build stops with a message naming both routes.
+
 [alias]
 # Generic: native test with an explicit host target.
 test_details = "test --target aarch64-apple-darwin"

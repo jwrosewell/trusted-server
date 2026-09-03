@@ -569,15 +569,52 @@ fastly profile create
 
 ---
 
+### No tsjs bundles found
+
+**Error Message:**
+
+```
+tsjs: no tsjs-*.js bundles in .../crates/trusted-server-js/dist.
+```
+
+**Cause:** The JavaScript build is off by default, so `cargo build` stays
+hermetic and needs neither Node nor the npm registry, and the bundles are not
+committed. A clean checkout therefore has an empty `dist` directory until
+something builds it.
+
+**Solution:** Either build the bundles once, and leave every later cargo build
+hermetic:
+
+```bash
+cd crates/trusted-server-js/lib
+npm ci
+npm run build
+```
+
+Or let a cargo run build them itself, which needs Node and network access to
+the npm registry:
+
+```bash
+TSJS_BUILD=1 cargo build-fastly
+```
+
+The `trusted-server-js/build-js` Cargo feature is the same switch for a build
+that selects the package directly:
+
+```bash
+cargo build -p trusted-server-js --features trusted-server-js/build-js
+```
+
 ### TSJS build failed
 
 **Error Message:**
 
 ```
-ERROR: npm run build:custom failed
+tsjs: npm run build failed - refusing to use stale bundles
 ```
 
-**Cause:** Node.js dependency or build issue
+**Cause:** The JavaScript build was asked for and npm reported a failure, so
+Node.js dependencies or the TypeScript sources are the place to look.
 
 **Solution:**
 
@@ -588,7 +625,7 @@ cd crates/trusted-server-js/lib
 npm ci
 ```
 
-2. Test build manually:
+2. Test the build on its own:
 
 ```bash
 npm run build
@@ -600,7 +637,8 @@ npm run build
 npm run type-check
 ```
 
-4. Skip TSJS build temporarily:
+4. Stop the cargo build from running npm at all, using whatever `dist` already
+   holds:
 
 ```bash
 TSJS_SKIP_BUILD=1 cargo build

@@ -19,8 +19,24 @@ fn main() {
     println!("cargo:rerun-if-changed=lib");
     watch_dir_recursively(Path::new("lib"));
 
-    // Allow opt-out or force via env
-    let skip = env::var("TSJS_SKIP_BUILD").is_ok_and(|value| value == "1");
+    // Whether this build is allowed to run npm.
+    //
+    // Off unless asked for, so an ordinary `cargo build` is hermetic: it reads
+    // no network and needs no Node toolchain. Two ways to ask, because a Cargo
+    // feature and an environment variable reach different callers. The
+    // `build-js` feature is what the cargo aliases in `.cargo/config.toml`
+    // turn on. `TSJS_BUILD=1` is for a caller who cannot pass a feature
+    // through to a transitive dependency, such as a plain
+    // `cargo build -p trusted-server-adapter-axum`. `TSJS_SKIP_BUILD=1` still
+    // wins over both, so an existing opt-out keeps working.
+    let requested = env::var_os("CARGO_FEATURE_BUILD_JS").is_some()
+        || env::var("TSJS_BUILD").is_ok_and(|value| value == "1");
+    let skip = !requested || env::var("TSJS_SKIP_BUILD").is_ok_and(|value| value == "1");
+
+    // A change to either switch changes what this script does, so Cargo has to
+    // be told to re-run it when one of them changes.
+    println!("cargo:rerun-if-env-changed=TSJS_BUILD");
+    println!("cargo:rerun-if-env-changed=TSJS_SKIP_BUILD");
 
     let crate_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("should set CARGO_MANIFEST_DIR for build script"),
@@ -38,11 +54,22 @@ fn main() {
         return;
     }
 
-    // If Node/npm is absent, keep going if dist exists
-    let npm = which::which("npm").ok();
-    if npm.is_none() {
-        warn!("tsjs: npm not found; will use existing dist if available");
-    }
+    // Locate npm only when this build was asked to run it. When it was asked
+    // and npm is missing, say so here rather than letting the empty-`dist`
+    // assertion below report a missing toolchain as a missing bundle.
+    let npm = if skip {
+        None
+    } else {
+        let found = which::which("npm").ok();
+        if found.is_none() {
+            warn!(
+                "tsjs: the JavaScript build was requested but npm was not \
+                 found; falling back to the existing dist directory if it \
+                 has bundles"
+            );
+        }
+        found
+    };
 
     // Install deps if node_modules missing
     if !skip
@@ -109,9 +136,21 @@ fn main() {
         }
     });
 
+    // The bundles are not committed, so an offline or container build that
+    // never ran npm reaches here with an empty `dist`. Say exactly that, and
+    // give both ways out, rather than leaving the reader to work out why a
+    // Rust build is complaining about JavaScript.
     assert!(
         !modules.is_empty(),
-        "tsjs: no tsjs-*.js files found in {}. Ensure `npm run build` succeeds.",
+        "tsjs: no tsjs-*.js bundles in {}.\n\
+         The JavaScript build is off by default so `cargo build` stays \
+         hermetic, and the bundles are not committed, so this directory is \
+         empty in a clean checkout.\n\
+         Either build them in this cargo run, by enabling the \
+         `trusted-server-js/build-js` feature or setting TSJS_BUILD=1 (both \
+         need Node and network access to the npm registry), or build them \
+         once beforehand with `cd crates/trusted-server-js/lib && npm ci && \
+         npm run build` and leave this build hermetic.",
         dist_dir.display()
     );
 

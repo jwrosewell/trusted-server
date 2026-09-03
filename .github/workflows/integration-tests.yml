@@ -11,6 +11,11 @@ on:
   workflow_dispatch:
 
 env:
+  # The TypeScript bundles are built during `cargo build` only when
+  # asked, so an ordinary build is hermetic and needs neither Node nor
+  # the npm registry (see `crates/trusted-server-js/build.rs`). This
+  # workflow builds the adapters from source and has both, so it asks.
+  TSJS_BUILD: "1"
   ORIGIN_PORT: 8888
   ARTIFACTS_DIR: /tmp/integration-test-artifacts
   WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-adapter-fastly.wasm
