@@ -1,7 +1,7 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -718,6 +718,45 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 Ok(())
             }
         }),
+        // `noscript` content is raw text to the parser rather than markup, so
+        // no element handler above can ever see inside it and every URL there
+        // reached the origin directly. That is where tag managers, analytics
+        // fallbacks and tracking pixels put their markup, so the bypass covered
+        // exactly the requests this proxy exists to carry.
+        //
+        // The parser gives no choice about this: `lol_html` classifies
+        // `noscript` as raw text unconditionally, alongside `style` and
+        // `iframe`, so the content arrives as text chunks and rewriting it as
+        // text is the only route.
+        text!("noscript", {
+            let patterns = patterns.clone();
+            // A text node arrives in chunks, and a URL can straddle two of
+            // them, so the node is accumulated and rewritten once complete.
+            let buffered = Rc::new(RefCell::new(String::new()));
+            move |chunk| {
+                buffered.borrow_mut().push_str(chunk.as_str());
+                if !chunk.last_in_text_node() {
+                    // Held back rather than emitted, so the rewrite below sees
+                    // the whole node and the content is not duplicated.
+                    chunk.remove();
+                    return Ok(());
+                }
+
+                let text = std::mem::take(&mut *buffered.borrow_mut());
+                let rewritten = rewrite_origin_authority(
+                    &text,
+                    &patterns.origin_host,
+                    &patterns.request_host,
+                    &patterns.request_scheme,
+                )
+                .unwrap_or(text);
+                // Emitted as HTML rather than text, because the content is
+                // markup that the parser merely declined to parse. Escaping it
+                // would show the reader the tags.
+                chunk.replace(&rewritten, ContentType::Html);
+                Ok(())
+            }
+        }),
     ];
 
     // A response-bound nonce is only safe for the response that carried it, and the
@@ -786,6 +825,31 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
         element_content_handlers,
+        // `lol_html` defaults `strict` to true, which aborts the rewrite when
+        // markup drives its tree-builder simulator into a state it cannot
+        // resolve, for example an unclosed `select` followed by an `iframe`.
+        // The abort is not a truncation here: the whole response fails, and
+        // because this adapter buffers the body the visitor gets a 502 with no
+        // document at all.
+        //
+        // What actually reaches that state was measured rather than assumed. A
+        // `noscript`/`iframe` pair in otherwise clean markup returns 200 in
+        // both the head and the body, so the tag-manager shape widely blamed
+        // for this is not the trigger. The unclosed tag in front of it is: the
+        // same pair placed after an unclosed `select` returns 502, and the two
+        // cases differ by nothing else.
+        //
+        // Measured against the rewriting corpus on 3 September 2026: turning
+        // strict off makes that page a complete, correctly rewritten 200 and
+        // changes no other page in the corpus by a single byte.
+        //
+        // The library gives a security rationale for aborting, which is that
+        // without certainty about its context the rewriter may misjudge whether
+        // it is inside a script element, and this rewriter injects script. That
+        // risk is accepted here deliberately rather than inherited. The
+        // durable fix is a document tree, which removes the ambiguity instead
+        // of tolerating it.
+        strict: false,
         ..RewriterSettings::default()
     };
 
@@ -836,6 +900,36 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    /// `lol_html` classifies `noscript` as raw text, so its contents never
+    /// become elements and no attribute handler can see inside them. The same
+    /// URL inside and outside a `noscript` must be rewritten the same way.
+    #[test]
+    fn urls_inside_noscript_are_rewritten_like_any_other() {
+        let config = create_test_config();
+        let html = r#"<!DOCTYPE html><html><head></head><body><noscript><iframe src="https://origin.example.com/tag"></iframe></noscript><iframe src="https://origin.example.com/tag"></iframe></body></html>"#;
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process HTML");
+        let result = String::from_utf8(output).expect("should be valid UTF-8");
+        assert_eq!(
+            result.matches("test.example.com/tag").count(),
+            2,
+            "the noscript iframe and the plain one should both be rewritten, got: {result}"
+        );
+        assert!(
+            !result.contains("&lt;iframe"),
+            "noscript content must be emitted as markup, not escaped text, got: {result}"
+        );
     }
 
     /// A third party host that merely begins with the origin host must not be
