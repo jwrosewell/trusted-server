@@ -1117,6 +1117,23 @@ async fn preflight_s3_origin_for_image_optimizer(
     Ok(Some(response))
 }
 
+/// Whether an asset response should carry a (streamed) body.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
+/// representation length in their `Content-Length` header while carrying no
+/// body. Attaching the origin stream would either contradict that header or
+/// stream bytes a client does not expect, so those responses drop the stream and
+/// keep the origin's `Content-Length` untouched.
+///
+/// Lives here rather than in an adapter so every adapter serving an asset route
+/// makes the same decision.
+#[must_use]
+pub fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
 /// Proxy a configured first-party asset path to its matched asset origin.
 ///
 /// This is a lean raw pass-through path: it preserves status/body/headers,
