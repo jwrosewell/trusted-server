@@ -6147,13 +6147,18 @@ pub(crate) fn build_ad_slots_script(
 
 /// Whether the content type requires processing (URL rewriting, HTML injection).
 ///
-/// Text-based and JavaScript/JSON responses are processable; binary types
-/// (images, fonts, video, etc.) pass through unchanged.
+/// Text-based and JavaScript/JSON responses are processable, and so is SVG,
+/// which is markup served with an `image/` type. Other binary types (raster
+/// images, fonts, video, etc.) pass through unchanged.
 fn is_processable_content_type(content_type: &str) -> bool {
     let normalized = content_type.to_ascii_lowercase();
     normalized.contains("text/")
         || normalized.contains("application/javascript")
         || normalized.contains("application/json")
+        // SVG carries URLs in `href` attributes and in embedded `<style>`
+        // blocks, so it is rewritten like the other text assets. It is not
+        // covered by `text/` because its type is `image/svg+xml`.
+        || normalized.contains("image/svg+xml")
 }
 
 fn is_html_content_type(content_type: &str) -> bool {
@@ -14530,6 +14535,9 @@ mod tests {
             ("application/json", true),
             ("application/json; charset=utf-8", true),
             ("Application/JSON; Charset=UTF-8", true),
+            ("image/svg+xml", true),
+            ("Image/SVG+XML", true),
+            ("image/svg+xml; charset=utf-8", true),
             ("image/jpeg", false),
             ("image/png", false),
             ("application/pdf", false),
