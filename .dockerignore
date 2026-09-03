@@ -18,13 +18,10 @@
 .gitignore
 .github/
 
-# Agent and editor state. Everything under .claude is excluded except the
-# directory holding this image's own entry point, which the Dockerfile COPYs.
-# Written as "exclude the children, then whitelist" to mirror the repository's
-# own .gitignore, rather than relying on re-including a child of an excluded
-# directory.
-.claude/*
-!.claude/docker
+# Agent and editor state. All of it, with no whitelist: the entry point this
+# image needs now lives in docker/ beside the Dockerfile, so nothing the build
+# reads is under .claude any more.
+.claude/
 .specstory/
 .vscode/
 .idea/

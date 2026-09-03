@@ -125,7 +125,14 @@ RUN set -eux; \
 # trusted-server-adapter-axum and its [[bin]] name is not, and reaching for
 # the crate name here is the mistake this comment exists to prevent.
 COPY --from=builder /out/trusted-server-axum /usr/local/bin/trusted-server-axum
-COPY .claude/docker/entrypoint.sh /usr/local/bin/appliance-entrypoint
+# docker/entrypoint.sh, not .claude/docker/entrypoint.sh: .gitignore line 44
+# ignores everything under .claude, so the entry point was never committed and
+# this image could not be built from a clean checkout at all. It is product
+# rather than session scratch, so it sits beside the Dockerfile that reads it.
+# .gitattributes pins *.sh to LF, because a CRLF shebang makes this script fail
+# inside the container with a "no such file or directory" naming a file that is
+# plainly there.
+COPY docker/entrypoint.sh /usr/local/bin/appliance-entrypoint
 RUN chmod +x /usr/local/bin/appliance-entrypoint /usr/local/bin/trusted-server-axum
 
 # The port the process binds. main.rs:36-45 reads PORT and exits non-zero on a

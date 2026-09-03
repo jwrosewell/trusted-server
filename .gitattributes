@@ -1,0 +1,10 @@
+# Shell scripts are checked out with LF endings on every platform.
+#
+# docker/entrypoint.sh is copied into a Linux container image and run by
+# /bin/sh. A CRLF line ending makes the shebang line read as
+# "#!/bin/sh\r", so the kernel looks for an interpreter whose name ends in
+# a carriage return and the container exits immediately with a "no such
+# file or directory" that names a file which plainly exists. Windows
+# clones with core.autocrlf=true produce exactly that, so the ending is
+# pinned here rather than left to a contributor's local git configuration.
+*.sh text eol=lf
