@@ -784,6 +784,28 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
         element_content_handlers,
+        // `lol_html` defaults `strict` to true, which aborts the rewrite when
+        // markup drives its tree-builder simulator into a state its ambiguity
+        // guard cannot resolve. The guard limits that to two insertion modes,
+        // inside an unclosed `<select>` and in or after a `<frameset>`, followed
+        // by one of its text-content tags. Inside a select those are `title`,
+        // `plaintext`, `style`, `iframe`, `xmp`, `noembed`, `noframes` and
+        // `noscript`, while a `<textarea>` closes the select and a `<script>` is
+        // allowed there.
+        //
+        // This module is shared by every adapter. On the adapters that buffer the
+        // body (Axum, Cloudflare, Spin) the abort leaves nothing to send and the
+        // visitor gets a 502 with no document. On Fastly the headers are
+        // committed before the body is pulled, so the outcome there differs.
+        //
+        // The library aborts for a security reason, which is that with the
+        // parsing context uncertain a rewriter may misjudge whether it is inside
+        // a raw-text element such as `script`. Its guard comment records that
+        // "Cloudflare's security features were used as XSS gadgets" that way,
+        // and this rewriter injects script. Turning strict off accepts that
+        // risk deliberately rather than inheriting it. The durable fix is a
+        // document tree, which removes the ambiguity instead of tolerating it.
+        strict: false,
         ..RewriterSettings::default()
     };
 
@@ -834,6 +856,37 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    /// An unclosed `<select>` followed by a text-content tag drives `lol_html`'s
+    /// tree builder simulator into a state its ambiguity guard cannot resolve.
+    /// Under the library's default `strict: true` that aborts the whole
+    /// rewrite and the buffered adapters emit no document at all. This asserts
+    /// the page still comes back, and still gets rewritten.
+    #[test]
+    fn an_unclosed_select_before_an_iframe_does_not_abort_the_rewrite() {
+        let config = create_test_config();
+        let html = r#"<!DOCTYPE html><html><head></head><body><select><iframe src="https://origin.example.com/tag"></iframe></body></html>"#;
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should not abort the rewrite on an unclosed select");
+        let result = String::from_utf8(output).expect("should be valid UTF-8");
+        assert!(
+            !result.is_empty(),
+            "the visitor must receive a document, got zero bytes"
+        );
+        assert!(
+            result.contains("test.example.com/tag"),
+            "the document must still be rewritten, got: {result}"
+        );
     }
 
     #[test]
