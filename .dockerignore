@@ -1,0 +1,74 @@
+# Build context for the Trusted Server appliance image.
+#
+# Sizes below were measured with `du -sm` at the worktree root, not guessed.
+# `target` is 141 MB and dominates everything else; `crates` is 10 MB and
+# `docs` is 5 MB. Nothing outside `target` exceeds 1 MB.
+
+# Rust build output, at the root and in any crate.
+/target
+**/target/
+
+# Node dependencies. The image installs these itself in the builder stage.
+**/node_modules/
+
+# Git metadata. In a worktree `.git` is a small pointer file rather than an
+# object store, so this saves little space, but neither build script reads git
+# metadata so it has no business in the context either.
+.git
+.gitignore
+.github/
+
+# Agent and editor state. Everything under .claude is excluded except the
+# directory holding this image's own entry point, which the Dockerfile COPYs.
+# Written as "exclude the children, then whitelist" to mirror the repository's
+# own .gitignore, rather than relying on re-including a child of an excluded
+# directory.
+.claude/*
+!.claude/docker
+.specstory/
+.vscode/
+.idea/
+
+# EdgeZero local emulator state. Stale local config here would only confuse a
+# reader of the image; nothing in the container reads it.
+.edgezero/
+
+# Operator secrets and local configuration. The appliance takes its config from
+# a mounted file at run time, so none of this may be baked into a layer.
+.env
+.env.*
+trusted-server.toml
+js-assets.toml
+*.pem
+*.key
+
+# Test and report output.
+/benchmark-results/
+/guest-profiles/
+**/test-results/
+**/playwright-report/
+**/.browser-test-state.json
+
+# Local tool downloads.
+/spin
+/spin.sig
+
+# Editor backups and OS clutter.
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+
+# Documentation and long-form markdown. The build does not read any of it.
+docs/
+CHANGELOG.md
+CONTRIBUTING.md
+FAQ_POC.md
+ProjectGovernance.md
+TESTING.md
+
+# Deliberately NOT excluded: crates/trusted-server-js/dist.
+# `crates/trusted-server-js/build.rs` asserts at line 112 that it found at
+# least one `tsjs-*.js` bundle, and the directory is gitignored so it is absent
+# from a clean checkout. Keeping it in the context leaves a Node-free build
+# possible (prebuild `dist` on the host, then set TSJS_SKIP_BUILD=1) for the day
+# the npm registry is unreachable. It is a few hundred KB at most.
