@@ -2720,6 +2720,23 @@ pub struct Proxy {
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub asset_routes: Vec<ProxyAssetRoute>,
+    /// Rewrite third-party URLs nested inside proxied assets to their
+    /// [`asset_routes`](Self::asset_routes) prefix.
+    ///
+    /// Only the publisher's own host is rewritten by default, so a third-party
+    /// URL written inside a stylesheet, script or SVG still sends the reader
+    /// straight to that third party even though the file carrying it was served
+    /// first-party. A web font referenced from a proxied stylesheet is the
+    /// common case.
+    ///
+    /// When enabled, every configured asset route's `origin_url` is replaced
+    /// with its `prefix` inside processed assets, so the reader fetches it
+    /// through this server instead. Nothing is rewritten for a host without a
+    /// matching route, which keeps the operator in control of what is proxied.
+    ///
+    /// Defaults to `false`, so an existing deployment is unchanged.
+    #[serde(default)]
+    pub rewrite_asset_urls: bool,
 }
 
 fn default_certificate_check() -> bool {
@@ -2740,6 +2757,7 @@ impl Default for Proxy {
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
+            rewrite_asset_urls: false,
         }
     }
 }
@@ -8199,6 +8217,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert_eq!(
@@ -8219,6 +8238,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert_eq!(
@@ -8234,6 +8254,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert_eq!(
@@ -8249,6 +8270,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert!(
@@ -8263,6 +8285,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert!(
@@ -8281,6 +8304,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
         assert_eq!(
@@ -8305,6 +8329,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            rewrite_asset_urls: false,
         };
         proxy.normalize();
 
@@ -8784,6 +8809,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            rewrite_asset_urls: false,
         };
 
         let route = proxy
@@ -8812,6 +8838,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            rewrite_asset_urls: false,
         };
 
         let route = proxy

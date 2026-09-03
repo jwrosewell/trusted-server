@@ -158,6 +158,7 @@ pub fn create_url_replacer(
     origin_url: &str,
     request_host: &str,
     request_scheme: &str,
+    asset_route_rewrites: &[(String, String)],
 ) -> StreamingReplacer {
     let request_url = format!("{request_scheme}://{request_host}");
 
@@ -189,6 +190,16 @@ pub fn create_url_replacer(
         find: origin_host.to_owned(),
         replace_with: request_host.to_owned(),
     });
+
+    // Third-party origins that the operator has given an asset route, so a URL
+    // nested inside this asset points back here instead of at the third party.
+    // Pushed last, because the publisher's own host must win any overlap.
+    for (third_party_origin, prefix) in asset_route_rewrites {
+        replacements.push(Replacement {
+            find: third_party_origin.clone(),
+            replace_with: prefix.clone(),
+        });
+    }
 
     StreamingReplacer::new(replacements)
 }
@@ -326,6 +337,7 @@ mod tests {
             "https://origin.example.com",
             "test.example.com",
             "https",
+            &[],
         );
 
         // Test comprehensive URL replacement scenarios
@@ -364,6 +376,7 @@ mod tests {
             "https://origin.example.com:8080",
             "test.example.com:9090",
             "https",
+            &[],
         );
 
         let content =
@@ -378,12 +391,66 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_third_party_urls_to_their_asset_route_prefix() {
+        // A web font referenced from inside a stylesheet the publisher serves.
+        // Without an asset route the reader fetches it straight from the third
+        // party, even though the stylesheet carrying it came through us.
+        let rewrites = vec![(
+            "https://fonts.gstatic.com".to_string(),
+            "/_tp/gstatic".to_string(),
+        )];
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+            &rewrites,
+        );
+
+        let css = "@font-face{src:url(https://fonts.gstatic.com/s/a/b.woff2)}                   .x{background:url(https://origin.example.com/i.png)}";
+        let out = String::from_utf8(replacer.process_chunk(css.as_bytes(), true)).expect("utf8");
+
+        assert!(
+            out.contains("/_tp/gstatic/s/a/b.woff2"),
+            "should route the third-party font through the asset prefix, got: {out}"
+        );
+        assert!(
+            !out.contains("fonts.gstatic.com"),
+            "should leave no direct third-party host behind, got: {out}"
+        );
+        assert!(
+            out.contains("https://test.example.com/i.png"),
+            "should still rewrite the publisher's own host, got: {out}"
+        );
+    }
+
+    #[test]
+    fn leaves_third_party_urls_alone_without_an_asset_route() {
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+            &[],
+        );
+
+        let css = "@font-face{src:url(https://fonts.gstatic.com/s/a/b.woff2)}";
+        let out = String::from_utf8(replacer.process_chunk(css.as_bytes(), true)).expect("utf8");
+
+        assert_eq!(
+            out, css,
+            "should not touch a third-party host the operator has not routed"
+        );
+    }
+
+    #[test]
     fn test_url_replacer_mixed_protocols() {
         let mut replacer = create_url_replacer(
             "origin.example.com",
             "https://origin.example.com",
             "test.example.com",
             "http",
+            &[],
         );
 
         let content = r#"
@@ -419,6 +486,7 @@ mod tests {
                     "https://origin.com",
                     "test.com",
                     "https",
+                    &[],
                 ),
                 content: "https://origin.com/test \u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5} https://origin.com/more",
                 chunk_size: 20,
@@ -430,7 +498,13 @@ mod tests {
             },
             Utf8BoundaryCase {
                 name: "small chunks preserve utf8 without replacements",
-                replacer: create_url_replacer("test.com", "https://test.com", "new.com", "https"),
+                replacer: create_url_replacer(
+                    "test.com",
+                    "https://test.com",
+                    "new.com",
+                    "https",
+                    &[],
+                ),
                 content: "Some text \u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5} more text with \u{1f389} emoji",
                 chunk_size: 8,
                 expected_fragments: &[
@@ -465,7 +539,13 @@ mod tests {
         let content = "https://example.com/f\u{f8}r/b\u{e5}r/test".as_bytes();
 
         let result = process_with_explicit_splits(
-            create_url_replacer("example.com", "https://example.com", "new.com", "https"),
+            create_url_replacer(
+                "example.com",
+                "https://example.com",
+                "new.com",
+                "https",
+                &[],
+            ),
             content,
             &[22, content.len()],
         );
@@ -478,7 +558,7 @@ mod tests {
         let content = "\u{1f389}\u{1f38a}\u{1f38b} https://emoji.com/more".as_bytes();
 
         let result = process_with_explicit_splits(
-            create_url_replacer("emoji.com", "https://emoji.com", "test.com", "https"),
+            create_url_replacer("emoji.com", "https://emoji.com", "test.com", "https", &[]),
             content,
             &[2, content.len()],
         );
@@ -489,8 +569,13 @@ mod tests {
 
     #[test]
     fn test_process_chunk_large_chunks() {
-        let mut replacer =
-            create_url_replacer("example.com", "https://example.com", "test.com", "https");
+        let mut replacer = create_url_replacer(
+            "example.com",
+            "https://example.com",
+            "test.com",
+            "https",
+            &[],
+        );
 
         // Test with content that won't have URLs split across chunks
         let content =
