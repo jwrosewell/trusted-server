@@ -1,3 +1,38 @@
+/// Characters that may appear inside a hostname or its `:port` suffix.
+///
+/// A match that touches one of these on either side is part of a longer
+/// hostname rather than a hostname of its own.
+fn is_host_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')
+}
+
+/// Whether the digits starting at `port_start` form a complete `:port`.
+fn has_valid_port_boundary(bytes: &[u8], port_start: usize) -> bool {
+    let mut index = port_start;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+
+    index > port_start && (index == bytes.len() || !is_host_char(bytes[index]))
+}
+
+/// Whether the `origin_host` match spanning `pos..end` is a whole hostname
+/// rather than part of a longer one.
+///
+/// This is the check whose absence corrupted longer hostnames sharing the
+/// origin's prefix, so both rewriters in this module go through it.
+fn match_is_whole_host(bytes: &[u8], pos: usize, end: usize) -> bool {
+    let before_ok = pos == 0 || !is_host_char(bytes[pos - 1]);
+    let after_ok = end == bytes.len()
+        || if bytes[end] == b':' {
+            has_valid_port_boundary(bytes, end + 1)
+        } else {
+            !is_host_char(bytes[end])
+        };
+
+    before_ok && after_ok
+}
+
 /// Rewrite bare host occurrences (e.g. `origin.example.com/news`) only when the match is a full
 /// hostname token, not part of a larger hostname like `cdn.origin.example.com`.
 ///
@@ -15,18 +50,81 @@ pub(crate) fn rewrite_bare_host_at_boundaries(
         return None;
     }
 
-    fn is_host_char(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')
-    }
+    let origin_len = origin_host.len();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut search = 0;
+    let mut replaced_any = false;
 
-    fn has_valid_port_boundary(bytes: &[u8], port_start: usize) -> bool {
-        let mut index = port_start;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
+    while let Some(rel) = text[search..].find(origin_host) {
+        let pos = search + rel;
+        let end = pos + origin_len;
+
+        if match_is_whole_host(bytes, pos, end) {
+            out.push_str(&text[search..pos]);
+            out.push_str(request_host);
+            replaced_any = true;
+            search = end;
+        } else {
+            out.push_str(&text[search..=pos]);
+            search = pos + 1;
         }
-
-        index > port_start && (index == bytes.len() || !is_host_char(bytes[index]))
     }
+
+    if !replaced_any {
+        return None;
+    }
+
+    out.push_str(&text[search..]);
+    Some(out)
+}
+
+/// Rewrite scheme-qualified and protocol-relative occurrences of the origin
+/// authority in `text`, but only where the match is a whole hostname.
+///
+/// Handles `https://origin`, `http://origin` and `//origin` in one pass, so a
+/// caller no longer needs a chain of unbounded [`str::replace`] calls. A
+/// scheme-qualified match takes `request_scheme`, while a protocol-relative one
+/// stays protocol-relative.
+///
+/// A **bare** host with no scheme is deliberately left alone. In an attribute
+/// value a bare host is only unambiguously an authority when it starts the
+/// value, and rewriting it anywhere else would corrupt values that merely
+/// mention the host, such as `?next=` style query parameters. Callers that want
+/// the bare form apply their own rule, or use
+/// [`rewrite_bare_host_at_boundaries`] where the whole text is known to be a
+/// URL payload.
+///
+/// Returns `None` when nothing was rewritten, so callers can keep the original
+/// allocation.
+///
+/// # Examples
+///
+/// A longer hostname that merely starts with the origin is left alone, which
+/// the previous chain of [`str::replace`] calls corrupted:
+///
+/// ```ignore
+/// let out = rewrite_origin_authority(
+///     "http://origin.example.com.cdn.example/a.png",
+///     "origin.example.com",
+///     "proxy.example.com",
+///     "https",
+/// );
+/// assert_eq!(out, None);
+/// ```
+pub(crate) fn rewrite_origin_authority(
+    text: &str,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> Option<String> {
+    if origin_host.is_empty() || request_host.is_empty() || !text.contains(origin_host) {
+        return None;
+    }
+
+    // Longest first, because `https://` and `http://` both end in `//` and a
+    // shorter match would leave a stray scheme behind.
+    const SCHEME_PREFIXES: [&str; 3] = ["https://", "http://", "//"];
 
     let origin_len = origin_host.len();
     let bytes = text.as_bytes();
@@ -38,23 +136,34 @@ pub(crate) fn rewrite_bare_host_at_boundaries(
         let pos = search + rel;
         let end = pos + origin_len;
 
-        let before_ok = pos == 0 || !is_host_char(bytes[pos - 1]);
-        let after_ok = end == bytes.len()
-            || if bytes[end] == b':' {
-                has_valid_port_boundary(bytes, end + 1)
-            } else {
-                !is_host_char(bytes[end])
-            };
-
-        if before_ok && after_ok {
-            out.push_str(&text[search..pos]);
-            out.push_str(request_host);
-            replaced_any = true;
-            search = end;
-        } else {
+        if !match_is_whole_host(bytes, pos, end) {
             out.push_str(&text[search..=pos]);
             search = pos + 1;
+            continue;
         }
+
+        let Some(prefix) = SCHEME_PREFIXES
+            .iter()
+            .find(|candidate| text[..pos].ends_with(*candidate))
+        else {
+            // A bare host, which this function leaves to the caller.
+            out.push_str(&text[search..=pos]);
+            search = pos + 1;
+            continue;
+        };
+
+        // The authority starts at the scheme, so the scheme is replaced along
+        // with the host rather than left pointing at the origin's protocol.
+        out.push_str(&text[search..pos - prefix.len()]);
+        if *prefix == "//" {
+            out.push_str("//");
+        } else {
+            out.push_str(request_scheme);
+            out.push_str("://");
+        }
+        out.push_str(request_host);
+        replaced_any = true;
+        search = end;
     }
 
     if !replaced_any {
@@ -86,6 +195,90 @@ mod tests {
 
     fn assert_no_rewrite(input: &str, message: &str) {
         assert_eq!(rewrite(input), None, "{message}");
+    }
+
+    fn rewrite_authority(input: &str) -> Option<String> {
+        rewrite_origin_authority(input, ORIGIN_HOST, REQUEST_HOST, "https")
+    }
+
+    #[test]
+    fn authority_rewrite_covers_each_scheme_form() {
+        assert_eq!(
+            rewrite_authority("https://origin.example.com/news"),
+            Some("https://proxy.example.com/news".to_string()),
+            "should rewrite an https authority"
+        );
+        assert_eq!(
+            rewrite_authority("http://origin.example.com/news"),
+            Some("https://proxy.example.com/news".to_string()),
+            "should rewrite an http authority to the request scheme"
+        );
+        assert_eq!(
+            rewrite_authority("//origin.example.com/news"),
+            Some("//proxy.example.com/news".to_string()),
+            "should keep a protocol-relative authority protocol-relative"
+        );
+    }
+
+    #[test]
+    fn authority_rewrite_leaves_a_longer_hostname_alone() {
+        // The defect this function was written for. A plain `str::replace` of
+        // `http://origin.example.com` matches the front of this hostname and
+        // produces `http://proxy.example.com.cdn.example/...`, silently
+        // pointing the browser at a host that does not exist.
+        assert_eq!(
+            rewrite_authority("http://origin.example.com.cdn.example/img/a.png"),
+            None,
+            "should not rewrite a hostname that merely starts with the origin"
+        );
+        assert_eq!(
+            rewrite_authority("https://cdn.origin.example.com/img/a.png"),
+            None,
+            "should not rewrite a hostname that merely ends with the origin"
+        );
+    }
+
+    #[test]
+    fn authority_rewrite_leaves_a_bare_host_to_the_caller() {
+        assert_eq!(
+            rewrite_authority("origin.example.com/news"),
+            None,
+            "should leave a bare host alone, so a query parameter mentioning \
+             the host is not corrupted"
+        );
+        assert_eq!(
+            rewrite_authority("/search?q=origin.example.com"),
+            None,
+            "should not rewrite a host mentioned in a query parameter"
+        );
+    }
+
+    #[test]
+    fn authority_rewrite_handles_several_urls_in_one_value() {
+        assert_eq!(
+            rewrite_authority(
+                "http://origin.example.com/a.png 1x, http://origin.example.com.cdn.example/b.png 2x"
+            ),
+            Some(
+                "https://proxy.example.com/a.png 1x, http://origin.example.com.cdn.example/b.png 2x"
+                    .to_string()
+            ),
+            "should rewrite the whole-host match and leave the longer hostname"
+        );
+    }
+
+    #[test]
+    fn authority_rewrite_preserves_a_port_on_the_origin() {
+        assert_eq!(
+            rewrite_origin_authority(
+                "http://127.0.0.1:8081/page",
+                "127.0.0.1:8081",
+                "127.0.0.1:3001",
+                "http"
+            ),
+            Some("http://127.0.0.1:3001/page".to_string()),
+            "should rewrite an origin host carrying a port"
+        );
     }
 
     #[test]
