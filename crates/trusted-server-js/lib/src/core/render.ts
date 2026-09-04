@@ -117,12 +117,31 @@ export function findSlot(id: string): HTMLElement | null {
   } catch {
     // Ignore selector errors (e.g., invalid characters)
   }
+  // Last resort: treat the value as a CSS selector, so a publisher element that
+  // carries no id can still be targeted. Many themes give the element a class
+  // and nothing else, and an operator has no way to add an id to a site they
+  // are proxying rather than authoring.
+  //
+  // Only attempted when the value cannot be a bare id, meaning it starts with
+  // `.` or `[`, or contains a combinator. An ordinary id therefore never takes
+  // this path and existing behaviour is unchanged. A leading `#` is already
+  // removed by `normalizeId`, so an id selector stays an id lookup.
+  if (/^[.[]/.test(id) || /[\s>~+]/.test(id)) {
+    try {
+      const bySelector = document.querySelector(id) as HTMLElement | null;
+      if (bySelector) return bySelector;
+    } catch {
+      // Ignore selector errors (e.g., invalid syntax)
+    }
+  }
   return null;
 }
 
 function ensureSlot(id: string): HTMLElement {
   const nid = normalizeId(id);
-  let el = document.getElementById(nid) as HTMLElement | null;
+  // Resolve through `findSlot` so a CSS selector reaches an existing element
+  // rather than falling through to a new div appended at the end of the body.
+  let el = findSlot(id);
   if (el) return el;
   el = document.createElement('div');
   el.id = nid;

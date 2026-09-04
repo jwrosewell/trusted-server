@@ -153,4 +153,49 @@ describe('render', () => {
       })
     );
   });
+
+  it('finds a slot by CSS class selector when the element carries no id', async () => {
+    const { findSlot } = await import('../../src/core/render');
+    document.body.innerHTML =
+      '<div class="tatsu-header-logo"><img class="logo-img" alt="" /></div>';
+
+    const el = findSlot('.tatsu-header-logo');
+
+    expect(el, 'should resolve a class selector to the element').not.toBeNull();
+    expect(el?.className).toContain('tatsu-header-logo');
+  });
+
+  it('finds a slot by attribute selector when the element carries no id', async () => {
+    const { findSlot } = await import('../../src/core/render');
+    document.body.innerHTML = '<div data-slot="hero"></div>';
+
+    const el = findSlot('[data-slot="hero"]');
+
+    expect(el, 'should resolve an attribute selector').not.toBeNull();
+    expect(el?.getAttribute('data-slot')).toBe('hero');
+  });
+
+  it('still prefers an id over a same-named element, so existing behavior is unchanged', async () => {
+    const { findSlot } = await import('../../src/core/render');
+    document.body.innerHTML = '<div id="footer">by id</div><div class="footer">by class</div>';
+
+    const el = findSlot('footer');
+
+    expect(el?.id, 'a bare id must never be reinterpreted as a selector').toBe('footer');
+  });
+
+  it('returns null for a bare name that matches nothing, rather than guessing', async () => {
+    const { findSlot } = await import('../../src/core/render');
+    document.body.innerHTML = '<div class="footer">by class</div>';
+
+    expect(findSlot('footer'), 'a bare name must not fall through to a class lookup').toBeNull();
+  });
+
+  it('does not throw on an invalid selector', async () => {
+    const { findSlot } = await import('../../src/core/render');
+    document.body.innerHTML = '<div></div>';
+
+    expect(() => findSlot('.[[[unclosed')).not.toThrow();
+    expect(findSlot('.[[[unclosed')).toBeNull();
+  });
 });

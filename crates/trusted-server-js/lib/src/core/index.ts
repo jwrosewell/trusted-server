@@ -8,7 +8,7 @@ export type {
 } from './types';
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
-import { renderAdUnit, renderAllAdUnits } from './render';
+import { findSlot, renderAdUnit, renderAllAdUnits } from './render';
 import { log } from './log';
 import { setConfig, getConfig } from './config';
 import { requestAds } from './request';
@@ -87,7 +87,11 @@ function injectTestBidsWithoutAdServer(): void {
   for (const slot of slots) {
     const bid = bids[slot.id];
     if (!bid?.debug_bid || !bid.adm) continue;
-    const target = document.getElementById(slot.div_id);
+    // Resolved through `findSlot` rather than `getElementById`, so a slot
+    // configured with a CSS selector reaches its element. A publisher being
+    // proxied often gives the target a class and no id, and the operator
+    // cannot add one to a site they do not author.
+    const target = findSlot(slot.div_id);
     if (!target) {
       log.warn('no element for slot', { id: slot.id, div_id: slot.div_id });
       continue;
