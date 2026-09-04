@@ -1117,6 +1117,23 @@ async fn preflight_s3_origin_for_image_optimizer(
     Ok(Some(response))
 }
 
+/// Whether an asset response should carry a (streamed) body.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
+/// representation length in their `Content-Length` header while carrying no
+/// body. Attaching the origin stream would either contradict that header or
+/// stream bytes a client does not expect, so those responses drop the stream and
+/// keep the origin's `Content-Length` untouched.
+///
+/// Lives here rather than in an adapter so every adapter serving an asset route
+/// makes the same decision.
+#[must_use]
+pub fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
 /// Proxy a configured first-party asset path to its matched asset origin.
 ///
 /// This is a lean raw pass-through path: it preserves status/body/headers,
@@ -2221,10 +2238,10 @@ mod tests {
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
         SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
-        build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
-        handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        is_host_permitted, proxy_request, rebuild_response_with_body,
+        asset_response_carries_body, build_asset_proxy_target_url,
+        clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
+        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        is_host_allowed, is_host_permitted, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
@@ -5830,5 +5847,38 @@ mod tests {
                 "should return 413 for oversized rebuild body"
             );
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // asset_response_carries_body
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn asset_response_carries_body_for_a_normal_get() {
+        assert!(
+            asset_response_carries_body(&Method::GET, StatusCode::OK),
+            "a 200 GET must keep the origin stream"
+        );
+    }
+
+    #[test]
+    fn asset_response_drops_the_body_for_head_and_bodiless_statuses() {
+        // HEAD, 204 and 304 advertise the origin representation length in
+        // Content-Length while carrying no body, so attaching the stream would
+        // either contradict that header or send bytes the client is not
+        // expecting. Every adapter serving an asset route has to agree on this,
+        // which is why the rule lives in core rather than in one adapter.
+        assert!(
+            !asset_response_carries_body(&Method::HEAD, StatusCode::OK),
+            "a HEAD response must not carry a body"
+        );
+        assert!(
+            !asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 must not carry a body"
+        );
+        assert!(
+            !asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 must not carry a body"
+        );
     }
 }

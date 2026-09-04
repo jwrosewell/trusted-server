@@ -23,8 +23,8 @@ use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    asset_response_carries_body, handle_asset_proxy_request, handle_first_party_click,
+    handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
@@ -416,6 +416,28 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         Err(Report::new(TrustedServerError::BadRequest {
                             message: format!("Unknown integration route: {path}"),
                         }))
+                    })
+            } else if matches!(method, Method::GET | Method::HEAD)
+                && let Some(route) = state.settings.asset_route_for_path(&path)
+            {
+                // Asset routes are first-party paths that proxy to a different
+                // backend, so they must be served before the publisher fallback
+                // claims the path. Only GET and HEAD participate, matching the
+                // Fastly and Axum adapters.
+                //
+                // Without this the configuration parses and validates, then
+                // silently does nothing, and a rewritten third-party URL falls
+                // through to the publisher origin as a 404.
+                handle_asset_proxy_request(&state.settings, &services, req, route)
+                    .await
+                    .map(|asset_response| {
+                        let (mut response, stream_body) = asset_response.into_response_and_body();
+                        if let Some(body) = stream_body
+                            && asset_response_carries_body(&method, response.status())
+                        {
+                            *response.body_mut() = body;
+                        }
+                        response
                     })
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);

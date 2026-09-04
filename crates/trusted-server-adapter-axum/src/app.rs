@@ -19,6 +19,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::proxy::{asset_response_carries_body, handle_asset_proxy_request};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -214,6 +215,27 @@ async fn dispatch_fallback(
                     message: format!("Unknown integration route: {path}"),
                 }))
             });
+    }
+
+    // Asset routes are first-party paths that proxy to a different backend, so
+    // they must be served before the publisher fallback claims the path. Only
+    // GET and HEAD participate, matching the Fastly adapter.
+    //
+    // Without this the configuration parses and validates, then silently does
+    // nothing, and a rewritten third-party URL falls through to the publisher
+    // origin as a 404.
+    if matches!(method, Method::GET | Method::HEAD)
+        && let Some(route) = state.settings.asset_route_for_path(&path)
+    {
+        let asset_response =
+            handle_asset_proxy_request(&state.settings, services, req, route).await?;
+        let (mut response, stream_body) = asset_response.into_response_and_body();
+        if let Some(body) = stream_body
+            && asset_response_carries_body(&method, response.status())
+        {
+            *response.body_mut() = body;
+        }
+        return Ok(response);
     }
 
     // Run the server-side auction with the configured creative-opportunity
