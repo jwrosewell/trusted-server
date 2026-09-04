@@ -7802,6 +7802,7 @@ mod tests {
                 })));
 
             let config = HtmlProcessorConfig {
+                rewrite_data_attributes: Vec::new(),
                 csp_nonce_observed: None,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),

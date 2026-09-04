@@ -1670,6 +1670,27 @@ pub struct Proxy {
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub asset_routes: Vec<ProxyAssetRoute>,
+    /// Extra HTML attributes whose values are rewritten alongside `href`,
+    /// `src`, `action`, `srcset` and `imagesrcset`.
+    ///
+    /// Lazy-loading scripts and tag managers keep the real URL in a `data-*`
+    /// attribute and copy it into `src` only when the element scrolls into
+    /// view, so the rewritten `src` is never the one that is fetched and the
+    /// reader goes to the origin instead. `data-src`, `data-srcset` and
+    /// `data-background` are the common ones.
+    ///
+    /// This is an operator's list rather than a default, because `data-*` is
+    /// unregulated: nothing in the markup separates an attribute holding a URL
+    /// from one holding an identifier, a template or a JSON blob that merely
+    /// looks like one, and rewriting the wrong one corrupts the page. Name the
+    /// attributes your pages actually use.
+    ///
+    /// Any attribute name is accepted, not only `data-*`. Names are trimmed
+    /// and lowercased, and an attribute already covered above is dropped with
+    /// a warning so it is not rewritten twice. Defaults to empty, so an
+    /// existing deployment rewrites nothing new.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub rewrite_data_attributes: Vec<String>,
 }
 
 fn default_certificate_check() -> bool {
@@ -1690,12 +1711,17 @@ impl Default for Proxy {
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
+            rewrite_data_attributes: Vec::new(),
         }
     }
 }
 
+/// Attributes the HTML rewriter always rewrites, so naming one in
+/// [`Proxy::rewrite_data_attributes`] would rewrite it twice.
+const ALWAYS_REWRITTEN_ATTRIBUTES: [&str; 5] = ["href", "src", "action", "srcset", "imagesrcset"];
+
 impl Proxy {
-    /// Normalizes `allowed_domains` in place.
+    /// Normalizes `allowed_domains` and `rewrite_data_attributes` in place.
     ///
     /// Each entry is trimmed of surrounding whitespace and lowercased.
     /// Empty entries (including those that were only whitespace) are removed.
@@ -1724,6 +1750,30 @@ impl Proxy {
                 "proxy.allowed_domains is empty: all signing, initial fetch, and redirect hosts are permitted (open mode)"
             );
         }
+
+        // Attribute names are matched exactly against what lol_html reports,
+        // which lowercases them, so the configured names are lowercased here
+        // rather than at every comparison.
+        self.rewrite_data_attributes = self
+            .rewrite_data_attributes
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        let before = self.rewrite_data_attributes.len();
+        self.rewrite_data_attributes
+            .retain(|name| !ALWAYS_REWRITTEN_ATTRIBUTES.contains(&name.as_str()));
+        if self.rewrite_data_attributes.len() < before {
+            log::warn!(
+                "proxy.rewrite_data_attributes named an attribute that is always rewritten                  ({}); the duplicate entries have been removed",
+                ALWAYS_REWRITTEN_ATTRIBUTES.join(", ")
+            );
+        }
+
+        let mut seen_attributes = HashSet::new();
+        self.rewrite_data_attributes
+            .retain(|name| seen_attributes.insert(name.clone()));
 
         for route in &mut self.asset_routes {
             route.normalize();
@@ -6211,6 +6261,7 @@ origin_host_header_overide = "www.example.com""#,
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -6231,6 +6282,7 @@ origin_host_header_overide = "www.example.com""#,
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -6246,6 +6298,7 @@ origin_host_header_overide = "www.example.com""#,
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -6261,6 +6314,7 @@ origin_host_header_overide = "www.example.com""#,
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert!(
@@ -6275,6 +6329,7 @@ origin_host_header_overide = "www.example.com""#,
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert!(
@@ -6293,6 +6348,7 @@ origin_host_header_overide = "www.example.com""#,
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -6302,6 +6358,38 @@ origin_host_header_overide = "www.example.com""#,
         assert_eq!(
             proxy.asset_routes[0].origin_url, "https://assets.example.com",
             "should trim asset-route origin_url"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_cleans_rewrite_data_attributes() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![],
+            asset_routes: vec![],
+            rewrite_data_attributes: vec![
+                "  Data-Src  ".to_string(),
+                "   ".to_string(),
+                "data-src".to_string(),
+                "href".to_string(),
+                "data-background".to_string(),
+            ],
+        };
+        proxy.normalize();
+
+        assert_eq!(
+            proxy.rewrite_data_attributes,
+            vec!["data-src".to_string(), "data-background".to_string()],
+            "should trim, lowercase, drop blanks and duplicates, and drop an \
+             attribute that is always rewritten"
+        );
+    }
+
+    #[test]
+    fn proxy_rewrite_data_attributes_defaults_to_empty() {
+        assert!(
+            Proxy::default().rewrite_data_attributes.is_empty(),
+            "an unconfigured deployment must rewrite no extra attributes"
         );
     }
 
@@ -6317,6 +6405,7 @@ origin_host_header_overide = "www.example.com""#,
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            rewrite_data_attributes: vec![],
         };
         proxy.normalize();
 
@@ -6796,6 +6885,7 @@ origin_host_header_overide = "www.example.com""#,
                     ..Default::default()
                 },
             ],
+            rewrite_data_attributes: vec![],
         };
 
         let route = proxy
@@ -6824,6 +6914,7 @@ origin_host_header_overide = "www.example.com""#,
                     ..Default::default()
                 },
             ],
+            rewrite_data_attributes: vec![],
         };
 
         let route = proxy

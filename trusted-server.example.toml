@@ -173,6 +173,14 @@ pull_sync_concurrency = 3
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 #
+# Extra attributes to rewrite alongside href, src, action, srcset and
+# imagesrcset. Lazy-loading scripts and tag managers keep the real URL in a
+# data-* attribute and only copy it into src when the element scrolls into
+# view, so the rewritten src is never the one fetched and the reader goes to
+# the origin. There is no way to tell from the markup which data-* attribute
+# holds a URL, so name the ones your pages actually use. Empty by default.
+# rewrite_data_attributes = ["data-src", "data-srcset", "data-background"]
+#
 # Route first-party asset paths to a different backend origin. Longest matching
 # prefix wins; only GET/HEAD participate; query string is preserved.
 # [[proxy.asset_routes]]

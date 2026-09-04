@@ -1,6 +1,7 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
@@ -8,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    EndTagHandler, Settings as RewriterSettings, element, end,
-    html_content::{ContentType, EndTag},
+    ElementContentHandlers, EndTagHandler, HandlerResult, Selector, Settings as RewriterSettings,
+    element, end,
+    html_content::{ContentType, Element, EndTag},
     text,
 };
 
@@ -205,6 +207,14 @@ pub struct HtmlProcessorConfig {
     pub body_close: BodyCloseInjection,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
     pub suppress_datadome_client_side_tag: bool,
+    /// Extra attribute names whose values are rewritten alongside `href`,
+    /// `src` and the rest.
+    ///
+    /// Comes from
+    /// [`proxy.rewrite_data_attributes`](crate::settings::Proxy::rewrite_data_attributes)
+    /// and is empty unless an operator configured it, so an existing
+    /// deployment rewrites nothing new.
+    pub rewrite_data_attributes: Vec<String>,
     /// Set when the document delivers a response-bound CSP nonce in its own markup.
     ///
     /// `None` on every path that cannot store a shared template, so an ordinary inline
@@ -230,6 +240,7 @@ impl HtmlProcessorConfig {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
+            rewrite_data_attributes: settings.proxy.rewrite_data_attributes.clone(),
             gpt_diagnostics: None,
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
@@ -759,6 +770,60 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
+    // Operator-named attributes, normally `data-*`, which lazy-loading scripts
+    // and tag managers use to hold the real URL until the element scrolls into
+    // view. The rewritten `src` is then never the one fetched, and the reader
+    // goes to the origin.
+    //
+    // Opt-in, and empty by default, because `data-*` is unregulated: nothing in
+    // the markup separates an attribute holding a URL from one holding an
+    // identifier or a JSON blob that merely looks like one, so rewriting every
+    // `data-*` would corrupt pages. The operator names the ones their pages use.
+    //
+    // One selector for the whole list rather than one per name, so a page with
+    // several configured attributes is still matched in a single pass. The
+    // selector is built from configuration, so it is parsed rather than
+    // `unwrap`ped: an unusable name is reported once at startup and the rest
+    // still work.
+    if !config.rewrite_data_attributes.is_empty() {
+        let names = config.rewrite_data_attributes.clone();
+        let selector = names
+            .iter()
+            .map(|name| format!("[{name}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match selector.parse::<Selector>() {
+            Ok(parsed) => {
+                let patterns = patterns.clone();
+                element_content_handlers.push((
+                    Cow::Owned(parsed),
+                    // The parameter and return types are spelled out because
+                    // this handler is built without the `element!` macro,
+                    // which supplies the same hint. The macro is not used here
+                    // because it `unwrap`s the selector parse, and this
+                    // selector comes from configuration.
+                    ElementContentHandlers::default().element(
+                        move |el: &mut Element<'_, '_>| -> HandlerResult {
+                            for name in &names {
+                                if let Some(value) = el.get_attribute(name)
+                                    && let Some(rewritten) = patterns.rewrite_url_value(&value)
+                                {
+                                    el.set_attribute(name, &rewritten)?;
+                                }
+                            }
+                            Ok(())
+                        },
+                    ),
+                ));
+            }
+            Err(err) => {
+                log::error!(
+                    "proxy.rewrite_data_attributes could not be turned into a selector, so none of those attributes will be rewritten: names={names:?}, error={err}"
+                );
+            }
+        }
+    }
+
     // A response-bound nonce is only safe for the response that carried it, and the
     // response-header gate cannot see one the origin delivered in the markup instead.
     // Observed structurally rather than by scanning the output bytes, which cannot tell a
@@ -888,6 +953,7 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
@@ -1861,6 +1927,7 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -1939,6 +2006,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -1978,6 +2046,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -2018,6 +2087,7 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
@@ -2072,6 +2142,7 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -2104,6 +2175,7 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -2129,6 +2201,7 @@ mod tests {
 
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: observer,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
@@ -2265,6 +2338,7 @@ mod tests {
     fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
+            rewrite_data_attributes: Vec::new(),
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
@@ -2317,6 +2391,108 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    /// Run one document through the processor with the shared test config
+    /// (`origin.example.com` -> `test.example.com`, https), after naming the
+    /// extra attributes to rewrite.
+    fn render_with_data_attributes(attributes: &[&str], html: &str) -> String {
+        let mut config = create_test_config();
+        config.rewrite_data_attributes =
+            attributes.iter().map(|name| (*name).to_string()).collect();
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        String::from_utf8(output).expect("output should be valid UTF-8")
+    }
+
+    #[test]
+    fn data_attributes_are_left_alone_by_default() {
+        // Defect 11c. Reproduced against the appliance on 3 September 2026 with
+        // `.claude/corpus-serve/02-lazy-data-attributes.html`, where `data-src`,
+        // `data-srcset` and `data-background` all came back byte-identical
+        // while the control `src` on the same page was rewritten.
+        //
+        // The default stays exactly that, because rewriting every `data-*`
+        // would corrupt the ones that hold identifiers rather than URLs.
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<img data-src=\"https://origin.example.com/lazy.png\">",
+            "</body></html>"
+        );
+
+        let output = render_with_data_attributes(&[], html);
+
+        assert!(
+            output.contains("data-src=\"https://origin.example.com/lazy.png\""),
+            "an unconfigured deployment must rewrite nothing new, got: {output}"
+        );
+    }
+
+    #[test]
+    fn a_configured_data_attribute_is_rewritten() {
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<img src=\"https://origin.example.com/control.png\" ",
+            "data-src=\"https://origin.example.com/lazy.png\">",
+            "<div data-background=\"https://origin.example.com/bg.png\"></div>",
+            "</body></html>"
+        );
+
+        let output = render_with_data_attributes(&["data-src", "data-background"], html);
+
+        assert!(
+            output.contains("data-src=\"https://test.example.com/lazy.png\""),
+            "should rewrite a configured data attribute, got: {output}"
+        );
+        assert!(
+            output.contains("data-background=\"https://test.example.com/bg.png\""),
+            "should rewrite every configured data attribute, got: {output}"
+        );
+        assert!(
+            !output.contains("origin.example.com"),
+            "should leave no origin host behind, got: {output}"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_data_attribute_on_the_same_element_is_left_alone() {
+        // The point of the list is that the operator says which attributes hold
+        // URLs. A neighbouring one must not be swept up.
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<img data-src=\"https://origin.example.com/lazy.png\" ",
+            "data-widget-id=\"origin.example.com\">",
+            "</body></html>"
+        );
+
+        let output = render_with_data_attributes(&["data-src"], html);
+
+        assert!(
+            output.contains("data-src=\"https://test.example.com/lazy.png\""),
+            "should rewrite the configured attribute, got: {output}"
+        );
+        assert!(
+            output.contains("data-widget-id=\"origin.example.com\""),
+            "should leave an unconfigured attribute untouched, got: {output}"
+        );
+    }
+
+    #[test]
+    fn a_configured_data_attribute_gets_the_hostname_boundary_check() {
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<img data-src=\"https://origin.example.com.cdn.example/a.png\">",
+            "</body></html>"
+        );
+
+        let output = render_with_data_attributes(&["data-src"], html);
+
+        assert!(
+            output.contains("data-src=\"https://origin.example.com.cdn.example/a.png\""),
+            "should not rewrite a hostname that merely starts with the origin, got: {output}"
         );
     }
 }
