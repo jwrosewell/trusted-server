@@ -237,6 +237,19 @@ pub struct CreativeOpportunitiesConfig {
     )]
     pub enabled: bool,
     /// GAM network ID used to build default unit paths.
+    ///
+    /// Optional, because it is only consumed when a slot renders the default
+    /// `/<network_id>/<slot_id>` unit path or substitutes `{network_id}` into
+    /// a `gam_unit_path` template. A publisher with no Google Ad Manager has
+    /// neither, and requiring the field stopped the whole
+    /// `[creative_opportunities]` section deserializing for them, because the
+    /// struct is `deny_unknown_fields` and a missing required field fails the
+    /// section outright.
+    ///
+    /// When something does consume it,
+    /// [`validate_runtime`](Self::validate_runtime) still rejects a blank
+    /// value at startup, so the case that needs a network ID is unchanged.
+    #[serde(default)]
     pub gam_network_id: String,
     /// Maximum time in milliseconds to wait for the server-side auction before
     /// closing the response body.
@@ -1996,6 +2009,67 @@ mod tests {
         assert_eq!(
             params.get("custom").and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn config_loads_without_a_network_id_when_nothing_consumes_it() {
+        // A publisher with no Google Ad Manager has no network id to give.
+        // Before `gam_network_id` carried `#[serde(default)]` the whole
+        // `[creative_opportunities]` section failed to deserialize for them,
+        // so the feature could not be configured at all.
+        let without_network_id = serde_json::json!({
+            "slot": [{
+                "id": "atf",
+                "page_patterns": ["/"],
+                "formats": [{ "width": 300, "height": 250 }],
+                "gam_unit_path": "/example/homepage"
+            }]
+        });
+
+        let mut config: CreativeOpportunitiesConfig = serde_json::from_value(without_network_id)
+            .expect("should deserialize a creative_opportunities section with no gam_network_id");
+
+        assert!(
+            config.gam_network_id.is_empty(),
+            "an absent network id should default to empty"
+        );
+
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile the static unit path");
+        config
+            .validate_runtime()
+            .expect("a static unit path consumes no network id, so startup should accept it");
+    }
+
+    #[test]
+    fn config_without_a_network_id_still_fails_when_a_slot_needs_one() {
+        // The same absent field, but the slot has no `gam_unit_path`, so the
+        // default `/<network_id>/<slot_id>` path renders it. That is the case
+        // startup must keep rejecting.
+        let without_network_id = serde_json::json!({
+            "slot": [{
+                "id": "atf",
+                "page_patterns": ["/"],
+                "formats": [{ "width": 300, "height": 250 }]
+            }]
+        });
+
+        let mut config: CreativeOpportunitiesConfig =
+            serde_json::from_value(without_network_id).expect("should deserialize");
+
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile the default path");
+        let err = config
+            .validate_runtime()
+            .expect_err("a default unit path consumes the network id, so startup must reject it");
+        assert_eq!(
+            err, "gam_network_id must not be empty",
+            "should report the blank network id"
         );
     }
 
