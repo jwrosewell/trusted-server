@@ -6,6 +6,8 @@
 // Note: std::io::{Read, Write} were previously used by stream_process function
 // which has been removed in favor of StreamingPipeline
 
+use crate::host_rewrite::match_is_whole_host_with_tail;
+
 /// A replacement pattern configuration
 #[derive(Debug, Clone)]
 pub struct Replacement {
@@ -13,6 +15,102 @@ pub struct Replacement {
     pub find: String,
     /// The string to replace it with
     pub replace_with: String,
+    /// Length in bytes of the hostname at the end of [`find`](Self::find),
+    /// when the pattern ends in one.
+    ///
+    /// Set, the occurrence is replaced only where that trailing span is a whole
+    /// hostname, so the `origin.example.com` inside
+    /// `origin.example.com.cdn.example` is left alone. Unset, every occurrence
+    /// is replaced, which is what a caller wants for a pattern that is not a
+    /// host at all.
+    ///
+    /// This is the check the HTML rewriter has had since `4cb95e889`. Without
+    /// it a plain `str::replace` of the bare host rewrote the front of any
+    /// longer hostname sharing the origin's prefix, in every proxied CSS,
+    /// JavaScript and JSON response.
+    pub host_suffix_len: Option<usize>,
+}
+
+impl Replacement {
+    /// A replacement applied wherever the pattern occurs.
+    #[must_use]
+    pub fn literal(find: impl Into<String>, replace_with: impl Into<String>) -> Self {
+        Self {
+            find: find.into(),
+            replace_with: replace_with.into(),
+            host_suffix_len: None,
+        }
+    }
+
+    /// A replacement applied only where the pattern's trailing `host_suffix_len`
+    /// bytes are a whole hostname.
+    #[must_use]
+    pub fn host_authority(
+        find: impl Into<String>,
+        replace_with: impl Into<String>,
+        host_suffix_len: usize,
+    ) -> Self {
+        Self {
+            find: find.into(),
+            replace_with: replace_with.into(),
+            host_suffix_len: Some(host_suffix_len),
+        }
+    }
+
+    /// Apply this replacement to `text`.
+    ///
+    /// `tail` is whatever the caller holds after `text` but has not emitted,
+    /// so a hostname ending exactly at the end of `text` is still judged
+    /// against the byte that follows it. Empty at end of stream.
+    fn apply(&self, text: &str, tail: &[u8]) -> String {
+        let Some(host_len) = self.host_suffix_len else {
+            return text.replace(&self.find, &self.replace_with);
+        };
+
+        if self.find.is_empty() || !text.contains(&self.find) {
+            return text.to_owned();
+        }
+
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut search = 0_usize;
+
+        while let Some(relative) = text[search..].find(&self.find) {
+            let start = search + relative;
+            let end = start + self.find.len();
+
+            if match_is_whole_host_with_tail(bytes, tail, end - host_len, end) {
+                out.push_str(&text[search..start]);
+                out.push_str(&self.replace_with);
+                search = end;
+            } else {
+                // Advance one byte rather than skipping the whole match, so an
+                // occurrence overlapping this one is still considered. Every
+                // pattern here starts with an ASCII byte, so this stays on a
+                // character boundary.
+                out.push_str(&text[search..=start]);
+                search = start + 1;
+            }
+        }
+
+        out.push_str(&text[search..]);
+        out
+    }
+}
+
+/// The hostname at the end of a scheme-qualified or protocol-relative origin,
+/// as a byte length, or `None` when the value is not one.
+///
+/// A configured asset-route origin may carry a path (`https://cdn.example/x`),
+/// and the trailing part of that is not a hostname, so it does not get the
+/// whole-host check and is replaced wherever it occurs, as before.
+fn host_suffix_len(origin: &str) -> Option<usize> {
+    let after_scheme = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .or_else(|| origin.strip_prefix("//"))?;
+
+    (!after_scheme.is_empty() && !after_scheme.contains('/')).then_some(after_scheme.len())
 }
 
 /// A generic streaming replacer that processes content in chunks
@@ -51,10 +149,7 @@ impl StreamingReplacer {
     /// * `replace_with` - The string to replace it with
     #[must_use]
     pub fn new_single(find: &str, replace_with: &str) -> Self {
-        Self::new(vec![Replacement {
-            find: find.to_owned(),
-            replace_with: replace_with.to_owned(),
-        }])
+        Self::new(vec![Replacement::literal(find, replace_with)])
     }
 
     /// Process a chunk of data and return the processed output
@@ -119,9 +214,16 @@ impl StreamingReplacer {
                 // Valid UTF-8 up to this point, process it
                 let mut processed = s.to_owned();
 
+                // The bytes held back for the next chunk. A host-bounded
+                // replacement needs them: a hostname ending exactly at the emit
+                // boundary would otherwise look complete when the next byte,
+                // still in the buffer, continues it. Empty on the last chunk,
+                // which is correct, because nothing follows it.
+                let tail = &combined[adjusted_end_bytes..];
+
                 // Apply all replacements
                 for replacement in &self.replacements {
-                    processed = processed.replace(&replacement.find, &replacement.replace_with);
+                    processed = replacement.apply(&processed, tail);
                 }
 
                 // Save the overlap for the next chunk
@@ -162,42 +264,51 @@ pub fn create_url_replacer(
 ) -> StreamingReplacer {
     let request_url = format!("{request_scheme}://{request_host}");
 
+    // Every pattern below ends in the origin's hostname, so every one carries
+    // the whole-host check. Without it these were plain `str::replace` calls
+    // that rewrote the front of any longer hostname sharing the origin's
+    // prefix, in every proxied CSS, JavaScript and JSON response.
+    let host_len = origin_host.len();
     let mut replacements = vec![
         // Replace full URLs first (more specific)
-        Replacement {
-            find: origin_url.to_owned(),
-            replace_with: request_url.clone(),
-        },
+        Replacement::host_authority(origin_url, request_url.clone(), host_len),
     ];
 
     // Also handle HTTP variant if origin is HTTPS
     if origin_url.starts_with("https://") {
         let http_origin_url = origin_url.replace("https://", "http://");
-        replacements.push(Replacement {
-            find: http_origin_url,
-            replace_with: request_url.clone(),
-        });
+        replacements.push(Replacement::host_authority(
+            http_origin_url,
+            request_url.clone(),
+            host_len,
+        ));
     }
 
     // Replace protocol-relative URLs
-    replacements.push(Replacement {
-        find: format!("//{origin_host}"),
-        replace_with: format!("//{request_host}"),
-    });
+    replacements.push(Replacement::host_authority(
+        format!("//{origin_host}"),
+        format!("//{request_host}"),
+        host_len,
+    ));
 
     // Replace host in various contexts
-    replacements.push(Replacement {
-        find: origin_host.to_owned(),
-        replace_with: request_host.to_owned(),
-    });
+    replacements.push(Replacement::host_authority(
+        origin_host,
+        request_host,
+        host_len,
+    ));
 
     // Third-party origins that the operator has given an asset route, so a URL
     // nested inside this asset points back here instead of at the third party.
     // Pushed last, because the publisher's own host must win any overlap.
     for (third_party_origin, prefix) in asset_route_rewrites {
-        replacements.push(Replacement {
-            find: third_party_origin.clone(),
-            replace_with: prefix.clone(),
+        replacements.push(match host_suffix_len(third_party_origin) {
+            Some(len) => {
+                Replacement::host_authority(third_party_origin.clone(), prefix.clone(), len)
+            }
+            // A configured origin carrying a path has no hostname at its end,
+            // so there is nothing to bound and it is replaced as written.
+            None => Replacement::literal(third_party_origin.clone(), prefix.clone()),
         });
     }
 
@@ -276,14 +387,14 @@ mod tests {
     #[test]
     fn test_streaming_replacer_multiple_patterns() {
         let replacements = vec![
-            Replacement {
-                find: "https://origin.example.com".to_owned(),
-                replace_with: "https://test.example.com".to_owned(),
-            },
-            Replacement {
-                find: "//origin.example.com".to_owned(),
-                replace_with: "//test.example.com".to_owned(),
-            },
+            Replacement::literal(
+                "https://origin.example.com".to_owned(),
+                "https://test.example.com".to_owned(),
+            ),
+            Replacement::literal(
+                "//origin.example.com".to_owned(),
+                "//test.example.com".to_owned(),
+            ),
         ];
 
         let mut replacer = StreamingReplacer::new(replacements);
@@ -600,14 +711,8 @@ mod tests {
     fn test_generic_replacements() {
         // Test replacing arbitrary strings
         let replacements = vec![
-            Replacement {
-                find: "color".to_owned(),
-                replace_with: "colour".to_owned(),
-            },
-            Replacement {
-                find: "gray".to_owned(),
-                replace_with: "grey".to_owned(),
-            },
+            Replacement::literal("color".to_owned(), "colour".to_owned()),
+            Replacement::literal("gray".to_owned(), "grey".to_owned()),
         ];
 
         let mut replacer = StreamingReplacer::new(replacements);
@@ -623,14 +728,8 @@ mod tests {
     fn test_pattern_priority() {
         // Test that longer patterns are replaced first (order matters)
         let replacements = vec![
-            Replacement {
-                find: "hello world".to_owned(),
-                replace_with: "greetings universe".to_owned(),
-            },
-            Replacement {
-                find: "hello".to_owned(),
-                replace_with: "hi".to_owned(),
-            },
+            Replacement::literal("hello world".to_owned(), "greetings universe".to_owned()),
+            Replacement::literal("hello".to_owned(), "hi".to_owned()),
         ];
 
         let mut replacer = StreamingReplacer::new(replacements);
@@ -647,14 +746,8 @@ mod tests {
     fn test_overlapping_patterns() {
         // Test handling of overlapping patterns
         let replacements = vec![
-            Replacement {
-                find: "abc".to_owned(),
-                replace_with: "xyz".to_owned(),
-            },
-            Replacement {
-                find: "bcd".to_owned(),
-                replace_with: "123".to_owned(),
-            },
+            Replacement::literal("abc".to_owned(), "xyz".to_owned()),
+            Replacement::literal("bcd".to_owned(), "123".to_owned()),
         ];
 
         let mut replacer = StreamingReplacer::new(replacements);
@@ -695,14 +788,8 @@ mod tests {
     fn test_special_characters_in_pattern() {
         // Test replacing patterns with special regex characters
         let replacements = vec![
-            Replacement {
-                find: "cost: $10.99".to_owned(),
-                replace_with: "price: \u{20ac}9.99".to_owned(),
-            },
-            Replacement {
-                find: "[TAG]".to_owned(),
-                replace_with: "<LABEL>".to_owned(),
-            },
+            Replacement::literal("cost: $10.99".to_owned(), "price: \u{20ac}9.99".to_owned()),
+            Replacement::literal("[TAG]".to_owned(), "<LABEL>".to_owned()),
         ];
 
         let mut replacer = StreamingReplacer::new(replacements);
@@ -720,14 +807,8 @@ mod tests {
         use std::io::Cursor;
 
         let replacements = vec![
-            Replacement {
-                find: "foo".to_owned(),
-                replace_with: "bar".to_owned(),
-            },
-            Replacement {
-                find: "hello".to_owned(),
-                replace_with: "hi".to_owned(),
-            },
+            Replacement::literal("foo".to_owned(), "bar".to_owned()),
+            Replacement::literal("hello".to_owned(), "hi".to_owned()),
         ];
 
         let replacer = StreamingReplacer::new(replacements);
@@ -824,5 +905,164 @@ mod tests {
 
         let result = String::from_utf8(output).expect("output should be valid UTF-8");
         assert_eq!(result, "hi world");
+    }
+
+    #[test]
+    fn leaves_a_longer_hostname_sharing_the_origins_prefix_alone() {
+        // Defect 13. Before this the replacer was a plain `str::replace` of the
+        // bare host, so `origin.example.com.cdn.example` had its front rewritten
+        // and pointed at a host that does not exist. The HTML rewriter has had
+        // this check since `4cb95e889`; every proxied CSS, JavaScript and JSON
+        // response went through the unchecked path.
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+            &[],
+        );
+
+        let content = concat!(
+            "a{background:url(https://origin.example.com.cdn.example/a.png)}",
+            "b{background:url(https://origin.example.com/b.png)}",
+            "/* see cdn.origin.example.com for the mirror */"
+        );
+        let out = String::from_utf8(replacer.process_chunk(content.as_bytes(), true))
+            .expect("output should be valid UTF-8");
+
+        assert!(
+            out.contains("https://origin.example.com.cdn.example/a.png"),
+            "should leave a longer hostname alone, got: {out}"
+        );
+        assert!(
+            out.contains("cdn.origin.example.com"),
+            "should leave a subdomain of the origin alone, got: {out}"
+        );
+        assert!(
+            out.contains("https://test.example.com/b.png"),
+            "should still rewrite the origin's own host, got: {out}"
+        );
+    }
+
+    #[test]
+    fn checks_the_boundary_across_a_chunk_split() {
+        // The boundary byte can sit in the part of the buffer the replacer has
+        // not emitted yet. Without looking at it, a hostname ending exactly at
+        // the emit boundary looks complete and gets rewritten.
+        let content =
+            "https://origin.example.com.cdn.example/a.png and https://origin.example.com/b.png";
+
+        for chunk_size in 1..=content.len() {
+            let replacer = create_url_replacer(
+                "origin.example.com",
+                "https://origin.example.com",
+                "test.example.com",
+                "https",
+                &[],
+            );
+            let out = process_with_fixed_chunk_size(replacer, content.as_bytes(), chunk_size);
+
+            assert!(
+                out.contains("https://origin.example.com.cdn.example/a.png"),
+                "chunk size {chunk_size} should leave the longer hostname alone, got: {out}"
+            );
+            assert!(
+                out.contains("https://test.example.com/b.png"),
+                "chunk size {chunk_size} should still rewrite the origin's host, got: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_a_port_on_the_origin_when_the_host_carries_one() {
+        let mut replacer = create_url_replacer(
+            "127.0.0.1:8081",
+            "http://127.0.0.1:8081",
+            "127.0.0.1:3001",
+            "http",
+            &[],
+        );
+
+        let out =
+            String::from_utf8(replacer.process_chunk(b"fetch('http://127.0.0.1:8081/api')", true))
+                .expect("output should be valid UTF-8");
+
+        assert_eq!(
+            out, "fetch('http://127.0.0.1:3001/api')",
+            "should rewrite an origin host carrying a port"
+        );
+    }
+
+    #[test]
+    fn a_routed_third_party_host_gets_the_same_boundary_check() {
+        let rewrites = vec![(
+            "https://fonts.gstatic.com".to_string(),
+            "/_tp/gstatic".to_string(),
+        )];
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+            &rewrites,
+        );
+
+        let css = concat!(
+            "@font-face{src:url(https://fonts.gstatic.com/s/a/b.woff2)}",
+            ".x{background:url(https://fonts.gstatic.com.evil.example/c.png)}"
+        );
+        let out = String::from_utf8(replacer.process_chunk(css.as_bytes(), true))
+            .expect("output should be valid UTF-8");
+
+        assert!(
+            out.contains("/_tp/gstatic/s/a/b.woff2"),
+            "should still route the third-party font, got: {out}"
+        );
+        assert!(
+            out.contains("https://fonts.gstatic.com.evil.example/c.png"),
+            "should leave a longer hostname sharing the routed prefix alone, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_routed_origin_with_a_path_is_still_replaced_as_written() {
+        // An asset-route origin carrying a path does not end in a hostname, so
+        // there is nothing to bound and it keeps the previous behaviour.
+        let rewrites = vec![(
+            "https://cdn.example.com/assets".to_string(),
+            "/_tp/cdn".to_string(),
+        )];
+        let mut replacer = create_url_replacer(
+            "origin.example.com",
+            "https://origin.example.com",
+            "test.example.com",
+            "https",
+            &rewrites,
+        );
+
+        let out = String::from_utf8(
+            replacer.process_chunk(b"url(https://cdn.example.com/assets/a.png)", true),
+        )
+        .expect("output should be valid UTF-8");
+
+        assert!(
+            out.contains("/_tp/cdn/a.png"),
+            "should replace a path-carrying routed origin as written, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_is_not_a_host_still_replaces_everywhere() {
+        // `Replacement::literal` keeps the old unchecked behaviour, which is
+        // what a caller wants for a pattern that is not a hostname.
+        let mut replacer = StreamingReplacer::new_single("OLD", "NEW");
+
+        let out = String::from_utf8(replacer.process_chunk(b"OLDER OLD OLDEST", true))
+            .expect("output should be valid UTF-8");
+
+        assert_eq!(
+            out, "NEWER NEW NEWEST",
+            "a literal replacement should not be boundary checked"
+        );
     }
 }

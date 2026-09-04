@@ -1783,10 +1783,10 @@ mod tests {
 
     #[test]
     fn test_uncompressed_pipeline() {
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig::default();
         let mut pipeline = StreamingPipeline::new(config, replacer);
@@ -1967,10 +1967,10 @@ mod tests {
             enc.finish().expect("should finish compression");
         }
 
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig {
             input_compression: Compression::Deflate,
@@ -2015,10 +2015,10 @@ mod tests {
             enc.finish().expect("should finish compression");
         }
 
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig {
             input_compression: Compression::Gzip,
@@ -2056,10 +2056,10 @@ mod tests {
         let mut compressed_input = gzip_member(b"<html><body>hello world</body></html>");
         compressed_input.extend_from_slice(b"junk");
 
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig {
             input_compression: Compression::Gzip,
@@ -2104,10 +2104,10 @@ mod tests {
             enc.finish().expect("should finish compression");
         }
 
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig {
             input_compression: Compression::Gzip,
@@ -2148,10 +2148,10 @@ mod tests {
             enc.flush().expect("should flush brotli encoder");
         }
 
-        let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_owned(),
-            replace_with: "hi".to_owned(),
-        }]);
+        let replacer = StreamingReplacer::new(vec![Replacement::literal(
+            "hello".to_owned(),
+            "hi".to_owned(),
+        )]);
 
         let config = PipelineConfig {
             input_compression: Compression::Brotli,

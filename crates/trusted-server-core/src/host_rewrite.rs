@@ -6,31 +6,55 @@ fn is_host_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')
 }
 
+/// The byte at `index` of `bytes` followed by `tail`, treated as one sequence.
+///
+/// `tail` exists for a streaming caller, which has decided how much of its
+/// buffer to emit but still holds the bytes after it. Without that lookahead a
+/// hostname ending exactly at the emit boundary would be judged complete when
+/// the next byte, still in the buffer, continues it.
+fn byte_at(bytes: &[u8], tail: &[u8], index: usize) -> Option<u8> {
+    match bytes.get(index) {
+        Some(byte) => Some(*byte),
+        None => tail.get(index - bytes.len()).copied(),
+    }
+}
+
 /// Whether the digits starting at `port_start` form a complete `:port`.
-fn has_valid_port_boundary(bytes: &[u8], port_start: usize) -> bool {
+fn has_valid_port_boundary(bytes: &[u8], tail: &[u8], port_start: usize) -> bool {
     let mut index = port_start;
-    while index < bytes.len() && bytes[index].is_ascii_digit() {
+    while byte_at(bytes, tail, index).is_some_and(|byte| byte.is_ascii_digit()) {
         index += 1;
     }
 
-    index > port_start && (index == bytes.len() || !is_host_char(bytes[index]))
+    index > port_start && !byte_at(bytes, tail, index).is_some_and(is_host_char)
 }
 
 /// Whether the `origin_host` match spanning `pos..end` is a whole hostname
-/// rather than part of a longer one.
+/// rather than part of a longer one, with `tail` supplying any bytes that
+/// follow `bytes` and have not been emitted yet.
 ///
 /// This is the check whose absence corrupted longer hostnames sharing the
-/// origin's prefix, so both rewriters in this module go through it.
-fn match_is_whole_host(bytes: &[u8], pos: usize, end: usize) -> bool {
-    let before_ok = pos == 0 || !is_host_char(bytes[pos - 1]);
-    let after_ok = end == bytes.len()
-        || if bytes[end] == b':' {
-            has_valid_port_boundary(bytes, end + 1)
-        } else {
-            !is_host_char(bytes[end])
-        };
+/// origin's prefix, so every rewriter that touches a host goes through it.
+pub(crate) fn match_is_whole_host_with_tail(
+    bytes: &[u8],
+    tail: &[u8],
+    pos: usize,
+    end: usize,
+) -> bool {
+    let before_ok = pos == 0 || !byte_at(bytes, tail, pos - 1).is_some_and(is_host_char);
+    let after_ok = match byte_at(bytes, tail, end) {
+        None => true,
+        Some(b':') => has_valid_port_boundary(bytes, tail, end + 1),
+        Some(byte) => !is_host_char(byte),
+    };
 
     before_ok && after_ok
+}
+
+/// [`match_is_whole_host_with_tail`] for a caller that already holds the whole
+/// text, so there is nothing after it to look at.
+fn match_is_whole_host(bytes: &[u8], pos: usize, end: usize) -> bool {
+    match_is_whole_host_with_tail(bytes, &[], pos, end)
 }
 
 /// Rewrite bare host occurrences (e.g. `origin.example.com/news`) only when the match is a full
