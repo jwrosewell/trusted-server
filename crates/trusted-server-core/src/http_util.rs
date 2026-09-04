@@ -179,6 +179,17 @@ fn extract_request_host(req: &Request<EdgeBody>) -> String {
                 .get(header::HOST)
                 .and_then(|h| h.to_str().ok())
         })
+        .or_else(|| {
+            // HTTP/2 and HTTP/3 carry the authority in the `:authority`
+            // pseudo-header rather than in `Host`, and clients are not required
+            // to send `Host` at all. Without this fallback the host is empty on
+            // every HTTP/2 request, and an empty host makes the publisher path
+            // return the origin's bytes unmodified: no rewriting, no injected
+            // script, and only a `warn` to say so. Browsers negotiate HTTP/2
+            // whenever the adapter terminates TLS, so this affects ordinary
+            // HTTPS traffic rather than an edge case.
+            req.uri().authority().map(http::uri::Authority::as_str)
+        })
         .unwrap_or_default()
         .to_owned()
 }
@@ -563,6 +574,43 @@ mod tests {
     }
 
     // RequestInfo tests
+
+    #[test]
+    fn request_host_falls_back_to_the_uri_authority_when_there_is_no_host_header() {
+        // An HTTP/2 request carries `:authority` and no `Host` header at all.
+        let req = Request::builder()
+            .uri("https://publisher.example/page")
+            .body(EdgeBody::empty())
+            .expect("should build a request with an authority and no host header");
+
+        assert!(
+            req.headers().get(header::HOST).is_none(),
+            "the fixture must have no host header, or it proves nothing"
+        );
+        assert_eq!(
+            extract_request_host(&req),
+            "publisher.example",
+            "an HTTP/2 request must resolve its host from the URI authority"
+        );
+    }
+
+    #[test]
+    fn host_header_still_wins_over_the_uri_authority() {
+        let mut req = Request::builder()
+            .uri("https://from-authority.example/page")
+            .body(EdgeBody::empty())
+            .expect("should build a request");
+        req.headers_mut().insert(
+            header::HOST,
+            "from-header.example".parse().expect("should parse host"),
+        );
+
+        assert_eq!(
+            extract_request_host(&req),
+            "from-header.example",
+            "the authority is a fallback and must not override an explicit host"
+        );
+    }
 
     #[test]
     fn test_request_info_from_host_header() {
