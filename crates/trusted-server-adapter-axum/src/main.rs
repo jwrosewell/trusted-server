@@ -2,6 +2,7 @@ use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::addr::resolve_bind_addr;
 use edgezero_core::app::Hooks as _;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::tls::{self, TlsPaths};
 
 #[allow(clippy::print_stderr)]
 fn main() {
@@ -29,12 +30,48 @@ fn main() {
         enable_ctrl_c: true,
     };
 
-    log::info!("Listening on http://{}", config.addr);
+    // TLS is off unless the operator configures a certificate and key. Reading
+    // it before the router is built means a half-configured pair stops startup
+    // instead of quietly serving plain HTTP on an address the operator
+    // believes is encrypted.
+    let tls_paths = match tls::tls_paths_from_env() {
+        Ok(paths) => paths,
+        Err(err) => {
+            log::error!("TLS configuration is not usable: {err:?}");
+            std::process::exit(1);
+        }
+    };
+
     let router = TrustedServerApp::routes();
-    if let Err(err) = AxumDevServer::with_config(router, config).run() {
+
+    let result = match &tls_paths {
+        Some(paths) => serve_https(router, &config, paths),
+        None => {
+            log::info!("Listening on http://{}", config.addr);
+            AxumDevServer::with_config(router, config)
+                .run()
+                .map_err(|err| format!("{err}"))
+        }
+    };
+
+    if let Err(err) = result {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
+}
+
+/// Serves the router over HTTPS on the configured address.
+fn serve_https(
+    router: edgezero_core::router::RouterService,
+    config: &AxumDevServerConfig,
+    paths: &TlsPaths,
+) -> Result<(), String> {
+    log::info!(
+        "Listening on https://{} with certificate {}",
+        config.addr,
+        paths.certificate.display()
+    );
+    tls::serve_https(router, config.addr, paths).map_err(|err| format!("{err:?}"))
 }
 
 /// Read a port number from the `PORT` environment variable.

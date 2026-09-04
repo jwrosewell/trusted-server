@@ -20,19 +20,21 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true, features = ["tls-rustls"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tower = { workspace = true, features = ["util"] }
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
 base64 = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tower = { workspace = true, features = ["util"] }

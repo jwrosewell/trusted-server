@@ -40,6 +40,7 @@ anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
+axum-server = { version = "0.8", default-features = false }
 base64 = "0.22"
 brotli = "8.0"
 build-print = "1.0.1"
