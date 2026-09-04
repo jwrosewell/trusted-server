@@ -250,12 +250,14 @@ fn process_and_encode_chunk<P: StreamProcessor>(
     is_last: bool,
     process_error: &str,
 ) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
-    let processed =
-        processor
-            .process_chunk(chunk, is_last)
-            .change_context(TrustedServerError::Proxy {
-                message: process_error.to_string(),
-            })?;
+    let processed = processor.process_chunk(chunk, is_last).change_context(
+        // The origin answered; this server failed on its bytes. Kept distinct
+        // from `OriginUnreachable` so an operator reading the log is not sent
+        // to check an origin that is healthy.
+        TrustedServerError::ResponseRewrite {
+            message: process_error.to_string(),
+        },
+    )?;
     if processed.is_empty() {
         return Ok(None);
     }
@@ -4597,8 +4599,15 @@ pub async fn handle_publisher_request(
                 )
                 .await;
             }
-            return Err(err.change_context(TrustedServerError::Proxy {
-                message: "Failed to proxy request to origin".to_string(),
+            // Named as an origin fault rather than a generic proxy error, so
+            // the log tells this apart from a rewriting failure. Both still
+            // answer the visitor with the same 502.
+            log::error!(
+                "Publisher origin request failed before any response bytes were processed: origin={}",
+                settings.publisher.origin_url
+            );
+            return Err(err.change_context(TrustedServerError::OriginUnreachable {
+                message: "Failed to reach the publisher origin".to_string(),
             }));
         }
     };

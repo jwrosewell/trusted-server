@@ -72,6 +72,27 @@ pub enum TrustedServerError {
     #[display("Proxy error: {message}")]
     Proxy { message: String },
 
+    /// The origin could not be reached, or answered in a way that ended the
+    /// exchange before any of its bytes were processed.
+    ///
+    /// Separate from [`ResponseRewrite`](Self::ResponseRewrite) because the two
+    /// produce the same 502 for the visitor and an operator seeing only that
+    /// 502 will check the origin, find it healthy, and stop looking. The
+    /// visitor-facing response is deliberately identical: what changes is that
+    /// the log now names which of the two happened.
+    #[display("Origin unreachable: {message}")]
+    OriginUnreachable { message: String },
+
+    /// The origin answered, and this server failed while rewriting its
+    /// response.
+    ///
+    /// The counterpart to [`OriginUnreachable`](Self::OriginUnreachable). This
+    /// is our fault, not the origin's, and it is per-response: the same origin
+    /// is usually serving every other page correctly at the same moment, which
+    /// is exactly the shape of fault an undifferentiated 502 hides longest.
+    #[display("Response rewriting failed: {message}")]
+    ResponseRewrite { message: String },
+
     /// Request understood but not permitted — results in a 403 Forbidden response.
     #[display("Forbidden: {message}")]
     Forbidden { message: String },
@@ -126,6 +147,12 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            // Both stay 502 and both stay fail-closed. Telling them apart is
+            // an operator concern, so it is done in the log rather than by
+            // changing what the visitor gets.
+            Self::OriginUnreachable { .. } | Self::ResponseRewrite { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
@@ -266,6 +293,18 @@ mod tests {
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
+            (
+                TrustedServerError::OriginUnreachable {
+                    message: String::from("connection refused"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::ResponseRewrite {
+                    message: String::from("HTML processing failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
         ];
 
         // `mapped_status` is an exhaustive match with no `_` arm, so adding a
@@ -289,6 +328,8 @@ mod tests {
                 TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::OriginUnreachable { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::ResponseRewrite { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
                 TrustedServerError::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
                 TrustedServerError::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -309,6 +350,47 @@ mod tests {
                 "exhaustive mapping should agree with the table for {error:?}",
             );
         }
+    }
+
+    #[test]
+    fn a_dead_origin_and_a_broken_rewriter_differ_only_in_the_log() {
+        // Defect 16. On 3 September 2026 an unreachable origin and a rewriter
+        // that aborted on one page's markup produced byte-identical 502s, so
+        // an operator checked the origin, found it healthy, and stopped
+        // looking. The visitor-facing behaviour stays fail-closed and
+        // identical on purpose; what has to differ is what the log says.
+        let dead_origin = TrustedServerError::OriginUnreachable {
+            message: "Failed to reach the publisher origin".to_string(),
+        };
+        let broken_rewriter = TrustedServerError::ResponseRewrite {
+            message: "Failed to process chunk".to_string(),
+        };
+
+        assert_eq!(
+            dead_origin.status_code(),
+            broken_rewriter.status_code(),
+            "both causes must still answer the visitor with the same status"
+        );
+        assert_eq!(
+            dead_origin.user_message(),
+            broken_rewriter.user_message(),
+            "both causes must still give the visitor the same body"
+        );
+        assert_ne!(
+            dead_origin.to_string(),
+            broken_rewriter.to_string(),
+            "the two causes must be tellable apart in the log"
+        );
+        assert!(
+            dead_origin.to_string().starts_with("Origin unreachable:"),
+            "the origin fault should name the origin, got: {dead_origin}"
+        );
+        assert!(
+            broken_rewriter
+                .to_string()
+                .starts_with("Response rewriting failed:"),
+            "the rewriting fault should name the rewrite, got: {broken_rewriter}"
+        );
     }
 
     #[test]
@@ -348,6 +430,12 @@ mod tests {
             },
             TrustedServerError::InsecureDefault {
                 field: "ec.passphrase".into(),
+            },
+            TrustedServerError::OriginUnreachable {
+                message: "tcp connect error".into(),
+            },
+            TrustedServerError::ResponseRewrite {
+                message: "HTML processing failed".into(),
             },
         ];
         for error in &cases {
@@ -416,6 +504,8 @@ mod tests {
             | TrustedServerError::Prebid { .. }
             | TrustedServerError::Integration { .. }
             | TrustedServerError::Proxy { .. }
+            | TrustedServerError::OriginUnreachable { .. }
+            | TrustedServerError::ResponseRewrite { .. }
             | TrustedServerError::Forbidden { .. }
             | TrustedServerError::AllowlistViolation { .. }
             | TrustedServerError::Settings { .. }
@@ -527,6 +617,18 @@ mod tests {
             (
                 TrustedServerError::Proxy {
                     message: "proxy failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::OriginUnreachable {
+                    message: "connection refused".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::ResponseRewrite {
+                    message: "HTML processing failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
             ),

@@ -249,8 +249,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
+                    // A rewriting fault, not an origin fault. Kept distinct so
+                    // the log can tell the two apart.
                     let final_chunk = self.processor.process_chunk(&[], true).change_context(
-                        TrustedServerError::Proxy {
+                        TrustedServerError::ResponseRewrite {
                             message: "Failed to process final chunk".to_owned(),
                         },
                     )?;
@@ -267,7 +269,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                     let processed = self
                         .processor
                         .process_chunk(&buffer[..n], false)
-                        .change_context(TrustedServerError::Proxy {
+                        .change_context(TrustedServerError::ResponseRewrite {
                             message: "Failed to process chunk".to_owned(),
                         })?;
                     if !processed.is_empty() {
