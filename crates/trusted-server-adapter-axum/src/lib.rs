@@ -11,3 +11,5 @@ pub mod ec_kv;
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
 pub mod platform;
+/// Optional TLS termination, off unless a certificate is configured.
+pub mod tls;
