@@ -1,17 +1,22 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
+use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -523,42 +528,164 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent KV store
+// ---------------------------------------------------------------------------
+
+/// Logical KV store id this application declares in `edgezero.toml`
+/// (`[stores.kv] default`).
+const DEFAULT_KV_STORE_ID: &str = "trusted_server_kv";
+
+/// Directory holding the adapter's local KV database file.
+///
+/// Matches the `.edgezero/` convention the `EdgeZero` Axum dev server already
+/// uses, which is listed in the repository `.gitignore`.
+const DEFAULT_KV_DIR: &str = ".edgezero";
+
+/// Process-wide KV store, published by [`init_kv_store`] before the server
+/// starts accepting requests.
+static KV_STORE: OnceLock<Arc<dyn PlatformKvStore>> = OnceLock::new();
+
+/// Warn-once guard for requests served before [`init_kv_store`] ran.
+static KV_UNINITIALIZED_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Resolves the file path backing the adapter's persistent KV store.
+///
+/// Resolution order, both read from the `EDGEZERO__*` environment layer that
+/// already supplies every other adapter store binding:
+///
+/// 1. `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH` — a complete path,
+///    used verbatim. An appliance sets this so durable state lives outside
+///    the working directory.
+/// 2. Otherwise `.edgezero/<store name>.redb`, where the store name comes
+///    from `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` and falls back to
+///    the logical id `trusted_server_kv`.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::env_config::EnvConfig;
+/// use trusted_server_adapter_axum::platform::kv_store_path;
+///
+/// let env = EnvConfig::from_vars(Vec::<(String, String)>::new());
+/// assert!(
+///     kv_store_path(&env).ends_with("trusted_server_kv.redb"),
+///     "should derive the file name from the logical store id"
+/// );
+/// ```
+#[must_use]
+pub fn kv_store_path(env: &EnvConfig) -> PathBuf {
+    if let Some(path) = env
+        .get(&["stores", "kv", DEFAULT_KV_STORE_ID, "path"])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+
+    let store_name = env.store_name("kv", DEFAULT_KV_STORE_ID);
+    Path::new(DEFAULT_KV_DIR).join(format!("{store_name}.redb"))
+}
+
+/// Opens a persistent KV store at `path`, creating the parent directory and
+/// the database file when they do not exist.
+///
+/// This is the seam the contract tests drive, so the store they exercise is
+/// built exactly the way a request-serving process builds it.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::KvStore`] when the parent directory cannot be
+/// created or the database file cannot be opened. A file already locked by
+/// another process is reported here too, because `redb` takes an exclusive
+/// lock and only one process may hold a database file at a time.
+pub fn open_kv_store(path: &Path) -> Result<Arc<dyn PlatformKvStore>, Report<TrustedServerError>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            Report::new(err).change_context(TrustedServerError::KvStore {
+                store_name: DEFAULT_KV_STORE_ID.to_owned(),
+                message: format!("Failed to create KV store directory {}", parent.display()),
+            })
+        })?;
+    }
+
+    let store = PersistentKvStore::new(path).map_err(|err| {
+        Report::new(err).change_context(TrustedServerError::KvStore {
+            store_name: DEFAULT_KV_STORE_ID.to_owned(),
+            message: format!("Failed to open KV database at {}", path.display()),
+        })
+    })?;
+
+    Ok(Arc::new(store) as Arc<dyn PlatformKvStore>)
+}
+
+/// Opens the persistent KV store and publishes it for request handling.
+///
+/// Returns the path that was opened so the caller can log it. Call this once,
+/// before the server starts accepting requests. A second call leaves the
+/// already-published store in place and returns the path it would have used.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::KvStore`] when the store cannot be opened.
+/// The caller is expected to fail startup: serving traffic without the store
+/// would silently drop the identity and consent state the store exists to
+/// keep, and a dropped consent withdrawal is indistinguishable from a reader
+/// who never withdrew.
+pub fn init_kv_store(env: &EnvConfig) -> Result<PathBuf, Report<TrustedServerError>> {
+    let path = kv_store_path(env);
+    let store = open_kv_store(&path)?;
+
+    // `set` fails only when the store was already published, which is a
+    // repeated call rather than a reason to fail startup.
+    let _ = KV_STORE.set(store);
+    Ok(path)
+}
+
+/// Returns the published KV store, or an unavailable stand-in when
+/// [`init_kv_store`] has not run.
+///
+/// The stand-in is only reachable from in-process test harnesses that build a
+/// router directly; the binary always initializes the store first and exits if
+/// it cannot.
+fn kv_store() -> Arc<dyn PlatformKvStore> {
+    if let Some(store) = KV_STORE.get() {
+        return Arc::clone(store);
+    }
+
+    KV_UNINITIALIZED_WARNED.get_or_init(|| {
+        log::warn!(
+            "KV store was not initialized before serving, so this process falls \
+             back to UnavailableKvStore. Call init_kv_store at startup."
+        );
+    });
+    Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Axum request.
 ///
-/// # Degraded features in dev
-///
-/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
-/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
-/// emitted once per process.
+/// The KV store is the persistent `redb`-backed store opened by
+/// [`init_kv_store`] at startup. When that has not run, which is only
+/// reachable from an in-process test harness, the request falls back to
+/// [`trusted_server_core::platform::UnavailableKvStore`] and a `warn` is
+/// logged once per process.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!(
-            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
-             Routes that depend on synthetic-ID or consent KV will degrade gracefully."
-        );
-    });
-
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
-    use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
-    };
-
     // Stateless shims are promoted to process-wide statics so callers clone
     // an existing Arc instead of allocating a new one per request.
-    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
-        std::sync::OnceLock::new();
-    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
-        std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
-    static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
-    static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    static CONFIG_STORE: OnceLock<Arc<dyn PlatformConfigStore>> = OnceLock::new();
+    static SECRET_STORE: OnceLock<Arc<dyn PlatformSecretStore>> = OnceLock::new();
+    static BACKEND: OnceLock<Arc<dyn PlatformBackend>> = OnceLock::new();
+    static GEO: OnceLock<Arc<dyn PlatformGeo>> = OnceLock::new();
 
     RuntimeServices::builder()
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
@@ -567,9 +694,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
+        .kv_store(kv_store())
         .backend(Arc::clone(BACKEND.get_or_init(|| {
             Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
         })))
@@ -817,5 +942,89 @@ mod tests {
         });
 
         format!("http://{addr}/")
+    }
+
+    // -----------------------------------------------------------------------
+    // KV store path resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kv_store_path_defaults_to_the_logical_store_id() {
+        let env = EnvConfig::from_vars(Vec::<(String, String)>::new());
+
+        assert_eq!(
+            kv_store_path(&env),
+            Path::new(".edgezero").join("trusted_server_kv.redb"),
+            "should derive the default path from the edgezero.toml store id"
+        );
+    }
+
+    #[test]
+    fn kv_store_path_honors_an_explicit_path_override() {
+        let env = EnvConfig::from_vars(vec![(
+            "EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH",
+            "/var/lib/trusted-server/kv.redb",
+        )]);
+
+        assert_eq!(
+            kv_store_path(&env),
+            PathBuf::from("/var/lib/trusted-server/kv.redb"),
+            "an appliance must be able to move durable state out of the working directory"
+        );
+    }
+
+    #[test]
+    fn kv_store_path_falls_back_when_the_override_is_blank() {
+        let env = EnvConfig::from_vars(vec![(
+            "EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH",
+            "   ",
+        )]);
+
+        assert_eq!(
+            kv_store_path(&env),
+            Path::new(".edgezero").join("trusted_server_kv.redb"),
+            "a blank override must not produce an empty path"
+        );
+    }
+
+    #[test]
+    fn kv_store_path_uses_the_store_name_override_for_the_file_name() {
+        let env = EnvConfig::from_vars(vec![(
+            "EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME",
+            "tenant_a",
+        )]);
+
+        assert_eq!(
+            kv_store_path(&env),
+            Path::new(".edgezero").join("tenant_a.redb"),
+            "two instances in one directory must be able to use separate files"
+        );
+    }
+
+    #[test]
+    fn open_kv_store_creates_the_database_and_round_trips_a_value() {
+        let path = std::env::temp_dir()
+            .join(format!("trusted-server-kv-open-{}", std::process::id()))
+            .join("trusted_server_kv.redb");
+        let _ = std::fs::remove_file(&path);
+
+        let store = open_kv_store(&path).expect("should open a temporary KV store");
+        futures::executor::block_on(async {
+            store
+                .put_bytes("k", bytes::Bytes::from_static(b"v"))
+                .await
+                .expect("should write");
+            assert_eq!(
+                store.get_bytes("k").await.expect("should read"),
+                Some(bytes::Bytes::from_static(b"v")),
+                "the injected store must return what was written to it"
+            );
+        });
+
+        assert!(
+            path.exists(),
+            "opening the store must create the database file"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

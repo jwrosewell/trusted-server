@@ -33,6 +33,7 @@ trusted-server-core = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }

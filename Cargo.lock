@@ -5345,6 +5345,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
