@@ -291,6 +291,90 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// Locate the target URL inside a `meta http-equiv="refresh"` `content` value.
+///
+/// The value is a delay, then optionally a `;` or `,` separator, optional
+/// whitespace, an optional case-insensitive `url=` keyword, and then the
+/// target, which may be wrapped in single or double quotes. Only the target is
+/// a URL, so only the target may be rewritten: the delay is a number and
+/// touching it would change how long the visitor waits.
+///
+/// Returns the byte range of the target within `content`, or `None` when the
+/// value carries no target (`content="5"`, an empty value, or an empty target).
+fn meta_refresh_url_range(content: &str) -> Option<core::ops::Range<usize>> {
+    let bytes = content.as_bytes();
+
+    // The delay ends at the first separator. With no separator there is no
+    // target, unless the value opens with the `url=` keyword, which browsers
+    // accept even though the HTML specification asks for a delay first.
+    let mut cursor = match bytes.iter().position(|byte| matches!(byte, b';' | b',')) {
+        Some(separator) => separator + 1,
+        None => 0,
+    };
+
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    // The optional `url=` keyword, matched without regard to case, with
+    // whitespace tolerated on either side of the `=` as browsers tolerate it.
+    if content[cursor..]
+        .get(..3)
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("url"))
+    {
+        let mut probe = cursor + 3;
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+        if bytes.get(probe) == Some(&b'=') {
+            probe += 1;
+            while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+            cursor = probe;
+        }
+    }
+
+    let mut end = bytes.len();
+    // A quoted target ends at its closing quote. An unquoted one runs to the
+    // end of the value, with trailing whitespace excluded.
+    if let Some(quote) = bytes
+        .get(cursor)
+        .copied()
+        .filter(|byte| matches!(*byte, b'"' | b'\''))
+    {
+        cursor += 1;
+        end = content[cursor..]
+            .find(char::from(quote))
+            .map_or(bytes.len(), |offset| cursor + offset);
+    } else {
+        while end > cursor && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+    }
+
+    (cursor < end).then_some(cursor..end)
+}
+
+/// Rewrite only the target URL of a `meta http-equiv="refresh"` `content`
+/// value, leaving the delay, the separator, the keyword and any quotes exactly
+/// as the origin wrote them.
+///
+/// Returns `None` when there is no target, or when `rewrite_url` declines it,
+/// so the caller can leave the attribute untouched.
+fn rewrite_meta_refresh_content(
+    content: &str,
+    rewrite_url: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let range = meta_refresh_url_range(content)?;
+    let rewritten = rewrite_url(&content[range.clone()])?;
+    let mut out = String::with_capacity(content.len() + rewritten.len());
+    out.push_str(&content[..range.start]);
+    out.push_str(&rewritten);
+    out.push_str(&content[range.end..]);
+    Some(out)
+}
+
 /// Create an HTML processor with URL replacement and integration hooks.
 ///
 /// # Panics
@@ -714,6 +798,36 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if imagesrcset != original_imagesrcset {
                         el.set_attribute("imagesrcset", &imagesrcset)?;
                     }
+                }
+                Ok(())
+            }
+        }),
+        // `<meta http-equiv="refresh" content="5; url=...">` navigates the
+        // visitor to the target on its own, so an unrewritten one takes them
+        // off the proxy entirely and every request after it goes straight to
+        // the origin. That is a different order of loss from a single asset
+        // leaking, because nothing afterwards is proxied at all.
+        //
+        // No handler covered the `content` attribute. The other
+        // `meta[http-equiv][content]` handler in this file is registered only
+        // for the template-cache nonce gate, reads a CSP policy, and never
+        // writes.
+        element!("meta[http-equiv][content]", {
+            let patterns = patterns.clone();
+            move |el| {
+                let is_refresh = el
+                    .get_attribute("http-equiv")
+                    .is_some_and(|equiv| equiv.trim().eq_ignore_ascii_case("refresh"));
+                if !is_refresh {
+                    return Ok(());
+                }
+                let Some(content) = el.get_attribute("content") else {
+                    return Ok(());
+                };
+                if let Some(rewritten) =
+                    rewrite_meta_refresh_content(&content, |url| patterns.rewrite_url_value(url))
+                {
+                    el.set_attribute("content", &rewritten)?;
                 }
                 Ok(())
             }
@@ -2317,6 +2431,148 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    /// Run one document through the processor with the shared test config
+    /// (`origin.example.com` -> `test.example.com`, https).
+    fn render_with_test_config(html: &str) -> String {
+        let mut processor = create_html_processor(create_test_config());
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        String::from_utf8(output).expect("output should be valid UTF-8")
+    }
+
+    fn rewrite_refresh(content: &str) -> Option<String> {
+        rewrite_meta_refresh_content(content, |url| {
+            url.strip_prefix("http://origin.example.com")
+                .map(|rest| format!("https://test.example.com{rest}"))
+        })
+    }
+
+    #[test]
+    fn meta_refresh_rewrites_the_target_and_leaves_the_delay() {
+        assert_eq!(
+            rewrite_refresh("30;url=http://origin.example.com/refreshed"),
+            Some("30;url=https://test.example.com/refreshed".to_string()),
+            "should rewrite only the target and keep the delay"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_accepts_the_forms_browsers_accept() {
+        let cases = [
+            // Whitespace after the separator.
+            (
+                "5; url=http://origin.example.com/a",
+                "5; url=https://test.example.com/a",
+            ),
+            // The keyword is case-insensitive.
+            (
+                "5;URL=http://origin.example.com/a",
+                "5;URL=https://test.example.com/a",
+            ),
+            (
+                "5;Url = http://origin.example.com/a",
+                "5;Url = https://test.example.com/a",
+            ),
+            // Double-quoted target.
+            (
+                "0; url=\"http://origin.example.com/a\"",
+                "0; url=\"https://test.example.com/a\"",
+            ),
+            // Single-quoted target.
+            (
+                "0; url='http://origin.example.com/a'",
+                "0; url='https://test.example.com/a'",
+            ),
+            // A comma separator, which browsers accept as well.
+            (
+                "0,url=http://origin.example.com/a",
+                "0,url=https://test.example.com/a",
+            ),
+            // No keyword at all, just delay and target.
+            (
+                "0; http://origin.example.com/a",
+                "0; https://test.example.com/a",
+            ),
+            // Trailing whitespace is preserved rather than swallowed.
+            (
+                "0; url=http://origin.example.com/a  ",
+                "0; url=https://test.example.com/a  ",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                rewrite_refresh(input),
+                Some(expected.to_string()),
+                "should rewrite the target in `{input}`"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_refresh_leaves_a_value_with_no_target_alone() {
+        for input in ["5", "", "  ", "5;", "5; url=", "5; url"] {
+            assert_eq!(
+                rewrite_refresh(input),
+                None,
+                "should leave `{input}` alone because it carries no target"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_refresh_leaves_a_third_party_target_alone() {
+        assert_eq!(
+            rewrite_refresh("5; url=http://other.example.net/a"),
+            None,
+            "should not rewrite a target that is not the origin"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_content_is_rewritten_in_a_document() {
+        // Defect 11a. Reproduced against the appliance on 3 September 2026 with
+        // `.claude/corpus-serve/05-meta-refresh.html`, which came back
+        // byte-identical to the origin, so the visitor left the proxy after the
+        // delay and every request after that went direct.
+        let html = concat!(
+            "<!doctype html><html><head>",
+            "<meta http-equiv=\"refresh\" content=\"30;url=https://origin.example.com/refreshed\">",
+            "</head><body></body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("content=\"30;url=https://test.example.com/refreshed\""),
+            "should rewrite the refresh target and keep the delay, got: {output}"
+        );
+        assert!(
+            !output.contains("origin.example.com"),
+            "should leave no origin host in the refresh target, got: {output}"
+        );
+    }
+
+    #[test]
+    fn a_non_refresh_meta_content_is_left_alone() {
+        // `http-equiv` values other than `refresh` carry policies, not URLs, and
+        // a policy that merely names the origin must not be edited.
+        let html = concat!(
+            "<!doctype html><html><head>",
+            "<meta http-equiv=\"content-security-policy\" ",
+            "content=\"default-src https://origin.example.com\">",
+            "</head><body></body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("content=\"default-src https://origin.example.com\""),
+            "should leave a non-refresh meta content untouched, got: {output}"
         );
     }
 }
