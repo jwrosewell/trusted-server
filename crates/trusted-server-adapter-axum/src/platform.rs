@@ -196,6 +196,59 @@ impl PlatformGeo for AxumPlatformGeo {
 // PlatformHttpClient
 // ---------------------------------------------------------------------------
 
+/// Maximum buffered upstream response body.
+///
+/// The Fastly adapter caps origin responses at this size
+/// (`MAX_PLATFORM_RESPONSE_BODY_BYTES` in
+/// `crates/trusted-server-adapter-fastly/src/platform.rs`) and the Cloudflare
+/// adapter mirrors it
+/// (`crates/trusted-server-adapter-cloudflare/src/platform.rs`). This adapter
+/// buffers the whole upstream response with `resp.bytes()`, so without the same
+/// cap a large or hostile upstream grows the process heap without bound. The
+/// value is copied from those two rather than chosen here, so all three
+/// adapters accept and reject the same responses.
+const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Rejects an upstream response whose declared `Content-Length` is over the cap.
+///
+/// `Content-Length` is advisory and absent on chunked responses, so this only
+/// rejects honestly-declared large bodies, before any bytes are copied.
+/// [`reject_oversized_body`] is the real guard. Mirrors the two-stage cap in
+/// the Fastly and Cloudflare adapters.
+fn reject_oversized_content_length(
+    headers: &reqwest::header::HeaderMap,
+    uri: &str,
+) -> Result<(), Report<PlatformError>> {
+    let Some(claimed_len) = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+
+    if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "origin Content-Length {claimed_len} from {uri} exceeds \
+             {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects an upstream response body that is over the cap once buffered.
+///
+/// Belt and braces for a chunked response that declares no `Content-Length`.
+fn reject_oversized_body(len: usize, uri: &str) -> Result<(), Report<PlatformError>> {
+    if len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "origin response body {len} bytes from {uri} exceeds \
+             {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
 type SpawnedRequestResult = Result<(u16, Vec<(String, Vec<u8>)>, Vec<u8>), Report<PlatformError>>;
 
 fn sanitized_response_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -359,6 +412,7 @@ impl AxumPlatformHttpClient {
             .attach(format!("outbound request to {uri} failed"))?;
 
         let status = resp.status().as_u16();
+        reject_oversized_content_length(resp.headers(), &uri)?;
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in sanitized_response_headers(resp.headers()) {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
@@ -367,9 +421,7 @@ impl AxumPlatformHttpClient {
             .bytes()
             .await
             .change_context(PlatformError::HttpClient)?;
-        // Upstream responses are buffered whole with no cap — acceptable for
-        // the dev server, but log the size so a large or hostile upstream is
-        // visible instead of silently growing the heap.
+        reject_oversized_body(resp_bytes.len(), &uri)?;
         log::debug!(
             "buffered {} upstream response bytes from {uri}",
             resp_bytes.len()
@@ -433,14 +485,14 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                     .attach(format!("outbound request to {uri} failed: {e}"))
             })?;
             let status = resp.status().as_u16();
+            reject_oversized_content_length(resp.headers(), &uri)?;
             let resp_headers = sanitized_response_headers(resp.headers());
             let body = resp
                 .bytes()
                 .await
                 .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
                 .to_vec();
-            // Same unbounded-buffering note as the synchronous path: log the
-            // size so large upstream responses are visible in dev.
+            reject_oversized_body(body.len(), &uri)?;
             log::debug!("buffered {} upstream response bytes from {uri}", body.len());
             Ok::<_, Report<PlatformError>>((status, resp_headers, body))
         });
@@ -817,5 +869,105 @@ mod tests {
         });
 
         format!("http://{addr}/")
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream response body cap
+    // -----------------------------------------------------------------------
+
+    /// Builds a header map carrying a single `Content-Length`.
+    fn content_length_headers(value: usize) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_str(&value.to_string())
+                .expect("should build content-length header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn content_length_at_the_cap_is_accepted() {
+        assert!(
+            reject_oversized_content_length(
+                &content_length_headers(MAX_PLATFORM_RESPONSE_BODY_BYTES),
+                "https://origin.example/asset"
+            )
+            .is_ok(),
+            "a response exactly at the cap must still be served"
+        );
+    }
+
+    #[test]
+    fn content_length_over_the_cap_is_rejected() {
+        assert!(
+            reject_oversized_content_length(
+                &content_length_headers(MAX_PLATFORM_RESPONSE_BODY_BYTES + 1),
+                "https://origin.example/asset"
+            )
+            .is_err(),
+            "a declared body one byte over the cap must be refused before it is copied"
+        );
+    }
+
+    #[test]
+    fn missing_content_length_is_accepted() {
+        assert!(
+            reject_oversized_content_length(
+                &reqwest::header::HeaderMap::new(),
+                "https://origin.example/asset"
+            )
+            .is_ok(),
+            "a chunked response declares no length, so the post-buffer check is the guard"
+        );
+    }
+
+    #[test]
+    fn buffered_body_at_the_cap_is_accepted() {
+        assert!(
+            reject_oversized_body(
+                MAX_PLATFORM_RESPONSE_BODY_BYTES,
+                "https://origin.example/asset"
+            )
+            .is_ok(),
+            "a body exactly at the cap must still be served"
+        );
+    }
+
+    #[test]
+    fn buffered_body_over_the_cap_is_rejected() {
+        assert!(
+            reject_oversized_body(
+                MAX_PLATFORM_RESPONSE_BODY_BYTES + 1,
+                "https://origin.example/asset"
+            )
+            .is_err(),
+            "a chunked response over the cap must be refused once buffered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_rejects_an_oversized_declared_response() {
+        // 10 MiB + 1, one byte past MAX_PLATFORM_RESPONSE_BODY_BYTES.
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Length: 10485761\r\n\
+              \r\n",
+        )
+        .await;
+
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let result = AxumPlatformHttpClient::new()
+            .send(PlatformHttpRequest::new(request, "test_backend"))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an origin declaring more than the cap must fail rather than be buffered"
+        );
     }
 }
