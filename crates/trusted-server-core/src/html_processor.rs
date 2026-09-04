@@ -291,12 +291,14 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Rewrite the URL-valued strings inside a JSON-LD block.
+/// Rewrite the asset URLs inside a JSON-LD block.
 ///
-/// The block is parsed as JSON and every string value the caller claims as a
-/// URL is replaced, rather than the text being substituted blind. A blind
-/// substitution would also hit identifiers, prose and escape sequences that
-/// merely contain the host.
+/// The block is parsed as JSON and only the strings under an asset-bearing key
+/// are replaced, listed in [`JSON_LD_ASSET_KEYS`]. Neither a blind text
+/// substitution nor a key-blind walk of the parsed document is safe here:
+/// both claim the schema.org identity fields, `@id` and the canonical `url`
+/// among them, which would tell a search engine the publisher's identity lives
+/// somewhere it does not.
 ///
 /// Returns `None`, meaning leave the origin's bytes exactly as they are, when
 /// the text is not valid JSON, when nothing was rewritten, or when
@@ -305,7 +307,9 @@ impl HtmlProcessorConfig {
 /// to `</script>` and would otherwise close the element early.
 fn rewrite_json_ld(text: &str, rewrite_url: impl Fn(&str) -> Option<String>) -> Option<String> {
     let mut document = serde_json::from_str::<serde_json::Value>(text).ok()?;
-    if !rewrite_json_strings(&mut document, &rewrite_url) {
+    // `false` at the root, because a bare string at the top of the document is
+    // not under any key and so is never an asset.
+    if !rewrite_json_ld_values(&mut document, false, &rewrite_url) {
         return None;
     }
 
@@ -320,31 +324,80 @@ fn rewrite_json_ld(text: &str, rewrite_url: impl Fn(&str) -> Option<String>) -> 
     Some(rewritten)
 }
 
-/// Replace every string in `value` that `rewrite_url` claims, reporting
-/// whether anything changed.
+/// The only JSON-LD keys whose string value is rewritten.
+///
+/// Every one of these names a file a consumer fetches. Everything else is left
+/// alone, and the ones that must never be touched are worth naming: `@id` is
+/// the entity's identifier rather than a place to fetch, `url` on a `WebPage`,
+/// `WebSite` or `Organization` is the canonical address, and `@context`,
+/// `sameAs`, `mainEntityOfPage` and `potentialAction.target` are all
+/// identifiers or off-site references.
+///
+/// This list is deliberately short. A key-blind walk over the document looks
+/// equivalent and is not: on a Yoast `@graph`, which nearly every `WordPress`
+/// article carries, it claims the whole identity block, so the publisher's
+/// `@id` and canonical `url` are reported to search engines as living
+/// somewhere else. Yoast still gives an `ImageObject` both `url` and
+/// `contentUrl` with the same value, so the asset is reached through
+/// `contentUrl` and the identity beside it is untouched.
+///
+/// Matched exactly. schema.org key names are camelCase and case-sensitive.
+const JSON_LD_ASSET_KEYS: [&str; 6] = [
+    "contentUrl",
+    "thumbnailUrl",
+    "embedUrl",
+    "image",
+    "logo",
+    "thumbnail",
+];
+
+/// Replace the strings in `value` that sit under one of
+/// [`JSON_LD_ASSET_KEYS`] and that `rewrite_url` claims, reporting whether
+/// anything changed.
+///
+/// `under_asset_key` says whether the value being visited was reached through
+/// one of those keys. It is decided afresh at each object, so `image` holding
+/// an object rewrites that object's `contentUrl` and leaves its `@id` alone,
+/// and it is carried through an array, so `image` holding a list of strings
+/// rewrites all of them.
 ///
 /// The depth is bounded by `serde_json`'s own recursion limit on the parse
 /// that produced `value`, so this cannot be driven past the stack by a deeply
 /// nested document.
-fn rewrite_json_strings(
+fn rewrite_json_ld_values(
     value: &mut serde_json::Value,
+    under_asset_key: bool,
     rewrite_url: &impl Fn(&str) -> Option<String>,
 ) -> bool {
     match value {
-        serde_json::Value::String(text) => match rewrite_url(text) {
+        serde_json::Value::String(text) if under_asset_key => match rewrite_url(text) {
             Some(rewritten) => {
                 *text = rewritten;
                 true
             }
             None => false,
         },
-        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
-            rewrite_json_strings(item, rewrite_url) || changed
-        }),
+        // Written as loops rather than `fold` or `any`, because every element
+        // has to be visited. `any` short-circuits at the first rewrite and
+        // would leave every URL after it pointing at the origin.
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                if rewrite_json_ld_values(item, under_asset_key, rewrite_url) {
+                    changed = true;
+                }
+            }
+            changed
+        }
         serde_json::Value::Object(entries) => {
-            entries.iter_mut().fold(false, |changed, (_, entry)| {
-                rewrite_json_strings(entry, rewrite_url) || changed
-            })
+            let mut changed = false;
+            for (key, entry) in entries {
+                let is_asset = JSON_LD_ASSET_KEYS.contains(&key.as_str());
+                if rewrite_json_ld_values(entry, is_asset, rewrite_url) {
+                    changed = true;
+                }
+            }
+            changed
         }
         _ => false,
     }
@@ -2503,44 +2556,153 @@ mod tests {
         );
     }
 
+    /// The identity half of a Yoast `@graph`, the block nearly every `WordPress`
+    /// article carries. Every string in it is an identifier or a canonical
+    /// address, and not one of them names a file anything fetches.
+    fn yoast_identity_graph() -> &'static str {
+        concat!(
+            "{\"@context\":\"https://schema.org\",\"@graph\":[",
+            "{\"@type\":\"WebPage\",",
+            "\"@id\":\"https://origin.example.com/\",",
+            "\"url\":\"https://origin.example.com/\",",
+            "\"isPartOf\":{\"@id\":\"https://origin.example.com/#website\"},",
+            "\"about\":{\"@id\":\"https://origin.example.com/#organization\"},",
+            "\"breadcrumb\":{\"@id\":\"https://origin.example.com/#breadcrumb\"},",
+            "\"potentialAction\":[{\"@type\":\"ReadAction\",",
+            "\"target\":[\"https://origin.example.com/\"]}]},",
+            "{\"@type\":\"WebSite\",",
+            "\"@id\":\"https://origin.example.com/#website\",",
+            "\"url\":\"https://origin.example.com/\",",
+            "\"publisher\":{\"@id\":\"https://origin.example.com/#organization\"}},",
+            "{\"@type\":\"Organization\",",
+            "\"@id\":\"https://origin.example.com/#organization\",",
+            "\"url\":\"https://origin.example.com/\",",
+            "\"sameAs\":[\"https://example.net/publisher\"],",
+            "\"mainEntityOfPage\":{\"@id\":\"https://origin.example.com/\"}}",
+            "]}"
+        )
+    }
+
+    /// The same graph with the `Organization` logo Yoast really emits: an
+    /// `ImageObject` carrying its own `@id`, a `url` and a `contentUrl`, the
+    /// last two with the same value. Only `contentUrl` names the file.
+    fn yoast_graph_with_logo() -> String {
+        yoast_identity_graph().replace(
+            "\"sameAs\":[\"https://example.net/publisher\"],",
+            concat!(
+                "\"sameAs\":[\"https://example.net/publisher\"],",
+                "\"image\":{\"@id\":\"https://origin.example.com/#/schema/logo/image/\"},",
+                "\"logo\":{\"@type\":\"ImageObject\",",
+                "\"@id\":\"https://origin.example.com/#/schema/logo/image/\",",
+                "\"url\":\"https://origin.example.com/logo.png\",",
+                "\"contentUrl\":\"https://origin.example.com/logo.png\"},"
+            ),
+        )
+    }
+
+    fn render_json_ld(block: &str) -> String {
+        let html = format!(
+            "<!doctype html><html><head>\
+             <script type=\"application/ld+json\">{block}</script>\
+             </head><body></body></html>"
+        );
+        render_with_test_config(&html)
+    }
+
     #[test]
-    fn json_ld_urls_are_rewritten() {
+    fn json_ld_asset_urls_are_rewritten() {
         // Defect 11d. Reproduced with `.claude/corpus-serve/04-json-ld.html`,
-        // where the whole block came back byte-identical, all three URLs
-        // included.
-        let html = concat!(
-            "<!doctype html><html><head>",
-            "<script type=\"application/ld+json\">",
+        // where the whole block came back byte-identical.
+        //
+        // Only keys naming a file a consumer fetches are rewritten. The other
+        // half of the contract, which matters more, is
+        // `json_ld_identity_fields_are_never_rewritten`.
+        let block = concat!(
             "{\"@context\":\"https://schema.org\",\"@type\":\"NewsArticle\",",
-            "\"url\":\"https://origin.example.com/article/1\",",
-            "\"publisher\":{\"logo\":{\"url\":\"https://origin.example.com/logo.png\"}},",
-            "\"keywords\":[\"news\",\"https://origin.example.com/tag/news\"]}",
-            "</script>",
-            "</head><body></body></html>"
+            "\"thumbnailUrl\":\"https://origin.example.com/thumb.png\",",
+            "\"image\":[\"https://origin.example.com/a.png\",",
+            "\"https://origin.example.com/b.png\"],",
+            "\"video\":{\"@type\":\"VideoObject\",",
+            "\"contentUrl\":\"https://origin.example.com/clip.mp4\",",
+            "\"embedUrl\":\"https://origin.example.com/embed/1\"}}"
         );
 
-        let output = render_with_test_config(html);
+        let output = render_json_ld(block);
 
-        assert!(
-            output.contains("https://test.example.com/article/1"),
-            "should rewrite a top-level URL, got: {output}"
-        );
-        assert!(
-            output.contains("https://test.example.com/logo.png"),
-            "should rewrite a nested URL, got: {output}"
-        );
-        assert!(
-            output.contains("https://test.example.com/tag/news"),
-            "should rewrite a URL inside an array, got: {output}"
-        );
+        for expected in [
+            "https://test.example.com/thumb.png",
+            "https://test.example.com/a.png",
+            "https://test.example.com/b.png",
+            "https://test.example.com/clip.mp4",
+            "https://test.example.com/embed/1",
+        ] {
+            assert!(
+                output.contains(expected),
+                "should rewrite the asset URL `{expected}`, got: {output}"
+            );
+        }
         assert!(
             output.contains("https://schema.org"),
             "should leave a third-party URL alone, got: {output}"
         );
         assert!(
             !output.contains("origin.example.com"),
-            "should leave no origin host behind, got: {output}"
+            "should leave no origin host in a block that is all asset keys, got: {output}"
         );
+    }
+
+    #[test]
+    fn json_ld_identity_fields_are_never_rewritten() {
+        // A defect introduced and corrected during this work. The first
+        // version walked the parsed document ignoring the key, so it claimed
+        // every string the URL rewriter matched. On a Yoast `@graph` that is
+        // the whole identity block: `@id` is the entity's identifier and not a
+        // place to fetch, and `url` on a `WebPage`, `WebSite` or
+        // `Organization` is the canonical address. Rewriting either tells a
+        // search engine the publisher's identity lives somewhere else, on
+        // nearly every article page of nearly every WordPress site.
+        //
+        // Nothing here is under an asset key, so nothing is rewritten and the
+        // origin's bytes are emitted exactly as they arrived.
+        let block = yoast_identity_graph();
+
+        let output = render_json_ld(block);
+
+        assert!(
+            output.contains(block),
+            "should leave a block of pure identity fields byte for byte, got: {output}"
+        );
+    }
+
+    #[test]
+    fn json_ld_keeps_identity_fields_while_rewriting_an_asset_beside_them() {
+        // The same graph plus the logo Yoast really emits, so the block is
+        // rewritten and re-serialized. Every identity field has to survive
+        // that, including the `url` and the `@id` sitting inside the very
+        // `ImageObject` whose `contentUrl` is rewritten.
+        let output = render_json_ld(&yoast_graph_with_logo());
+
+        assert!(
+            output.contains("\"contentUrl\":\"https://test.example.com/logo.png\""),
+            "should rewrite the logo's contentUrl, got: {output}"
+        );
+
+        for identity in [
+            "\"@id\":\"https://origin.example.com/\"",
+            "\"@id\":\"https://origin.example.com/#website\"",
+            "\"@id\":\"https://origin.example.com/#organization\"",
+            "\"@id\":\"https://origin.example.com/#breadcrumb\"",
+            "\"@id\":\"https://origin.example.com/#/schema/logo/image/\"",
+            "\"url\":\"https://origin.example.com/\"",
+            "\"url\":\"https://origin.example.com/logo.png\"",
+            "\"sameAs\":[\"https://example.net/publisher\"]",
+            "\"target\":[\"https://origin.example.com/\"]",
+        ] {
+            assert!(
+                output.contains(identity),
+                "should leave `{identity}` exactly as the publisher wrote it, got: {output}"
+            );
+        }
     }
 
     #[test]
@@ -2549,13 +2711,8 @@ mod tests {
         // leaving a URL pointing at the origin, so a parse failure means no
         // change at all.
         let block = "{ this is not JSON: https://origin.example.com/a }";
-        let html = format!(
-            "<!doctype html><html><head>\
-             <script type=\"application/ld+json\">{block}</script>\
-             </head><body></body></html>"
-        );
 
-        let output = render_with_test_config(&html);
+        let output = render_json_ld(block);
 
         assert!(
             output.contains(block),
@@ -2568,13 +2725,8 @@ mod tests {
         // Nothing to rewrite must mean no re-serialization, which would
         // otherwise reformat the publisher's block and reorder its keys.
         let block = "{\n  \"@context\": \"https://schema.org\",\n  \"name\": \"Example\"\n}";
-        let html = format!(
-            "<!doctype html><html><head>\
-             <script type=\"application/ld+json\">{block}</script>\
-             </head><body></body></html>"
-        );
 
-        let output = render_with_test_config(&html);
+        let output = render_json_ld(block);
 
         assert!(
             output.contains(block),
@@ -2586,17 +2738,16 @@ mod tests {
     fn json_ld_is_not_allowed_to_close_its_own_script_element() {
         // A JSON string holding `<\/script>` parses to `</script>`. Emitting
         // that raw would close the element early, so the block is left alone.
+        //
+        // The `contentUrl` is what makes this reach the guard: without an
+        // asset key nothing would be rewritten and the block would be left
+        // alone for the ordinary reason instead.
         let block = concat!(
-            r#"{"url":"https://origin.example.com/a","#,
+            r#"{"contentUrl":"https://origin.example.com/a.png","#,
             r#""note":"<\/script><img src=x>"}"#
         );
-        let html = format!(
-            "<!doctype html><html><head>\
-             <script type=\"application/ld+json\">{block}</script>\
-             </head><body></body></html>"
-        );
 
-        let output = render_with_test_config(&html);
+        let output = render_json_ld(block);
 
         assert!(
             output.contains(block),
