@@ -77,6 +77,11 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/admin/ec"),
         ("GET", "/_ts/admin/ec/{id}"),
         ("GET", "/_ts/admin/eids"),
+        ("POST", "/_ts/api/v1/batch-sync"),
+        ("GET", "/_ts/api/v1/identify"),
+        ("OPTIONS", "/_ts/api/v1/identify"),
+        ("GET", "/_ts/set-tester"),
+        ("GET", "/_ts/clear-tester"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
@@ -307,10 +312,12 @@ async fn admin_route_without_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_ec_routes_return_501() {
-    // The EC identity graph is Fastly KV backed, so the Axum dev server
-    // answers the admin EC lookup routes locally with 501 instead of letting
-    // them fall through to the publisher fallback.
+async fn authenticated_admin_ec_routes_report_no_identity_graph() {
+    // The Axum adapter now has an EC identity-graph backend, so these routes
+    // serve the real lookup handler instead of a blanket "not supported".
+    // These test settings leave `ec.ec_store` unset, which is the "no graph
+    // configured" case the handler answers with 501, so the assertion pins
+    // that the real handler ran rather than the old stub.
     let sample_ec_id = format!("{}.abc123", "a".repeat(64));
     for path in [
         "/_ts/admin/ec".to_owned(),
@@ -333,7 +340,7 @@ async fn authenticated_admin_ec_routes_return_501() {
         assert_eq!(
             resp.status().as_u16(),
             501,
-            "{path} should report that Axum EC lookup is unsupported"
+            "{path} should report that no EC identity graph is configured"
         );
         assert_eq!(
             resp.headers()

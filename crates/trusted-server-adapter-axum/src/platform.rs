@@ -644,6 +644,17 @@ pub fn init_kv_store(env: &EnvConfig) -> Result<PathBuf, Report<TrustedServerErr
     Ok(path)
 }
 
+/// Returns the published KV store, or `None` when [`init_kv_store`] has not run.
+///
+/// The Edge Cookie identity graph uses this rather than [`kv_store`]: a graph
+/// built over `UnavailableKvStore` would fail every lookup, where `None` lets
+/// the routes answer "not configured", which is what an operator who has not
+/// set `ec.ec_store` should see.
+#[must_use]
+pub fn published_kv_store() -> Option<Arc<dyn PlatformKvStore>> {
+    KV_STORE.get().map(Arc::clone)
+}
+
 /// Returns the published KV store, or an unavailable stand-in when
 /// [`init_kv_store`] has not run.
 ///

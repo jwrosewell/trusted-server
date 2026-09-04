@@ -14,8 +14,11 @@ use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -34,11 +37,14 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
+use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use trusted_server_core::platform::RuntimeServices;
 
+use crate::ec_kv::AxumEcKvStore;
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::platform::{AxumPlatformConfigStore, build_runtime_services, published_kv_store};
+use crate::rate_limiter::InProcessRateLimiter;
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -49,6 +55,9 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Counts the sync-endpoint rate window. Shared across requests, because a
+    /// per-request limiter would count one request and forget it.
+    rate_limiter: Arc<InProcessRateLimiter>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -81,6 +90,7 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        rate_limiter: Arc::new(InProcessRateLimiter::new()),
     }))
 }
 
@@ -144,6 +154,41 @@ where
     Ok(handler(state, services, req)
         .await
         .unwrap_or_else(|e| http_error(&e)))
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cookie identity graph
+// ---------------------------------------------------------------------------
+
+/// Builds the identity graph over this adapter's persistent key-value store.
+///
+/// Returns `None` when `ec.ec_store` is not configured, or when the store was
+/// never opened, which only happens in an in-process test harness that builds
+/// a router without starting the server. Mirrors the Fastly adapter's
+/// `maybe_identity_graph`, which returns `None` on the same missing setting.
+fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    let store_name = settings.ec.ec_store.as_deref()?;
+    let store = published_kv_store()?;
+    Some(KvIdentityGraph::new(AxumEcKvStore::new(store, store_name)))
+}
+
+/// Builds the identity graph, or reports why it cannot be built.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::KvStore`] when `ec.ec_store` is unset or the
+/// store was never opened. The routes that call this cannot do anything useful
+/// without the graph, so they fail rather than answer from nothing.
+fn require_identity_graph(
+    settings: &Settings,
+) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+    maybe_identity_graph(settings).ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.ec_store".to_owned(),
+            message: "ec.ec_store is not configured, or the key-value store was not opened"
+                .to_owned(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -269,8 +314,12 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
-    AdminEcNotSupported,
+    AdminEcLookup,
     AdminEidsLookup,
+    BatchSync,
+    Identify,
+    SetTester,
+    ClearTester,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -298,7 +347,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 16] {
+fn named_routes() -> [NamedRoute; 20] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -325,16 +374,18 @@ fn named_routes() -> [NamedRoute; 16] {
         },
         // Admin EC lookup routes. Registered explicitly (like the key routes
         // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
+        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage. The bare
+        // route reads the EC ID from the caller's `ts-ec` cookie; the
+        // parameterized route takes an explicit EC ID.
         NamedRoute {
             path: "/_ts/admin/ec",
             primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
+            handler: NamedRouteHandler::AdminEcLookup,
         },
         NamedRoute {
             path: "/_ts/admin/ec/{id}",
             primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
+            handler: NamedRouteHandler::AdminEcLookup,
         },
         // Admin EIDs echo: pure request inspection (no KV), so the dev
         // server serves the real handler.
@@ -342,6 +393,33 @@ fn named_routes() -> [NamedRoute; 16] {
             path: "/_ts/admin/eids",
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::AdminEidsLookup,
+        },
+        // Partner sync endpoints, matching the Fastly adapter. Leaving them
+        // unrouted sent an identity payload to the publisher origin through
+        // the fallback, which is both wrong and a disclosure.
+        NamedRoute {
+            path: "/_ts/api/v1/batch-sync",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::BatchSync,
+        },
+        // GET serves the identify response; OPTIONS is the CORS preflight the
+        // browser sends before it.
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::Identify,
+        },
+        // Tester cookie endpoints. Pure cookie writes with no store access,
+        // and a 404 when `tester_cookie.enabled` is false.
+        NamedRoute {
+            path: "/_ts/set-tester",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::SetTester,
+        },
+        NamedRoute {
+            path: "/_ts/clear-tester",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::ClearTester,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -439,16 +517,45 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
-                        Ok(admin_ec_lookup_not_supported())
+                    NamedRouteHandler::AdminEcLookup => {
+                        // Read-only diagnostic. It deliberately builds its own
+                        // graph rather than a bot-gated one, because operators
+                        // reach this authenticated route with curl.
+                        let partner_registry =
+                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        let kv = maybe_identity_graph(&state.settings);
+                        handle_admin_ec_lookup(kv.as_ref(), &partner_registry, &req)
                     }
                     NamedRouteHandler::AdminEidsLookup => {
                         let partner_registry =
                             PartnerRegistry::from_config(&state.settings.ec.partners)?;
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
+                    NamedRouteHandler::BatchSync => {
+                        let kv = require_identity_graph(&state.settings)?;
+                        let partner_registry =
+                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        handle_batch_sync(&kv, &partner_registry, state.rate_limiter.as_ref(), req)
+                    }
+                    NamedRouteHandler::Identify => {
+                        if req.method() == Method::OPTIONS {
+                            cors_preflight_identify(&state.settings, &req)
+                        } else {
+                            let kv = require_identity_graph(&state.settings)?;
+                            let partner_registry =
+                                PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                            let ec_context = build_ec_context(&state, &services, &req);
+                            handle_identify(
+                                &state.settings,
+                                &kv,
+                                &partner_registry,
+                                &req,
+                                &ec_context,
+                            )
+                        }
+                    }
+                    NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
+                    NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent

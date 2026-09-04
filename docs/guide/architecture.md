@@ -50,6 +50,11 @@ Native Axum dev/test adapter (native binary):
 - Local development and integration-test adapter — not a production-equivalent runtime
 - Platform implementations backed by environment variables instead of Fastly stores
 - Listens on `http://localhost:8787` by default
+- Edge Cookie identity graph is backed by the same `redb` database, so the
+  `/_ts/admin/ec`, `/_ts/api/v1/identify` and `/_ts/api/v1/batch-sync` routes
+  are served rather than reporting that no store exists. Sync rate limiting is
+  counted in the process rather than by a shared platform counter, so it is
+  correct for one instance and too generous for more than one
 - KV store is a persistent `redb` database file, created on first start at
   `.edgezero/trusted_server_kv.redb`. Override the whole path with
   `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH`, or just the file name with
