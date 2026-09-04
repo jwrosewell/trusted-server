@@ -212,6 +212,42 @@ pull_sync_concurrency = 3
 # thumbnail = "width=150&crop=1:1,smart"
 # medium = "format=auto&width=828"
 
+# The asset cache. Two unrelated things live under [cache]: the asset_rules
+# below decide the cache headers Trusted Server SENDS, and the settings here
+# decide what Trusted Server STORES for itself.
+#
+# No provider is the default, so nothing is stored and every asset request
+# reaches the origin. At the edge that is right, because the platform already
+# caches and would only be duplicated. On a deployment with nothing in front of
+# it, every asset on every page is fetched from the publisher's origin every
+# time, and selecting a provider is what stops that. Unknown keys are rejected
+# at startup rather than quietly disabling the cache.
+# [cache]
+# provider = "51degrees"
+#
+# Total bytes held, across every entry. Bytes rather than a number of entries,
+# because assets run from a few hundred bytes to megabytes and an entry count
+# would say nothing about memory use. Defaults to 64 MiB.
+# max_bytes = 67108864
+#
+# Largest single asset stored, in bytes. Separate from max_bytes so one large
+# asset cannot evict everything else on its way in. Defaults to 8 MiB, and must
+# not be larger than max_bytes.
+# max_entry_bytes = 8388608
+#
+# Longest lifetime honored, whatever the origin asked for. An origin asking for
+# a year is not wrong, but an in-memory cache honoring it would hold a stale
+# asset until the process restarted with no way to invalidate it. Defaults to
+# one day.
+# max_ttl_seconds = 86400
+#
+# What is never stored, whatever the settings say: anything but a GET, anything
+# but a 200, a response carrying Set-Cookie, a response whose Cache-Control
+# says no-store, private or no-cache, a response that varies on anything other
+# than Accept-Encoding, and a response that gives no max-age or s-maxage at all.
+# A per-reader token in a query string is safe because the whole query is part
+# of the key, so such a URL simply never gets a second hit.
+
 # Operator-controlled cache header policies for static/rehosted assets. Disabled
 # rules never match, and matcher/policy validation is deferred until a rule is
 # enabled; IDs must be non-empty and unique. Keep rules disabled unless the

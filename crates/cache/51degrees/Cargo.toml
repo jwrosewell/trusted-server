@@ -1,0 +1,25 @@
+[package]
+name = "trusted-server-cache-51degrees"
+description = "Memory-bound asset cache provider storing raw origin responses."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+log = { workspace = true }
+moka = { workspace = true }
+trusted-server-core = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cache/51degrees",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -85,6 +86,11 @@ log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
+# In-process cache used by the 51Degrees asset cache provider. Bounded by
+# bytes through a weigher rather than by entry count, which is the property
+# that rules the alternatives out. `future` selects the async cache; no
+# default features, so nothing else is pulled in.
+moka = { version = "0.12", default-features = false, features = ["future"] }
 prost-build = "0.13"
 rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }
@@ -108,6 +114,7 @@ tokio-rustls = "0.26"
 toml = "1.1"
 toml_edit = "0.23.10"
 tower = "0.4"
+trusted-server-cache-51degrees = { path = "crates/cache/51degrees" }
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

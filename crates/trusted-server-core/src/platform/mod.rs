@@ -13,6 +13,7 @@
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
+//! - [`PlatformAssetCache`], which caches raw origin asset responses
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
 //!
 //! ## Platform-Agnostic Components
@@ -32,8 +33,12 @@
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::settings::Settings;
+
+mod asset_cache;
 mod error;
 mod http;
 mod image_optimizer;
@@ -45,6 +50,11 @@ pub(crate) mod test_support;
 mod traits;
 mod types;
 
+pub use asset_cache::{
+    ASSET_REPLAYABLE_HEADERS, AssetCacheEligibility, AssetCacheEntry, AssetCacheError,
+    AssetCacheKey, AssetCacheLimits, AssetCacheMiss, AssetCacheRefusal, PlatformAssetCache,
+    UnavailableAssetCache,
+};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
@@ -75,6 +85,31 @@ pub use types::{
 
 /// Default first-byte timeout for platform backends.
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Selects the asset cache named by the `[cache] provider` selector.
+///
+/// Returns [`UnavailableAssetCache`] when no provider is selected, so a default
+/// deployment stores no assets and behaves exactly as it did before the cache
+/// existed. A provider is opt-in: `provider = "51degrees"` returns
+/// `build_51degrees`, which the adapter supplies because the implementation
+/// lives in its own crate and core never depends on a cache library. The
+/// factory runs only when its provider is selected, so nothing is allocated for
+/// a deployment that is not using it.
+///
+/// A selected-but-unknown provider is rejected at startup by
+/// [`CacheSettings::validate_provider_selection`](crate::settings::CacheSettings::validate_provider_selection),
+/// so this falls back to [`UnavailableAssetCache`] for that case rather than
+/// failing the request.
+#[must_use]
+pub fn build_asset_cache(
+    settings: &Settings,
+    build_51degrees: impl FnOnce() -> Arc<dyn PlatformAssetCache>,
+) -> Arc<dyn PlatformAssetCache> {
+    match settings.cache.provider.as_deref() {
+        Some("51degrees") => build_51degrees(),
+        _ => Arc::new(UnavailableAssetCache),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +161,98 @@ mod tests {
         ) -> Result<KvPage, KvError> {
             Ok(KvPage::default())
         }
+    }
+
+    /// A stand-in for a vendor cache crate, so the selector is proven against
+    /// something that is not the default rather than against itself.
+    struct MarkerAssetCache;
+
+    #[async_trait(?Send)]
+    impl PlatformAssetCache for MarkerAssetCache {
+        fn id(&self) -> &'static str {
+            "marker"
+        }
+
+        async fn get(&self, _key: &AssetCacheKey) -> Result<AssetCacheEntry, AssetCacheMiss> {
+            Err(AssetCacheMiss::NotFound)
+        }
+
+        async fn insert(
+            &self,
+            _key: AssetCacheKey,
+            _entry: AssetCacheEntry,
+            _ttl: Duration,
+        ) -> Result<(), AssetCacheError> {
+            Ok(())
+        }
+
+        async fn purge_all(&self) -> Result<(), AssetCacheError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_provider_selected_installs_the_null_object() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.cache.provider = None;
+        // Records whether the factory ran at all. Asserting only on the
+        // returned id would leave "built the provider, then threw it away"
+        // passing, which would allocate a cache nothing uses.
+        let built = std::cell::Cell::new(false);
+
+        let cache = build_asset_cache(&settings, || {
+            built.set(true);
+            Arc::new(MarkerAssetCache)
+        });
+
+        assert_eq!(
+            cache.id(),
+            "unavailable",
+            "should install the null object so a default deployment stores nothing"
+        );
+        assert!(
+            !built.get(),
+            "should not run the provider factory when no provider is selected"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_falls_back_to_the_null_object() {
+        // Startup validation rejects an unknown key, so this path is only
+        // reachable if that check is ever bypassed. It must degrade rather than
+        // build the wrong thing.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.cache.provider = Some("something-else".to_owned());
+        let built = std::cell::Cell::new(false);
+
+        let cache = build_asset_cache(&settings, || {
+            built.set(true);
+            Arc::new(MarkerAssetCache)
+        });
+
+        assert_eq!(
+            cache.id(),
+            "unavailable",
+            "should fall back rather than build the wrong provider"
+        );
+        assert!(
+            !built.get(),
+            "should not run the provider factory for an unknown key"
+        );
+    }
+
+    #[test]
+    fn the_selected_provider_is_the_one_that_gets_injected() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.cache.provider = Some("51degrees".to_owned());
+
+        let cache = build_asset_cache(&settings, || Arc::new(MarkerAssetCache));
+
+        assert_eq!(
+            cache.id(),
+            "marker",
+            "should return the factory's cache, not the null object"
+        );
     }
 
     fn _assert_config_store_object_safe(_: &dyn PlatformConfigStore) {}

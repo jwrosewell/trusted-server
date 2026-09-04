@@ -22,7 +22,7 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
-use crate::platform::PlatformImageOptimizerRegion;
+use crate::platform::{AssetCacheLimits, PlatformImageOptimizerRegion};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -1953,15 +1953,177 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
 }
 
 /// Cache behavior configuration.
+///
+/// Two unrelated things share this section. [`asset_rules`](Self::asset_rules)
+/// decides the cache headers Trusted Server *sends*. The provider selector and
+/// the limits below decide what Trusted Server *stores* for itself, which only
+/// matters for a deployment with no platform cache in front of it.
+///
+/// Every field added for the store is an `Option` that is skipped when unset.
+/// The reason is rollout, the same one written up on
+/// [`Settings::trusted_client_ip`]: this struct carries
+/// `deny_unknown_fields`, so an instance running an older build rejects a
+/// config blob that names a field it has never heard of. Serializing nothing
+/// when nothing is configured keeps an unchanged `ts config push` working
+/// across a rollout or a rollback.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSettings {
     /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
     #[serde(default)]
     pub asset_rules: Vec<CacheAssetRule>,
+
+    /// The key of the asset cache provider to activate.
+    ///
+    /// No provider is the default, so Trusted Server stores no asset itself and
+    /// every asset request reaches the origin, exactly as it did before the
+    /// cache existed. At the edge that is right, because the platform already
+    /// caches. A deployment with nothing in front of it selects a provider,
+    /// today `51degrees`. Override it with the
+    /// `TRUSTED_SERVER__cache__provider` environment variable so one compiled
+    /// binary can switch providers at deployment. An unknown key is rejected at
+    /// startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Total bytes the asset cache may hold, across every entry.
+    ///
+    /// Bytes rather than a number of entries, because assets run from a few
+    /// hundred bytes to megabytes, so an entry count tells an operator nothing
+    /// about how much memory the process will use. Defaults to
+    /// [`DEFAULT_CACHE_MAX_BYTES`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+
+    /// Largest body a single asset entry may hold, in bytes.
+    ///
+    /// Separate from [`max_bytes`](Self::max_bytes) so one large asset cannot
+    /// evict everything else on its way in. Defaults to
+    /// [`DEFAULT_CACHE_MAX_ENTRY_BYTES`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entry_bytes: Option<u64>,
+
+    /// Longest lifetime the asset cache will honor, in seconds.
+    ///
+    /// An origin asking for a year is not wrong, but an in-memory cache that
+    /// honored it would hold a stale asset until the process restarted with no
+    /// way to invalidate it. Defaults to [`DEFAULT_CACHE_MAX_TTL_SECONDS`] when
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ttl_seconds: Option<u64>,
 }
 
+/// Total bytes the asset cache holds when `[cache] max_bytes` is unset.
+///
+/// 64 MiB. Chosen to be small enough that an operator who selects a provider
+/// without reading further does not find the process using memory they did not
+/// expect, and large enough to hold the asset set of a page. It is a starting
+/// point for an operator to raise, not a measured optimum.
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Largest single asset body cached when `[cache] max_entry_bytes` is unset.
+///
+/// 8 MiB, an eighth of [`DEFAULT_CACHE_MAX_BYTES`], so no single asset can take
+/// more than an eighth of the cache.
+pub const DEFAULT_CACHE_MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Longest asset lifetime honored when `[cache] max_ttl_seconds` is unset.
+///
+/// One day. Long enough that a versioned asset is served from memory all day,
+/// short enough that a mistake ages out without a restart.
+pub const DEFAULT_CACHE_MAX_TTL_SECONDS: u64 = 24 * 60 * 60;
+
 impl CacheSettings {
+    /// Validates that the selected asset cache provider is available in this
+    /// build.
+    ///
+    /// No provider is valid and is the default, so a deployment stores no
+    /// assets until one is selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// key is not one this build provides.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.provider.as_deref() {
+            None | Some("51degrees") => Ok(()),
+            Some(key) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Asset cache provider `{key}` is not available in this build"),
+            })),
+        }
+    }
+
+    /// The limits the asset cache eligibility gate enforces.
+    ///
+    /// Reads the configured values, falling back to
+    /// [`DEFAULT_CACHE_MAX_ENTRY_BYTES`] and [`DEFAULT_CACHE_MAX_TTL_SECONDS`].
+    #[must_use]
+    pub fn asset_cache_limits(&self) -> AssetCacheLimits {
+        AssetCacheLimits {
+            max_entry_bytes: usize::try_from(
+                self.max_entry_bytes
+                    .unwrap_or(DEFAULT_CACHE_MAX_ENTRY_BYTES),
+            )
+            .unwrap_or(usize::MAX),
+            max_ttl: Duration::from_secs(
+                self.max_ttl_seconds
+                    .unwrap_or(DEFAULT_CACHE_MAX_TTL_SECONDS),
+            ),
+        }
+    }
+
+    /// Total bytes the asset cache may hold, configured or defaulted.
+    #[must_use]
+    pub fn asset_cache_max_bytes(&self) -> u64 {
+        self.max_bytes.unwrap_or(DEFAULT_CACHE_MAX_BYTES)
+    }
+
+    /// Validates that the asset cache limits describe a cache that can hold
+    /// something.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when a limit is zero, or
+    /// when the per-entry limit is larger than the whole cache, which would let
+    /// one asset in that immediately evicts itself.
+    pub fn validate_asset_cache_limits(&self) -> Result<(), Report<TrustedServerError>> {
+        let max_bytes = self.asset_cache_max_bytes();
+        let max_entry_bytes = self
+            .max_entry_bytes
+            .unwrap_or(DEFAULT_CACHE_MAX_ENTRY_BYTES);
+        let max_ttl_seconds = self
+            .max_ttl_seconds
+            .unwrap_or(DEFAULT_CACHE_MAX_TTL_SECONDS);
+
+        for (name, value) in [
+            ("max_bytes", max_bytes),
+            ("max_entry_bytes", max_entry_bytes),
+            ("max_ttl_seconds", max_ttl_seconds),
+        ] {
+            if value == 0 {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[cache] {name} is 0, which is a cache that can never hold anything. \
+                         Leave it unset to take the default, or remove the [cache] provider \
+                         selector to turn the cache off deliberately"
+                    ),
+                }));
+            }
+        }
+
+        if max_entry_bytes > max_bytes {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[cache] max_entry_bytes ({max_entry_bytes}) is larger than max_bytes \
+                     ({max_bytes}), so an accepted asset could evict the whole cache on its \
+                     way in"
+                ),
+            }));
+        }
+        Ok(())
+    }
+
     fn normalize(&mut self) {
         for rule in &mut self.asset_rules {
             rule.normalize();
@@ -1972,9 +2134,17 @@ impl CacheSettings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any rule ID is duplicate, or if an
-    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
+    /// Returns a configuration error if any rule ID is duplicate, if an
+    /// enabled rule has an invalid policy/matcher or cannot compile its
+    /// regex/glob, if the asset cache provider is unknown, or if the asset
+    /// cache limits cannot hold anything.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        // Startup, not first request. An operator who mistypes a provider key
+        // should be told at deploy time; discovering it as a cache that
+        // silently stores nothing is the failure mode this prevents.
+        self.validate_provider_selection()?;
+        self.validate_asset_cache_limits()?;
+
         let mut seen_ids = HashSet::new();
         for rule in &self.asset_rules {
             if rule.id.is_empty() {
@@ -4395,6 +4565,180 @@ mod tests {
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
         );
+    }
+
+    #[test]
+    fn asset_cache_is_off_unless_a_provider_is_selected() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse a config with no [cache] section");
+
+        assert!(
+            settings.cache.provider.is_none(),
+            "should select no asset cache provider by default"
+        );
+        assert!(
+            settings.cache.validate_provider_selection().is_ok(),
+            "should accept a config that selects no provider"
+        );
+    }
+
+    #[test]
+    fn asset_cache_provider_selection_is_read_and_checked() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache]
+            provider = "51degrees"
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the provider selector");
+
+        assert_eq!(
+            settings.cache.provider.as_deref(),
+            Some("51degrees"),
+            "should read the provider selector"
+        );
+    }
+
+    #[test]
+    fn an_unknown_asset_cache_provider_is_rejected_at_startup() {
+        // The failure this prevents is a mistyped key producing a cache that
+        // silently stores nothing, which looks exactly like a cache that is
+        // working badly.
+        let toml_str = format!(
+            r#"{}
+
+            [cache]
+            provider = "51degress"
+        "#,
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should refuse a config naming a provider this build does not have");
+
+        assert!(
+            format!("{error:?}").contains("51degress"),
+            "should name the unknown key in the error, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn asset_cache_limits_take_their_defaults() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse a config with no [cache] section");
+
+        let limits = settings.cache.asset_cache_limits();
+        assert_eq!(
+            settings.cache.asset_cache_max_bytes(),
+            DEFAULT_CACHE_MAX_BYTES,
+            "should default the total size"
+        );
+        assert_eq!(
+            limits.max_entry_bytes,
+            usize::try_from(DEFAULT_CACHE_MAX_ENTRY_BYTES).expect("should fit in usize"),
+            "should default the per-entry size"
+        );
+        assert_eq!(
+            limits.max_ttl,
+            Duration::from_secs(DEFAULT_CACHE_MAX_TTL_SECONDS),
+            "should default the lifetime ceiling"
+        );
+    }
+
+    #[test]
+    fn configured_asset_cache_limits_are_read() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache]
+            provider = "51degrees"
+            max_bytes = 1048576
+            max_entry_bytes = 65536
+            max_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the cache limits");
+
+        let limits = settings.cache.asset_cache_limits();
+        assert_eq!(
+            settings.cache.asset_cache_max_bytes(),
+            1_048_576,
+            "should read the total size"
+        );
+        assert_eq!(limits.max_entry_bytes, 65_536, "should read the entry size");
+        assert_eq!(
+            limits.max_ttl,
+            Duration::from_secs(300),
+            "should read the lifetime ceiling"
+        );
+    }
+
+    #[test]
+    fn an_entry_limit_larger_than_the_cache_is_rejected() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache]
+            provider = "51degrees"
+            max_bytes = 1024
+            max_entry_bytes = 4096
+        "#,
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should refuse an entry limit larger than the whole cache");
+
+        assert!(
+            format!("{error:?}").contains("max_entry_bytes"),
+            "should name the setting at fault, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_asset_cache_limit_is_rejected() {
+        for setting in ["max_bytes", "max_entry_bytes", "max_ttl_seconds"] {
+            let toml_str = format!(
+                r#"{}
+
+                [cache]
+                provider = "51degrees"
+                {setting} = 0
+            "#,
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&toml_str).expect_err(
+                "should refuse a zero limit, which is a cache that can never hold anything",
+            );
+            assert!(
+                format!("{error:?}").contains(setting),
+                "should name the setting at fault, got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_asset_cache_fields_are_not_serialized() {
+        // Rollout: CacheSettings carries deny_unknown_fields, so an instance
+        // running an older build rejects a blob naming a field it has never
+        // heard of. An unchanged `ts config push` must therefore emit nothing
+        // new when nothing is configured.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse a config with no [cache] section");
+        let json = serde_json::to_string(&settings.cache).expect("should serialize cache settings");
+
+        for field in [
+            "provider",
+            "max_bytes",
+            "max_entry_bytes",
+            "max_ttl_seconds",
+        ] {
+            assert!(
+                !json.contains(field),
+                "should omit the unset `{field}` field, serialized: {json}"
+            );
+        }
     }
 
     #[test]

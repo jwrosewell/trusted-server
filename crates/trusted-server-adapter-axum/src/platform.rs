@@ -8,11 +8,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
+use trusted_server_cache_51degrees::FiftyOneDegreesAssetCache;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
+use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
 // Env-var naming helpers
@@ -533,7 +535,19 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 /// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
 /// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
 /// emitted once per process.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+///
+/// # The asset cache
+///
+/// `settings` is read for the `[cache] provider` selector. This adapter is the
+/// first to inject an asset cache, because it is the one that runs with no
+/// platform cache in front of it and so pays for every asset on every request.
+/// With no provider selected the injected cache is
+/// [`trusted_server_core::platform::UnavailableAssetCache`] and behavior is
+/// unchanged.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+    settings: &Settings,
+) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!(
@@ -547,7 +561,8 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .map(|addr| addr.ip());
 
     use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        PlatformAssetCache, PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore,
+        PlatformSecretStore, build_asset_cache,
     };
 
     // Stateless shims are promoted to process-wide statics so callers clone
@@ -559,6 +574,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    // The asset cache holds state, so it must be one cache for the process
+    // rather than one per request. Built from the settings seen on the first
+    // request and then kept, which also means a `[cache]` change needs a
+    // restart to take effect: rebuilding it would silently throw away
+    // everything it holds.
+    static ASSET_CACHE: std::sync::OnceLock<Arc<dyn PlatformAssetCache>> =
+        std::sync::OnceLock::new();
 
     RuntimeServices::builder()
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
@@ -580,6 +602,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
         .geo(Arc::clone(GEO.get_or_init(|| {
             Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
+        })))
+        .asset_cache(Arc::clone(ASSET_CACHE.get_or_init(|| {
+            build_asset_cache(settings, || {
+                let max_bytes = settings.cache.asset_cache_max_bytes();
+                log::info!("asset cache enabled, holding at most {max_bytes} bytes");
+                FiftyOneDegreesAssetCache::shared(max_bytes)
+            })
         })))
         .client_info(ClientInfo {
             client_ip,

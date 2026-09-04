@@ -178,6 +178,11 @@ pub struct RuntimeServices {
     /// Defaults to [`super::UnavailableTemplateAssembler`]. Core retains a portable
     /// byte-seam fallback when this service is unavailable or rejects a document.
     pub(crate) template_assembler: Arc<dyn super::PlatformTemplateAssembler>,
+    /// Shared cache of raw origin asset responses. Defaults to
+    /// [`super::UnavailableAssetCache`], so a deployment with no cache selected
+    /// fetches every asset from the origin exactly as it did before, rather
+    /// than failing. See [`crate::platform::build_asset_cache`].
+    pub(crate) asset_cache: Arc<dyn super::PlatformAssetCache>,
     /// Dynamic backend registration and name prediction.
     pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
@@ -237,6 +242,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
         &*self.template_cache
+    }
+
+    /// The shared cache of raw origin asset responses.
+    #[must_use]
+    pub fn asset_cache(&self) -> &dyn super::PlatformAssetCache {
+        &*self.asset_cache
     }
 
     /// Returns the platform-specific cold-response template assembler.
@@ -337,6 +348,7 @@ pub struct RuntimeServicesBuilder {
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
+    asset_cache: Option<Arc<dyn super::PlatformAssetCache>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
@@ -352,6 +364,7 @@ impl RuntimeServicesBuilder {
             kv_store: None,
             template_cache: None,
             template_assembler: None,
+            asset_cache: None,
             backend: None,
             http_client: None,
             geo: None,
@@ -388,6 +401,17 @@ impl RuntimeServicesBuilder {
         assembler: Arc<dyn super::PlatformTemplateAssembler>,
     ) -> Self {
         self.template_assembler = Some(assembler);
+        self
+    }
+
+    /// Set the shared asset cache.
+    ///
+    /// Adapters obtain the value from
+    /// [`build_asset_cache`](crate::platform::build_asset_cache), which honors
+    /// the `[cache] provider` selector, rather than constructing one directly.
+    #[must_use]
+    pub fn asset_cache(mut self, cache: Arc<dyn super::PlatformAssetCache>) -> Self {
+        self.asset_cache = Some(cache);
         self
     }
 
@@ -461,6 +485,11 @@ impl RuntimeServicesBuilder {
             template_assembler: self
                 .template_assembler
                 .unwrap_or_else(|| Arc::new(super::UnavailableTemplateAssembler)),
+            // Defaulted rather than required: a deployment with no asset cache
+            // should fetch every asset from the origin, not fail to build.
+            asset_cache: self
+                .asset_cache
+                .unwrap_or_else(|| Arc::new(super::UnavailableAssetCache)),
             backend: self
                 .backend
                 .expect("should set backend before building RuntimeServices"),
