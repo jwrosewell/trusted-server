@@ -97,11 +97,38 @@ pub fn tls_paths_from_env() -> Result<Option<TlsPaths>, Report<TrustedServerErro
 /// Returns [`TrustedServerError::Configuration`] when the runtime cannot be
 /// built, when the certificate or key cannot be read or parsed, or when the
 /// listener fails.
+/// Records whether this process is terminating TLS.
+///
+/// The core scheme detector decides `https` from the TLS fields on
+/// [`ClientInfo`](trusted_server_core::platform::ClientInfo), which the adapter
+/// populates. Without this the adapter reported no TLS even while serving it,
+/// so every rewritten URL was emitted as `http://` on an `https://` page and
+/// the browser blocked the lot as mixed content, the injected script included.
+static TLS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as terminating TLS.
+pub fn mark_tls_active() {
+    TLS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process is terminating TLS.
+///
+/// Reports only that TLS is in use, not the negotiated version, because the
+/// per-connection version is not plumbed through to the request handler at this
+/// layer. That is enough for scheme detection, which is all core asks of it.
+#[must_use]
+pub fn tls_active() -> bool {
+    TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn serve_https(
     router: RouterService,
     addr: SocketAddr,
     paths: &TlsPaths,
 ) -> Result<(), Report<TrustedServerError>> {
+    // Declared before the listener starts, so the first request already sees it.
+    mark_tls_active();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

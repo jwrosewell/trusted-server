@@ -583,7 +583,14 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         })))
         .client_info(ClientInfo {
             client_ip,
-            tls_protocol: None,
+            // Reported when this process is terminating TLS, so core's scheme
+            // detection returns `https` and rewritten URLs carry that scheme.
+            // Without it the adapter served TLS while telling core it was
+            // plain HTTP, and every rewritten URL came back as `http://` on an
+            // `https://` page, which the browser blocks as mixed content.
+            // The value names the protocol rather than a version, because the
+            // negotiated version is not plumbed to the handler at this layer.
+            tls_protocol: crate::tls::tls_active().then(|| "TLS".to_owned()),
             tls_cipher: None,
             ..ClientInfo::default()
         })
