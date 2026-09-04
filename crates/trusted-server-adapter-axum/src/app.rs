@@ -14,6 +14,7 @@ use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::permissions_endpoint::{PERMISSIONS_PATH, handle_permissions};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -268,6 +269,8 @@ enum NamedRouteHandler {
     FirstPartyClick,
     FirstPartySign,
     FirstPartyProxyRebuild,
+    /// Reports the permissions resolved for this request, as JSON.
+    Permissions,
 }
 
 struct NamedRoute {
@@ -286,7 +289,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 13] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -342,6 +345,14 @@ fn named_routes() -> [NamedRoute; 13] {
         // Deprecated double-underscore alias, kept so tsjs bundles served before
         // the `/_ts/page-bids` rename keep getting ads on SPA navigations until
         // they age out of browser caches. See `PAGE_BIDS_LEGACY_PATH`.
+        // Reports the permissions resolved for the request that asks. Read
+        // only, so no preflight guard is needed, unlike the side-effecting
+        // page-bids endpoint above.
+        NamedRoute {
+            path: PERMISSIONS_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Permissions,
+        },
         NamedRoute {
             path: PAGE_BIDS_LEGACY_PATH,
             primary_methods: &[Method::GET, Method::OPTIONS],
@@ -455,6 +466,14 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::FirstPartyProxyRebuild => {
                         handle_first_party_proxy_rebuild(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::Permissions => {
+                        // Built from the same context the request pipeline
+                        // resolved, so the report cannot disagree with the
+                        // decision the request itself acted on.
+                        let ec_context = build_ec_context(&state, &services, &req);
+                        let query = req.uri().query().map(str::to_owned);
+                        handle_permissions(&state.settings, &ec_context, query.as_deref())
                     }
                 }
             },
