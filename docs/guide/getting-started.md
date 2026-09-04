@@ -105,12 +105,25 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 | ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
 | Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
 | Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
+| TLS certificate    | `TRUSTED_SERVER_TLS_CERTIFICATE_PATH` | `TRUSTED_SERVER_TLS_CERTIFICATE_PATH=/etc/trusted-server/site.pem`     |
+| TLS private key    | `TRUSTED_SERVER_TLS_PRIVATE_KEY_PATH` | `TRUSTED_SERVER_TLS_PRIVATE_KEY_PATH=/etc/trusted-server/site-key.pem` |
 
 The config-store value is the verified app-config blob. Secret-store values are
 looked up by the key names in that blob. Store names and key names are uppercased
 with hyphens and dots replaced by underscores. The quick-start exports ephemeral
 secret-store values only into the current shell; do not put secret values in the
 TOML config, config-store blob, or a source-controlled environment file.
+
+### Serving HTTPS
+
+The adapter serves plain HTTP unless both TLS variables above are set, in which
+case it terminates TLS itself on the same address and no separate terminator is
+needed. Setting only one of the two stops startup rather than serving plain HTTP
+on an address the operator believes is encrypted.
+
+The certificate is a PEM chain with the leaf first and the key is its PEM
+private key, which is what most issuers hand you and what `mkcert` writes for a
+local development certificate.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
