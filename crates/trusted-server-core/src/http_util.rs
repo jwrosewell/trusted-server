@@ -576,7 +576,6 @@ mod tests {
     // RequestInfo tests
 
     #[test]
-    #[test]
     fn request_host_falls_back_to_the_uri_authority_when_there_is_no_host_header() {
         // An HTTP/2 request carries `:authority` and no `Host` header at all.
         let req = Request::builder()
@@ -613,6 +612,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_request_info_from_host_header() {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "host", "test.example.com");
