@@ -291,6 +291,65 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// Rewrite the URL-valued strings inside a JSON-LD block.
+///
+/// The block is parsed as JSON and every string value the caller claims as a
+/// URL is replaced, rather than the text being substituted blind. A blind
+/// substitution would also hit identifiers, prose and escape sequences that
+/// merely contain the host.
+///
+/// Returns `None`, meaning leave the origin's bytes exactly as they are, when
+/// the text is not valid JSON, when nothing was rewritten, or when
+/// re-serializing would produce a `</script` sequence. That last case matters
+/// because the block is emitted raw: a string containing `<\/script>` parses
+/// to `</script>` and would otherwise close the element early.
+fn rewrite_json_ld(text: &str, rewrite_url: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let mut document = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !rewrite_json_strings(&mut document, &rewrite_url) {
+        return None;
+    }
+
+    let rewritten = serde_json::to_string(&document).ok()?;
+    if rewritten.to_ascii_lowercase().contains("</script") {
+        log::warn!(
+            "JSON-LD left unrewritten: re-serializing it would emit a `</script` sequence and close the element early"
+        );
+        return None;
+    }
+
+    Some(rewritten)
+}
+
+/// Replace every string in `value` that `rewrite_url` claims, reporting
+/// whether anything changed.
+///
+/// The depth is bounded by `serde_json`'s own recursion limit on the parse
+/// that produced `value`, so this cannot be driven past the stack by a deeply
+/// nested document.
+fn rewrite_json_strings(
+    value: &mut serde_json::Value,
+    rewrite_url: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) => match rewrite_url(text) {
+            Some(rewritten) => {
+                *text = rewritten;
+                true
+            }
+            None => false,
+        },
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            rewrite_json_strings(item, rewrite_url) || changed
+        }),
+        serde_json::Value::Object(entries) => {
+            entries.iter_mut().fold(false, |changed, (_, entry)| {
+                rewrite_json_strings(entry, rewrite_url) || changed
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Create an HTML processor with URL replacement and integration hooks.
 ///
 /// # Panics
@@ -715,6 +774,71 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         el.set_attribute("imagesrcset", &imagesrcset)?;
                     }
                 }
+                Ok(())
+            }
+        }),
+        // `poster` on `<video>` and `data` on `<object>` carry URLs and no
+        // handler covered either, so both went to the origin direct. Confirmed
+        // on 3 September 2026 on a corpus page where the `<source src>` in the
+        // same `<video>` was rewritten and the `poster` beside it was not.
+        //
+        // Scoped to the elements that actually define these attributes. A bare
+        // `[data]` selector would match any element carrying an attribute
+        // literally named `data`, which is not a URL carrier.
+        element!("video[poster]", {
+            let patterns = patterns.clone();
+            move |el| {
+                if let Some(poster) = el.get_attribute("poster")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&poster)
+                {
+                    el.set_attribute("poster", &rewritten)?;
+                }
+                Ok(())
+            }
+        }),
+        element!("object[data]", {
+            let patterns = patterns.clone();
+            move |el| {
+                if let Some(data) = el.get_attribute("data")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&data)
+                {
+                    el.set_attribute("data", &rewritten)?;
+                }
+                Ok(())
+            }
+        }),
+        // JSON-LD is a text node inside a `<script>`, so no attribute handler
+        // can see it, and the only text handler registered by default is built
+        // in a loop over the enabled integrations, which is empty on a plain
+        // deployment. Every URL in it therefore stayed pointing at the origin.
+        // Yoast and Rank Math emit exactly this shape on every article page.
+        //
+        // Parsed as JSON rather than substituted blind, so only string values
+        // that really are URLs are touched. The type match is
+        // case-insensitive because the attribute value is not case-sensitive
+        // in practice.
+        text!("script[type=\"application/ld+json\" i]", {
+            let patterns = patterns.clone();
+            // A text node arrives in chunks and a URL can straddle two of
+            // them, so the node is accumulated and parsed once complete.
+            let buffered = Rc::new(RefCell::new(String::new()));
+            move |chunk| {
+                buffered.borrow_mut().push_str(chunk.as_str());
+                if !chunk.last_in_text_node() {
+                    // Held back rather than emitted, so the parse below sees
+                    // the whole node and the content is not duplicated.
+                    chunk.remove();
+                    return Ok(());
+                }
+
+                let text = std::mem::take(&mut *buffered.borrow_mut());
+                let rewritten = rewrite_json_ld(&text, |url| patterns.rewrite_url_value(url));
+                // Emitted raw, because script data is not escaped by the
+                // browser: writing it as text would turn a `&` in a query
+                // string into `&amp;` inside the script and break the URL.
+                // `rewrite_json_ld` refuses to produce a `</script` sequence,
+                // which is the hazard raw emission would otherwise carry.
+                chunk.replace(rewritten.as_deref().unwrap_or(&text), ContentType::Html);
                 Ok(())
             }
         }),
@@ -2317,6 +2441,166 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    /// Run one document through the processor with the shared test config
+    /// (`origin.example.com` -> `test.example.com`, https).
+    fn render_with_test_config(html: &str) -> String {
+        let mut processor = create_html_processor(create_test_config());
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        String::from_utf8(output).expect("output should be valid UTF-8")
+    }
+
+    #[test]
+    fn video_poster_and_object_data_are_rewritten() {
+        // Defect 11d. Reproduced on 3 September 2026 with
+        // `.claude/corpus-serve/06-video-poster.html`, where the `<source src>`
+        // inside the same `<video>` was rewritten and the `poster` beside it
+        // was not, and the `<object data>` was not either.
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<video poster=\"https://origin.example.com/poster.png\">",
+            "<source src=\"https://origin.example.com/clip.mp4\" type=\"video/mp4\">",
+            "</video>",
+            "<object data=\"https://origin.example.com/thing.svg\"></object>",
+            "</body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("poster=\"https://test.example.com/poster.png\""),
+            "should rewrite the video poster, got: {output}"
+        );
+        assert!(
+            output.contains("data=\"https://test.example.com/thing.svg\""),
+            "should rewrite the object data, got: {output}"
+        );
+        assert!(
+            !output.contains("origin.example.com"),
+            "should leave no origin host behind, got: {output}"
+        );
+    }
+
+    #[test]
+    fn an_attribute_named_data_on_another_element_is_left_alone() {
+        // `data` is a URL only on `<object>`. A bare `[data]` selector would
+        // sweep up anything else carrying an attribute of that name.
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<div data=\"https://origin.example.com/not-a-url-carrier\"></div>",
+            "</body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("data=\"https://origin.example.com/not-a-url-carrier\""),
+            "should only treat `data` as a URL on `<object>`, got: {output}"
+        );
+    }
+
+    #[test]
+    fn json_ld_urls_are_rewritten() {
+        // Defect 11d. Reproduced with `.claude/corpus-serve/04-json-ld.html`,
+        // where the whole block came back byte-identical, all three URLs
+        // included.
+        let html = concat!(
+            "<!doctype html><html><head>",
+            "<script type=\"application/ld+json\">",
+            "{\"@context\":\"https://schema.org\",\"@type\":\"NewsArticle\",",
+            "\"url\":\"https://origin.example.com/article/1\",",
+            "\"publisher\":{\"logo\":{\"url\":\"https://origin.example.com/logo.png\"}},",
+            "\"keywords\":[\"news\",\"https://origin.example.com/tag/news\"]}",
+            "</script>",
+            "</head><body></body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("https://test.example.com/article/1"),
+            "should rewrite a top-level URL, got: {output}"
+        );
+        assert!(
+            output.contains("https://test.example.com/logo.png"),
+            "should rewrite a nested URL, got: {output}"
+        );
+        assert!(
+            output.contains("https://test.example.com/tag/news"),
+            "should rewrite a URL inside an array, got: {output}"
+        );
+        assert!(
+            output.contains("https://schema.org"),
+            "should leave a third-party URL alone, got: {output}"
+        );
+        assert!(
+            !output.contains("origin.example.com"),
+            "should leave no origin host behind, got: {output}"
+        );
+    }
+
+    #[test]
+    fn json_ld_that_does_not_parse_is_left_exactly_as_it_was() {
+        // Corrupting a block the parser cannot read would be worse than
+        // leaving a URL pointing at the origin, so a parse failure means no
+        // change at all.
+        let block = "{ this is not JSON: https://origin.example.com/a }";
+        let html = format!(
+            "<!doctype html><html><head>\
+             <script type=\"application/ld+json\">{block}</script>\
+             </head><body></body></html>"
+        );
+
+        let output = render_with_test_config(&html);
+
+        assert!(
+            output.contains(block),
+            "should leave unparseable JSON-LD byte for byte, got: {output}"
+        );
+    }
+
+    #[test]
+    fn json_ld_with_no_origin_url_is_left_exactly_as_it_was() {
+        // Nothing to rewrite must mean no re-serialization, which would
+        // otherwise reformat the publisher's block and reorder its keys.
+        let block = "{\n  \"@context\": \"https://schema.org\",\n  \"name\": \"Example\"\n}";
+        let html = format!(
+            "<!doctype html><html><head>\
+             <script type=\"application/ld+json\">{block}</script>\
+             </head><body></body></html>"
+        );
+
+        let output = render_with_test_config(&html);
+
+        assert!(
+            output.contains(block),
+            "should leave an unchanged JSON-LD block byte for byte, got: {output}"
+        );
+    }
+
+    #[test]
+    fn json_ld_is_not_allowed_to_close_its_own_script_element() {
+        // A JSON string holding `<\/script>` parses to `</script>`. Emitting
+        // that raw would close the element early, so the block is left alone.
+        let block = concat!(
+            r#"{"url":"https://origin.example.com/a","#,
+            r#""note":"<\/script><img src=x>"}"#
+        );
+        let html = format!(
+            "<!doctype html><html><head>\
+             <script type=\"application/ld+json\">{block}</script>\
+             </head><body></body></html>"
+        );
+
+        let output = render_with_test_config(&html);
+
+        assert!(
+            output.contains(block),
+            "should refuse to rewrite a block that would close its own script element, got: {output}"
         );
     }
 }
