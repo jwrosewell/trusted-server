@@ -396,6 +396,34 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
+    // A document with no `<head>` gets no script bundle, because the injection
+    // is an `element!("head", ...)` handler and a selector that never matches
+    // cannot fire. Nothing anywhere noticed, so a page that silently lost the
+    // whole client-side half of the product looked exactly like one that had
+    // it: URLs were still rewritten and the response was still a clean 200.
+    // Confirmed on 3 September 2026 at maximum verbosity, where the log for
+    // such a request ended at the `process_response_streaming` debug line with
+    // nothing after it.
+    //
+    // Warning rather than info, matching the existing `<body>` warning below,
+    // because the outcome is the same class: a feature the operator configured
+    // did not happen and the response gives no sign of it. Warning rather than
+    // error because the response itself is correct and is served. This will be
+    // noisy on a deployment that proxies HTML fragments, which legitimately
+    // have no head, and that noise is the price of the fragment case being
+    // visible at all.
+    document_content_handlers.push(end!({
+        let injected_tsjs = injected_tsjs.clone();
+        move |_document_end| {
+            if !injected_tsjs.get() {
+                log::warn!(
+                    "no `<head>` element in the response, so the Trusted Server script bundle was not injected; URL rewriting still ran (an HTML fragment, or a document whose head the origin omitted)"
+                );
+            }
+            Ok(())
+        }
+    }));
+
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
         element!("head", {
@@ -2251,6 +2279,89 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    /// Captures `log` records so a test can assert on what was logged.
+    ///
+    /// Installed once for the whole test binary, because `log` allows a single
+    /// logger per process.
+    struct CapturingLogger {
+        records: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if let Ok(mut records) = self.records.lock() {
+                records.push(format!("{} {}", record.level(), record.args()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURING_LOGGER: std::sync::OnceLock<&'static CapturingLogger> =
+        std::sync::OnceLock::new();
+
+    fn captured_logs() -> &'static CapturingLogger {
+        CAPTURING_LOGGER.get_or_init(|| {
+            let logger: &'static CapturingLogger = Box::leak(Box::new(CapturingLogger {
+                records: std::sync::Mutex::new(Vec::new()),
+            }));
+            log::set_logger(logger).expect("should install the capturing logger");
+            log::set_max_level(log::LevelFilter::Trace);
+            logger
+        })
+    }
+
+    #[test]
+    fn a_document_with_no_head_is_no_longer_skipped_silently() {
+        // Defect 12. Reproduced on 3 September 2026 with
+        // `.claude/corpus-serve/10-no-head.html` and `11-fragment.html`: the
+        // `href` was rewritten, no script was injected, and the log for the
+        // request ended at the `process_response_streaming` debug line with
+        // nothing after it, at maximum verbosity.
+        let logger = captured_logs();
+        let already_seen = logger
+            .records
+            .lock()
+            .expect("should lock the captured records")
+            .len();
+
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<a href=\"https://origin.example.com/page\">link</a>",
+            "</body></html>"
+        );
+        let mut processor = create_html_processor(create_test_config());
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        let output = String::from_utf8(output).expect("output should be valid UTF-8");
+
+        assert!(
+            !output.contains("/static/tsjs="),
+            "test precondition: a document with no head gets no bundle, got: {output}"
+        );
+        assert!(
+            output.contains("https://test.example.com/page"),
+            "URL rewriting should still have run, got: {output}"
+        );
+
+        let records = logger
+            .records
+            .lock()
+            .expect("should lock the captured records");
+        let emitted = &records[already_seen..];
+        assert!(
+            emitted
+                .iter()
+                .any(|record| record.starts_with("WARN") && record.contains("no `<head>` element")),
+            "should warn that the script bundle was not injected, logged: {emitted:?}"
         );
     }
 }
