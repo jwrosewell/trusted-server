@@ -13,6 +13,7 @@ use lol_html::{
     text,
 };
 
+use crate::css_url::rewrite_css_url_values;
 use crate::host_rewrite::{rewrite_bare_host_at_boundaries, rewrite_origin_authority};
 use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
@@ -714,6 +715,27 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if imagesrcset != original_imagesrcset {
                         el.set_attribute("imagesrcset", &imagesrcset)?;
                     }
+                }
+                Ok(())
+            }
+        }),
+        // A `style` attribute carries URLs in `url(...)`, and none of them were
+        // rewritten, so a background image hosted on the origin was fetched
+        // direct even though the page carrying it came through the proxy.
+        //
+        // The scan is shared with the creative pipeline, which already had one
+        // (`creative::rewrite_style_urls`), rather than a second copy of it.
+        // The value inside `url(...)` is unambiguously a URL, so it goes
+        // through the same `rewrite_url_value` as `href` and `src` including
+        // the bare-host form.
+        element!("[style]", {
+            let patterns = patterns.clone();
+            move |el| {
+                if let Some(style) = el.get_attribute("style")
+                    && let Some(rewritten) =
+                        rewrite_css_url_values(&style, |url| patterns.rewrite_url_value(url))
+                {
+                    el.set_attribute("style", &rewritten)?;
                 }
                 Ok(())
             }
@@ -2317,6 +2339,100 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    /// Run one document through the processor with the shared test config
+    /// (`origin.example.com` -> `test.example.com`, https).
+    fn render_with_test_config(html: &str) -> String {
+        let mut processor = create_html_processor(create_test_config());
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        String::from_utf8(output).expect("output should be valid UTF-8")
+    }
+
+    #[test]
+    fn inline_style_url_is_rewritten_in_each_quoting_form() {
+        // Defect 11b. Reproduced against the appliance on 3 September 2026
+        // with `.claude/corpus-serve/03-inline-css-url.html`, where the
+        // `style` attribute came back byte-identical, so the background image
+        // was fetched straight from the origin.
+        //
+        // The attribute is written with single quotes in the double-quoted
+        // CSS case, because a `"` inside a `"`-delimited attribute would end
+        // the attribute instead.
+        let cases = [
+            (
+                "style=\"background-image: url(https://origin.example.com/a.png)\"",
+                "url(https://test.example.com/a.png)",
+            ),
+            (
+                "style=\"background-image: url('https://origin.example.com/a.png')\"",
+                "url('https://test.example.com/a.png')",
+            ),
+            (
+                // The quotes come back however lol_html chooses to serialize
+                // them, so this case asserts the URL only.
+                "style='background-image: url(\"https://origin.example.com/a.png\")'",
+                "https://test.example.com/a.png",
+            ),
+        ];
+
+        for (attribute, expected) in cases {
+            let html = format!("<!doctype html><html><body><div {attribute}></div></body></html>");
+
+            let output = render_with_test_config(&html);
+
+            assert!(
+                output.contains(expected),
+                "should rewrite `{attribute}` to contain `{expected}`, got: {output}"
+            );
+            assert!(
+                !output.contains("origin.example.com"),
+                "should leave no origin host behind for `{attribute}`, got: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_style_without_an_origin_url_is_left_alone() {
+        // Nothing to rewrite must mean no `set_attribute`, because
+        // `set_attribute` re-serializes the whole start tag and loses the
+        // origin's intra-tag whitespace.
+        let html = concat!(
+            "<!doctype html><html><body>",
+            "<div  style=\"background-image: url(/local/bg.png)\"  ></div>",
+            "</body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("<div  style=\"background-image: url(/local/bg.png)\"  >"),
+            "should leave a style with no origin URL byte for byte, got: {output}"
+        );
+    }
+
+    #[test]
+    fn an_inline_style_rewrites_a_longer_hostname_no_further_than_the_origin() {
+        // The boundary check from `4cb95e889` has to reach inside `url()` too,
+        // or a hostname that merely starts with the origin is corrupted.
+        let html = concat!(
+            "<!doctype html><html><body><div style=\"background: ",
+            "url(https://origin.example.com.cdn.example/a.png), ",
+            "url(https://origin.example.com/b.png)\"></div></body></html>"
+        );
+
+        let output = render_with_test_config(html);
+
+        assert!(
+            output.contains("url(https://origin.example.com.cdn.example/a.png)"),
+            "should leave the longer hostname alone, got: {output}"
+        );
+        assert!(
+            output.contains("url(https://test.example.com/b.png)"),
+            "should still rewrite the origin's own host, got: {output}"
         );
     }
 }

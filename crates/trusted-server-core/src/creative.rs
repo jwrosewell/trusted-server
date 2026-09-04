@@ -37,6 +37,7 @@
 //! See the tests in this module for comprehensive cases, including irregular
 //! spacing, no-space commas, and `data:` handling.
 
+use crate::css_url::rewrite_css_url_values;
 use crate::http_util::compute_encrypted_sha256_token;
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
@@ -77,60 +78,13 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
 // `base_origin` is prefixed onto the proxy path — empty for root-relative output,
 // `https://<domain>` for absolute output (see [`build_proxy_url`]).
 pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
-    // naive url(...) rewrite for absolute/protocol-relative URLs
-    let lower = style.to_ascii_lowercase();
-    let mut out = String::with_capacity(style.len() + 16);
-    let mut write_pos = 0_usize;
-    let mut scan = 0_usize;
-    while let Some(off) = lower[scan..].find("url(") {
-        let start = scan + off;
-        let open = start + 4; // after 'url('
-        // write prefix including 'url('
-        out.push_str(&style[write_pos..open]);
-        // find closing ')'
-        let close = if let Some(c) = lower[open..].find(')') {
-            open + c
-        } else {
-            out.push_str(&style[open..]);
-            return out;
-        };
-        // trim spaces and quotes
-        let bytes = style.as_bytes();
-        let mut s = open;
-        while s < close && bytes[s].is_ascii_whitespace() {
-            s += 1;
-        }
-        let mut e = close;
-        while e > s && bytes[e - 1].is_ascii_whitespace() {
-            e -= 1;
-        }
-        let mut quoted = false;
-        let (qs, qe) = if s < e && (bytes[s] == b'"' || bytes[s] == b'\'') {
-            quoted = true;
-            (s + 1, if e > s + 1 { e - 1 } else { e })
-        } else {
-            (s, e)
-        };
-        let url_val = &style[qs..qe];
-        let new_val = if let Some(abs) = to_abs(settings, url_val) {
-            build_proxy_url(settings, &abs, base_origin)
-        } else {
-            url_val.to_owned()
-        };
-        if quoted {
-            let q = style.as_bytes()[s] as char;
-            out.push(q);
-            out.push_str(&new_val);
-            out.push(q);
-        } else {
-            out.push_str(&new_val);
-        }
-        out.push(')');
-        write_pos = close + 1;
-        scan = write_pos;
-    }
-    out.push_str(&style[write_pos..]);
-    out
+    // The scan for `url(...)` and its three quoting forms lives in
+    // `css_url` so the publisher path can use the same one rather than
+    // growing a second copy of it.
+    rewrite_css_url_values(style, |url| {
+        to_abs(settings, url).map(|abs| build_proxy_url(settings, &abs, base_origin))
+    })
+    .unwrap_or_else(|| style.to_owned())
 }
 
 #[inline]
