@@ -62,19 +62,30 @@ fn request_body_bytes(
     Ok(body.into_bytes().unwrap_or_default())
 }
 
-/// Headers copied from the original client request to the upstream proxy request
-/// when `copy_request_headers` is enabled.
+/// Headers copied verbatim from the original client request to the upstream
+/// proxy request when `copy_request_headers` is enabled.
+///
+/// `User-Agent` is forwarded unchanged because origins that attribute a request
+/// to a visitor parse it. An ad server records the User-Agent family when it
+/// decides an ad and compares it again when the impression is tracked, so
+/// substituting the appliance's own agent makes the origin discard the
+/// impression as a mismatch and the advertiser is never billed.
+///
+/// `X-Forwarded-For` is deliberately absent from this list, because it is never
+/// copied from the client. The `copy_request_headers` branch of the proxy
+/// request builder sets it from the trusted client address the adapter
+/// resolved, and the comment there records why the inbound value cannot be
+/// trusted.
 ///
 /// `Accept-Encoding` is also overridden in the same code path, but with a fixed
 /// value ([`SUPPORTED_ENCODINGS`]) rather than forwarding the client's preference.
 /// Both forwarded headers and the Accept-Encoding override are applied together in
 /// the `copy_request_headers` branch of the proxy request builder.
-const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
+const PROXY_FORWARD_HEADERS: [header::HeaderName; 4] = [
     HEADER_USER_AGENT,
     HEADER_ACCEPT,
     HEADER_ACCEPT_LANGUAGE,
     HEADER_REFERER,
-    HEADER_X_FORWARDED_FOR,
 ];
 
 /// Curated request headers preserved for asset proxying.
@@ -1407,6 +1418,31 @@ async fn proxy_with_redirects(
                     outbound_headers.insert(header_name, v.clone());
                 }
             }
+            // `X-Forwarded-For` carries the trusted client address the adapter
+            // resolved at the entry point, never the inbound header. Only the
+            // Spin adapter strips a client-supplied `x-forwarded-for`, so on
+            // every other host the inbound value is attacker-controlled, and
+            // `x-forwarded-for` is already listed as internal in
+            // [`crate::constants::INTERNAL_HEADERS`] precisely so it is not
+            // passed through from a client.
+            //
+            // Sending the visitor's real address matters most to an origin
+            // that bills on it. An ad server keys its view and click rate
+            // limits on the client address and re-checks geographic targeting
+            // when it tracks an impression. Without the header every visitor
+            // arrives under the appliance's own address and shares one bucket,
+            // so past the limit the origin answers the tracking pixel with an
+            // ordinary success and counts nothing, and the advertiser is never
+            // billed.
+            //
+            // When the adapter resolved no trusted address the header is
+            // omitted rather than filled from the request, because a forged
+            // address is worse than an absent one.
+            if let Some(client_ip) = request_headers.services.client_info().client_ip
+                && let Ok(value) = HeaderValue::from_str(&client_ip.to_string())
+            {
+                outbound_headers.insert(HEADER_X_FORWARDED_FOR, value);
+            }
             outbound_headers.insert(
                 HEADER_ACCEPT_ENCODING,
                 HeaderValue::from_static(SUPPORTED_ENCODINGS),
@@ -2248,7 +2284,8 @@ mod tests {
     use crate::platform::RuntimeServices;
     use crate::platform::test_support::{
         HashMapSecretStore, StubHttpClient, build_services_with_http_client,
-        build_services_with_secret_and_http_client, noop_services,
+        build_services_with_secret_and_http_client,
+        build_services_with_secret_http_client_and_client_ip, noop_services,
     };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
@@ -4274,6 +4311,298 @@ mod tests {
                 Some(SUPPORTED_ENCODINGS),
                 "should override Accept-Encoding with supported encodings"
             );
+        });
+    }
+
+    /// Build a signed first-party proxy request for `target`, as the creative
+    /// rewriter emits for an ad server's view pixel.
+    fn signed_tracking_request(
+        settings: &crate::settings::Settings,
+        target: &str,
+        user_agent: &str,
+    ) -> HttpRequest<EdgeBody> {
+        let signed = creative::build_proxy_url(settings, target, "");
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(&signed)
+            .body(EdgeBody::empty())
+            .expect("should build signed tracking request");
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(user_agent).expect("should build test User-Agent"),
+        );
+        req
+    }
+
+    /// Read one header from a captured upstream request.
+    fn captured_header(sent: &[(String, String)], name: &str) -> Option<String> {
+        sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+    }
+
+    /// Build services whose trusted client address is `client_ip`.
+    fn tracking_services(
+        stub: &Arc<StubHttpClient>,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> RuntimeServices {
+        build_services_with_secret_http_client_and_client_ip(
+            HashMapSecretStore::new(HashMap::new()),
+            Arc::clone(stub) as Arc<dyn PlatformHttpClient>,
+            client_ip,
+        )
+    }
+
+    /// An ad server records the User-Agent family when it decides an ad and
+    /// compares it again when the impression is tracked. A substituted agent
+    /// makes it discard the impression, so the appliance must relay the
+    /// visitor's own agent byte for byte.
+    #[test]
+    fn tracking_proxy_forwards_visitor_user_agent_unchanged() {
+        futures::executor::block_on(async {
+            let visitor_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0";
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            let services = tracking_services(
+                &stub,
+                Some("203.0.113.42".parse().expect("should parse client IP")),
+            );
+            let settings = create_test_settings();
+            let req = signed_tracking_request(
+                &settings,
+                "https://ads.example.com/proxy/view/7/abc-nonce/",
+                visitor_agent,
+            );
+
+            handle_first_party_proxy(&settings, &services, req)
+                .await
+                .expect("should proxy the view pixel");
+
+            let all_headers = stub.recorded_request_headers();
+            assert_eq!(all_headers.len(), 1, "should have made one upstream call");
+            assert_eq!(
+                captured_header(&all_headers[0], "user-agent").as_deref(),
+                Some(visitor_agent),
+                "should forward the visitor User-Agent verbatim so the origin parses the same OS and browser family it recorded"
+            );
+        });
+    }
+
+    /// The tracked address decides the origin's per-visitor rate limit and its
+    /// geographic targeting re-check. It must be the trusted address the
+    /// adapter resolved, not the appliance's own and not one the visitor
+    /// supplied.
+    #[test]
+    fn tracking_proxy_sets_forwarded_for_from_trusted_client_ip() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            let services = tracking_services(
+                &stub,
+                Some("203.0.113.42".parse().expect("should parse client IP")),
+            );
+            let settings = create_test_settings();
+            let mut req = signed_tracking_request(
+                &settings,
+                "https://ads.example.com/proxy/view/7/abc-nonce/",
+                "test-agent/1.0",
+            );
+            // The visitor offers a forged forwarding chain. Only the Spin
+            // adapter strips it at the entry point, so the proxy has to
+            // overwrite rather than relay it.
+            req.headers_mut().insert(
+                HEADER_X_FORWARDED_FOR,
+                HeaderValue::from_static("198.51.100.9, 192.0.2.7"),
+            );
+
+            handle_first_party_proxy(&settings, &services, req)
+                .await
+                .expect("should proxy the view pixel");
+
+            let all_headers = stub.recorded_request_headers();
+            assert_eq!(all_headers.len(), 1, "should have made one upstream call");
+            assert_eq!(
+                captured_header(&all_headers[0], "x-forwarded-for").as_deref(),
+                Some("203.0.113.42"),
+                "should send the trusted client address, replacing the value the visitor supplied"
+            );
+        });
+    }
+
+    /// With no trusted address the header is omitted rather than filled from
+    /// the request, because an origin that bills on a forged address is worse
+    /// off than one that sees none.
+    #[test]
+    fn tracking_proxy_omits_forwarded_for_without_a_trusted_client_ip() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            let services = tracking_services(&stub, None);
+            let settings = create_test_settings();
+            let mut req = signed_tracking_request(
+                &settings,
+                "https://ads.example.com/proxy/view/7/abc-nonce/",
+                "test-agent/1.0",
+            );
+            req.headers_mut().insert(
+                HEADER_X_FORWARDED_FOR,
+                HeaderValue::from_static("198.51.100.9"),
+            );
+
+            handle_first_party_proxy(&settings, &services, req)
+                .await
+                .expect("should proxy the view pixel");
+
+            let all_headers = stub.recorded_request_headers();
+            assert!(
+                captured_header(&all_headers[0], "x-forwarded-for").is_none(),
+                "should not relay a visitor-supplied forwarding chain"
+            );
+        });
+    }
+
+    /// A click only counts after the view for the same nonce, and the ad server
+    /// answers a click with a redirect to the advertiser whether or not the
+    /// click counted. So the appliance must not fetch the click itself and must
+    /// not rewrite it. It hands the visitor's own browser a redirect carrying
+    /// the click URL with the nonce untouched, which leaves the ordering, the
+    /// User-Agent and the client address exactly as the browser presents them
+    /// and leaves the ruling to the ad server.
+    #[test]
+    fn tracking_click_redirects_the_browser_with_the_nonce_untouched() {
+        futures::executor::block_on(async {
+            let click_target =
+                "https://ads.example.com/proxy/click/7/01a07391-d819-7680-8436-2af3df90a1d7/";
+
+            let stub = Arc::new(StubHttpClient::new());
+            let services = tracking_services(
+                &stub,
+                Some("203.0.113.42".parse().expect("should parse client IP")),
+            );
+            let settings = create_test_settings();
+
+            let signed = creative::build_click_url(&settings, click_target, "");
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(&signed)
+                .body(EdgeBody::empty())
+                .expect("should build signed click request");
+
+            let response = handle_first_party_click(&settings, &services, req)
+                .await
+                .expect("should answer the signed click");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::FOUND,
+                "should redirect the browser rather than answer the click itself"
+            );
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with(click_target),
+                "should preserve the click path and nonce byte for byte: {location}"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the browser makes the click call, so the appliance must fetch nothing and cannot consume the nonce itself"
+            );
+        });
+    }
+
+    /// The nonce is single use and the ad server answers both hits with the same
+    /// status, putting its ruling in a response header instead. So a second view
+    /// looks identical to the first over HTTP, and the appliance must reach the
+    /// origin every time and relay the response untouched. Collapsing, caching
+    /// or replaying a hit would either lose a billable view or hide a discarded
+    /// one.
+    #[test]
+    fn tracking_proxy_relays_each_nonce_ruling_instead_of_answering_from_cache() {
+        futures::executor::block_on(async {
+            let view_target =
+                "https://ads.example.com/proxy/view/7/01a07391-d819-7680-8436-2af3df90a1d7/";
+            let svg = b"<svg><!-- View Proxy --></svg>".to_vec();
+
+            let stub = Arc::new(StubHttpClient::new());
+            // The ad server counts the first view and discards the replay of the
+            // same nonce, answering 200 both times and separating them only by
+            // the reason header.
+            stub.push_response_with_headers(
+                200,
+                svg.clone(),
+                vec![
+                    ("content-type", "image/svg+xml"),
+                    ("x-adserver-reason", "Billed view"),
+                ],
+            );
+            stub.push_response_with_headers(
+                200,
+                svg,
+                vec![
+                    ("content-type", "image/svg+xml"),
+                    ("x-adserver-reason", "Old/Invalid nonce"),
+                ],
+            );
+            let services = tracking_services(
+                &stub,
+                Some("203.0.113.42".parse().expect("should parse client IP")),
+            );
+            let settings = create_test_settings();
+
+            let reason_of = |response: &Response<EdgeBody>| -> Option<String> {
+                response
+                    .headers()
+                    .get("x-adserver-reason")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+
+            let first = handle_first_party_proxy(
+                &settings,
+                &services,
+                signed_tracking_request(&settings, view_target, "test-agent/1.0"),
+            )
+            .await
+            .expect("should proxy the first view");
+            assert_eq!(first.status(), StatusCode::OK, "first view should succeed");
+            assert_eq!(
+                reason_of(&first).as_deref(),
+                Some("Billed view"),
+                "should relay the origin's ruling, which is the only signal that separates a counted view from a discarded one"
+            );
+
+            let second = handle_first_party_proxy(
+                &settings,
+                &services,
+                signed_tracking_request(&settings, view_target, "test-agent/1.0"),
+            )
+            .await
+            .expect("should proxy the repeated view");
+            assert_eq!(
+                second.status(),
+                StatusCode::OK,
+                "a discarded view is still an HTTP success, so the status cannot be the test"
+            );
+            assert_eq!(
+                reason_of(&second).as_deref(),
+                Some("Old/Invalid nonce"),
+                "should relay the origin's discard of a reused nonce rather than answer from a cache"
+            );
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris.len(),
+                2,
+                "should reach the origin on both hits so the origin, not the appliance, rules on the reused nonce: {uris:?}"
+            );
+            for uri in &uris {
+                assert!(
+                    uri.contains("/proxy/view/7/01a07391-d819-7680-8436-2af3df90a1d7/"),
+                    "should carry the nonce through unchanged: {uri}"
+                );
+            }
         });
     }
 
