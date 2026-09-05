@@ -86,6 +86,10 @@ export default withMermaid(
               text: 'Auction Orchestration',
               link: '/guide/auction-orchestration',
             },
+            {
+              text: 'Ethical Ad Server',
+              link: '/guide/ethical-ad-server',
+            },
             { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
             { text: 'Asset Routes', link: '/guide/asset-routes' },
             { text: 'Creative Processing', link: '/guide/creative-processing' },

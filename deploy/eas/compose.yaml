@@ -1,0 +1,243 @@
+# Trusted Server and the Ethical Ad Server, running side by side.
+#
+#   docker compose -f deploy/eas/compose.yaml up
+#
+# Four containers. Two of them are the pair itself, the other two are what the
+# ad server needs to run at all:
+#
+#   appliance   Trusted Server. The only service published to the network the
+#               publisher's readers come from.
+#   eas         the Ethical Ad Server, a Django application. Reached by the
+#               appliance at http://eas:5000 and by nobody else.
+#   postgres    the ad server's database.
+#   redis       the ad server's queue and cache.
+#
+# The two programs are separate processes in separate images. They share no
+# code and no library, and they talk over HTTP. That separation is the point of
+# this file, and it is also the licensing position: the ad server is licensed
+# AGPL-3.0 and the appliance is licensed Apache-2.0, and neither license
+# reaches across into the other. See THIRD-PARTY-NOTICES.md at the root of this
+# repository, and docs/guide/ethical-ad-server.md for the operator
+# instructions.
+#
+# Settings an operator is expected to change, all with working defaults:
+#
+#   EAS_SOURCE            path to a checkout of the ad server (see below)
+#   TS_APPLIANCE_PORT     host port for the appliance, default 8080
+#   EAS_ADMIN_PORT        host loopback port for the ad server admin, default 5001
+#   TS_APPLIANCE_IMAGE    appliance image tag
+#   EAS_IMAGE             ad server image tag
+#   EAS_POSTGRES_IMAGE    ad server database image tag
+
+name: ts-eas
+
+services:
+  appliance:
+    # Built by the appliance packaging work in this repository, not here. Two
+    # images and two containers is the default posture on purpose: baking the
+    # ad server into this image would put an AGPL-3.0 program and an Apache-2.0
+    # program in one artifact, and nothing is gained by it.
+    image: ${TS_APPLIANCE_IMAGE:-trusted-server-appliance:dev}
+
+    environment:
+      # The port the process binds inside the container. The Axum adapter reads
+      # PORT and exits non-zero on a value it cannot parse
+      # (crates/trusted-server-adapter-axum/src/main.rs, port_from_env), so
+      # this is the adapter's own mechanism and the published mapping below
+      # agrees with it by construction.
+      PORT: "8787"
+
+      # Bind every interface inside the container, not just container
+      # loopback. Without this the published port below accepts the connection
+      # and then answers nothing, because the process is listening on an
+      # address the forwarded connection never reaches. The variable is
+      # resolved by EdgeZero (edgezero-core, addr::resolve_bind_addr), and an
+      # appliance image whose adapter does not pass it through will still bind
+      # loopback and stay silent on the published port, so check this first
+      # when the appliance is up and nothing answers.
+      EDGEZERO__ADAPTER__HOST: 0.0.0.0
+
+      # Where the durable key-value store is written. The adapter resolves this
+      # exact variable first and uses the value verbatim
+      # (crates/trusted-server-adapter-axum/src/platform.rs, kv_store_path).
+      # The store holds identity and consent state, so it belongs on a volume
+      # rather than in the container's writable layer, where a
+      # `docker compose down` would take a reader's consent withdrawal with it.
+      EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH: /home/appliance/trusted_server_kv.redb
+
+    volumes:
+      # Mounted at the home directory, which the image creates and owns, so a
+      # fresh volume inherits that ownership and the non-root process can write
+      # the database file. A volume mounted at a path the image does not create
+      # would arrive owned by root and the store would fail to open.
+      - appliance_state:/home/appliance
+
+    # The store is a redb database and redb takes an exclusive lock on the
+    # file, so exactly one process may hold it. A second appliance against the
+    # same volume does not split state quietly, it fails to open, which is the
+    # behavior we want.
+    deploy:
+      replicas: 1
+
+    # The appliance's own settings, supplied the way the Axum adapter documents
+    # them in docs/guide/getting-started.md. Marked not required so the stack
+    # still starts without one and fails in the appliance's own words.
+    env_file:
+      - path: .env
+        required: false
+
+    ports:
+      - "${TS_APPLIANCE_PORT:-8080}:8787"
+
+    # Ordering only, and deliberately not `service_healthy`. A publisher's
+    # pages must still be served when the ad server is down, and an appliance
+    # that refused to start without one would turn an unfilled ad slot into a
+    # dark site.
+    depends_on:
+      - eas
+
+    restart: unless-stopped
+
+    networks:
+      - pair
+
+  eas:
+    # The ad server's own image, built from its own Dockerfile in its own
+    # source tree. Nothing here modifies that source.
+    #
+    # EAS_SOURCE points at a checkout of
+    # https://github.com/jwrosewell/ethical-ad-server, which is our fork of
+    # https://github.com/readthedocs/ethical-ad-server. The default assumes it
+    # sits next to this repository as `ethical-ad-server`.
+    build:
+      context: ${EAS_SOURCE:-../../../ethical-ad-server}
+      dockerfile: docker-compose/django/Dockerfile
+    image: ${EAS_IMAGE:-ethicaladserver_local_django}
+
+    # That Dockerfile installs the Python dependencies but does not copy the
+    # application into the image: it sets WORKDIR /app and leaves /app empty,
+    # because the ad server's own compose file mounts the source there. This
+    # mount is that same arrangement, so the code that runs is the code in the
+    # checkout, which is also the copy of the source an operator can read.
+    #
+    # There is deliberately no mount for `ethicalads-ext`. That package is
+    # referenced by config/settings/base.py but is not part of the public
+    # source, and the import there is wrapped so a missing package leaves
+    # ADSERVER_EXT false and keeps those apps out of INSTALLED_APPS. Mounting
+    # something empty in its place is what breaks that, so nothing is mounted.
+    volumes:
+      - ${EAS_SOURCE:-../../../ethical-ad-server}:/app
+
+      # The start script, mounted over the copy baked into the image, which is
+      # what the ad server's own compose file does as well. It matters more
+      # here than there: on Windows, Git rewrites that script to CRLF line
+      # endings when `core.autocrlf` is true, which is the default, and an
+      # image built from such a checkout dies at once with
+      #   exec /start: no such file or directory
+      # because the kernel is looking for an interpreter called `/bin/bash\r`.
+      # With the script mounted, correcting the checkout is enough and the
+      # image does not have to be built again.
+      - ${EAS_SOURCE:-../../../ethical-ad-server}/docker-compose/django/start:/start
+
+    # The ad server reads its settings from these two files, which belong to
+    # its source tree and not to this one. `.envs/local/django` does not exist
+    # in a fresh checkout and has to be copied from `.envs/local/django.sample`
+    # first. Left required on purpose, so a missing file is named by compose
+    # rather than turning into a Django error later.
+    env_file:
+      - path: ${EAS_SOURCE:-../../../ethical-ad-server}/.envs/local/django
+        required: true
+      - path: ${EAS_SOURCE:-../../../ethical-ad-server}/.envs/local/postgres
+        required: true
+
+    command: /start
+
+    # Published on the host loopback address only, so the admin pages are
+    # reachable from the machine running the stack and from nowhere else. The
+    # ad server's own sample settings assume port 5000 on the host, which is
+    # where MEDIA_URL in `.envs/local/django.sample` points, so an operator who
+    # changes EAS_ADMIN_PORT should change MEDIA_URL to match or the image
+    # previews in the admin pages will not load.
+    ports:
+      - "127.0.0.1:${EAS_ADMIN_PORT:-5001}:5000"
+
+    # `-f` fails the probe on a 4xx or 5xx. The dashboard at `/` answers with a
+    # redirect to the login page when nobody is signed in, which is a healthy
+    # ad server answering, so the probe accepts it.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:5000/"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    restart: unless-stopped
+
+    networks:
+      - pair
+
+  postgres:
+    # The ad server's own database image, built from its own Dockerfile, so the
+    # server version and the extensions match what the ad server expects.
+    build:
+      context: ${EAS_SOURCE:-../../../ethical-ad-server}
+      dockerfile: docker-compose/postgres/Dockerfile
+    image: ${EAS_POSTGRES_IMAGE:-ethicaladserver_production_postgres}
+
+    env_file:
+      - path: ${EAS_SOURCE:-../../../ethical-ad-server}/.envs/local/postgres
+        required: true
+
+    volumes:
+      - eas_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+    restart: unless-stopped
+
+    networks:
+      - pair
+
+  redis:
+    # Pinned to the version the ad server's own compose file uses.
+    image: redis:5.0
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+    restart: unless-stopped
+
+    networks:
+      - pair
+
+volumes:
+  # Identity and consent state. Survives `docker compose down`, and is removed
+  # by `docker compose down --volumes`.
+  appliance_state:
+  eas_postgres_data:
+
+networks:
+  # One private network. The only ways in are the ports listed above, which are
+  # the appliance on every interface and the ad server on the host loopback
+  # address.
+  pair:
+    driver: bridge
