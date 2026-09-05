@@ -50,7 +50,7 @@ fn settings_with(extra: &str) -> Settings {
 /// The configuration block a deployment writes to use this provider.
 ///
 /// The endpoint is the self-hosted container's documented shape, which carries
-/// no key in the path because that image is authorised by licence key at
+/// no key in the path because that image is authorized by license key at
 /// start-up.
 const PROVIDER_BLOCK: &str = r#"
 [geo]

@@ -570,6 +570,24 @@ mod tests {
     }
 
     #[test]
+    fn a_second_open_of_the_same_file_is_refused() {
+        let directory = tempfile::tempdir().expect("should make a temporary directory");
+        let path = directory.path().join("ec.redb");
+        let _held = AxumEcKvStore::open(&path).expect("should open");
+
+        let second = AxumEcKvStore::open(&path);
+
+        // This is why the identity store gets a file of its own rather than
+        // sharing the platform store's. The module documentation says `redb`
+        // locks exclusively, and this is what makes that claim checkable
+        // rather than asserted.
+        assert!(
+            second.is_err(),
+            "a second open of a held database must be refused, or the separate-file              design this store depends on has no reason to exist"
+        );
+    }
+
+    #[test]
     fn identity_survives_reopening_the_database() {
         let directory = tempfile::tempdir().expect("should make a temporary directory");
         let path = directory.path().join("ec.redb");
