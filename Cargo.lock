@@ -5451,6 +5451,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "bytes",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
