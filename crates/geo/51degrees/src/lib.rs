@@ -78,7 +78,7 @@ pub struct FiftyOneDegreesGeoConfig {
     /// The full URL of the JSON endpoint, including any resource key the
     /// deployment requires in the path.
     ///
-    /// The self-hosted container is single-tenant and authorises by licence
+    /// The self-hosted container is single-tenant and authorized by license
     /// key at start-up, so its endpoint carries no key, for example
     /// `http://127.0.0.1:8080/api/v4/json`. A multi-tenant service keys the
     /// path instead, for example
@@ -150,7 +150,7 @@ pub fn geo_from_response(body: &serde_json::Value) -> Option<GeoInfo> {
             log::warn!(
                 "51Degrees geo: the service returns a region name and the permission model \
                  matches ISO 3166-2 subdivision codes, so the region is left unset. Country \
-                 rules apply; region rules do not."
+                 rules apply, region rules do not."
             );
         });
     }
