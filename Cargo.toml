@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/device/fastly",
+    "crates/geo/51degrees",
     "crates/geo/fastly",
     # Test fixture that proves the integration seam from outside core. A
     # workspace member so it shares workspace settings and lints; no default
@@ -118,6 +119,7 @@ toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-device-fastly = { path = "crates/device/fastly" }
+trusted-server-geo-51degrees = { path = "crates/geo/51degrees" }
 trusted-server-geo-fastly = { path = "crates/geo/fastly" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

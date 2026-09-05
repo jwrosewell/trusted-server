@@ -1,0 +1,36 @@
+[package]
+name = "trusted-server-geo-51degrees"
+description = "51Degrees IP Intelligence geo provider, calling a 51Degrees cloud service over HTTP."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter. This one has a vendor owner from the start,
+# because 51Degrees wrote it.
+[package.metadata.maintainers]
+owner = "51Degrees"
+status = "vendor owned"
