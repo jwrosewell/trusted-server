@@ -109,6 +109,7 @@ simple_logger = "5"
 spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
 subtle = "2.6"
 temp-env = "0.3.6"
+redb = "4.1"
 tempfile = "3.24"
 testcontainers = { version = "0.25", features = ["blocking"] }
 time = "0.3"

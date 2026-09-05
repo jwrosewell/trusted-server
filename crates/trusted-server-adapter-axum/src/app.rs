@@ -1,6 +1,7 @@
 use core::future::Future;
 use std::sync::Arc;
 
+use crate::ec_kv::{AxumEcKvStore, ec_identity_path};
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -22,6 +23,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::provider::ensure_provider_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -65,6 +67,14 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// The Edge Cookie identity graph, when the operator has named a store.
+    ///
+    /// Opened once here rather than per request, because `redb` locks the file
+    /// exclusively and a second open would fail. Absent when `[ec] ec_store`
+    /// is not configured, which is the operator declaring that identity is not
+    /// persisted, and core then declines to issue an identifier rather than
+    /// minting one with no row behind it.
+    ec_identity_graph: Option<KvIdentityGraph>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -129,11 +139,13 @@ pub fn build_state_with_registrations(
     ensure_provider_available(&settings.ec, None, None)?;
     let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
     let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+    let ec_identity_graph = open_ec_identity_graph(&settings)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        ec_identity_graph,
     }))
 }
 
@@ -357,7 +369,7 @@ async fn dispatch_fallback(
     if looks_like_browser
         && is_navigation_request(&req)
         && let Err(err) = ec_context
-            .generate_if_needed(&state.settings, None, services)
+            .generate_if_needed(&state.settings, state.ec_identity_graph.as_ref(), services)
             .await
     {
         log::error!("Edge Cookie generation failed for the publisher path: {err:?}");
@@ -397,16 +409,14 @@ async fn dispatch_fallback(
     // so every visitor looked new on their next request and no identity could
     // be carried at all.
     //
-    // The identity graph is `None` because this adapter has no `EcKvStore`
-    // implementation, which is a separate trait from the platform key-value
-    // store and a separate defect. Passing `None` is the shape the function
-    // already takes for a deployment without a graph, so tombstones and
-    // cross-partner reconciliation do not run here yet.
+    // The identity graph is present when the operator named a store. Without
+    // one, core declines to write a generated identifier rather than minting a
+    // browser cookie with no row behind it.
     let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
     ec_finalize_response(
         &state.settings,
         &ec_context,
-        None,
+        state.ec_identity_graph.as_ref(),
         &partner_registry,
         eids_cookie.as_deref(),
         sharedid_cookie.as_deref(),
@@ -414,6 +424,25 @@ async fn dispatch_fallback(
     );
 
     Ok(response)
+}
+
+/// Opens the Edge Cookie identity graph when the operator has named a store.
+///
+/// Mirrors the Fastly adapter, which builds a graph only when `[ec] ec_store`
+/// is set. The difference is that this adapter opens a local database file, so
+/// failing to open it is fatal rather than deferred: an appliance that cannot
+/// keep identity should say so at startup instead of quietly issuing nothing
+/// on every request afterwards.
+fn open_ec_identity_graph(
+    settings: &Settings,
+) -> Result<Option<KvIdentityGraph>, Report<TrustedServerError>> {
+    let Some(store_name) = settings.ec.ec_store.as_deref() else {
+        return Ok(None);
+    };
+    let path = ec_identity_path(store_name);
+    let store = AxumEcKvStore::open(&path)?;
+    log::info!("Edge Cookie identity store opened at {}", path.display());
+    Ok(Some(KvIdentityGraph::new(store)))
 }
 
 fn fallback_handler(
@@ -879,6 +908,10 @@ mod tests {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
+            // No identity graph: this fixture exercises the provider selection
+            // error, and opening a database file would make it a slower test
+            // of something it is not about.
+            ec_identity_graph: None,
         }
     }
 

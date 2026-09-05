@@ -6,6 +6,7 @@
 
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
+pub mod ec_kv;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
