@@ -85,15 +85,24 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 
 **Environment variable conventions used by the Axum adapter:**
 
-| Purpose            | Pattern                               | Example                                                  |
-| ------------------ | ------------------------------------- | -------------------------------------------------------- |
-| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123`          |
+| Purpose            | Pattern                                         | Example                                                                         |
+| ------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}`           | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…`                        |
+| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`           | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123`                                 |
+| KV store file      | `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH` | `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH=/var/lib/trusted-server/kv.redb` |
 
 Store names and key names are uppercased with hyphens and dots replaced by underscores.
 
-> **Dev server limitations:** The Axum adapter does not support KV store,
-> geo lookup, config/secret-store writes, or admin key-management routes.
+The KV store is a `redb` database file, created on first start at
+`.edgezero/trusted_server_kv.redb` unless the path above is set. `.edgezero/` is
+already in `.gitignore`. The database is locked for exclusive use, so a second
+dev server started in the same directory will refuse to start rather than share
+the file. That is deliberate, because the store holds identity and consent
+state, and a lost consent withdrawal cannot be told apart from a reader who
+never withdrew.
+
+> **Dev server limitations:** The Axum adapter does not support geo lookup,
+> config/secret-store writes, or admin key-management routes.
 > See [Architecture](/guide/architecture) for the full list.
 
 ### Build the Project

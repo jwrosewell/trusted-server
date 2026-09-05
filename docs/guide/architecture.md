@@ -50,12 +50,17 @@ Native Axum dev/test adapter (native binary):
 - Local development and integration-test adapter — not a production-equivalent runtime
 - Platform implementations backed by environment variables instead of Fastly stores
 - Listens on `http://localhost:8787` by default
+- KV store is a persistent `redb` database file, created on first start at
+  `.edgezero/trusted_server_kv.redb`. Override the whole path with
+  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH`, or just the file name with
+  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME`. The database is locked for
+  exclusive use and the server refuses to start when it cannot be opened,
+  rather than serving traffic that silently drops identity and consent state
 
 **Current limitations compared to the Fastly adapter:**
 
 | Feature                                    | Axum dev server                                                                                                                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
 | Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
 | Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
