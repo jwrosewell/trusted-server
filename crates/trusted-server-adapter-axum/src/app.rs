@@ -14,13 +14,19 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, AuctionProviderBuilder, build_orchestrator_with_providers,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::cookies::extract_cookie_value;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::provider::ensure_provider_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::evidence::BorrowedRequestInfo;
+use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -305,7 +311,57 @@ async fn dispatch_fallback(
 
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
+    // Read before routing consumes the request. `ec_finalize_response` needs
+    // both, and by the time the response exists the request has been moved.
+    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
+
     let mut ec_context = build_ec_context(state, services, &req).await?;
+
+    // Classify the device, then generate an identifier when the request is a
+    // document navigation by something that looks like a browser. Without this
+    // the context resolves an identity decision on every request and never acts
+    // on it, so `ec_finalize_response` below has nothing to write and every
+    // visitor stays new for ever.
+    //
+    // Both conditions matter. A subresource request carries no consent signals
+    // such as Sec-GPC, so generating from one would create an identity the
+    // visitor never had a chance to refuse. And an identifier minted for a
+    // crawler is an identity for something that is not a person.
+    let client_ip = services
+        .client_info()
+        .client_ip
+        .map_or_else(String::new, |ip| ip.to_string());
+    let device_signals = match services.device_provider() {
+        Some(provider) => {
+            let info = BorrowedRequestInfo::new(&client_ip, Some(req.headers()));
+            provider.detect(&info, services).await
+        }
+        // No module supplies one, so classify from the User-Agent alone.
+        //
+        // `derive_ua_only`, not `derive`. `derive` is the host-signals path and
+        // decides `looks_like_browser` from `ja4_class.is_some()`, so on a host
+        // that exposes no TLS fingerprint it calls every visitor a bot and no
+        // identifier is ever created. That failure is silent: the page serves
+        // correctly and no cookie appears.
+        None => DeviceSignals::derive_ua_only(
+            req.headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+        ),
+    };
+    let looks_like_browser = device_signals.looks_like_browser;
+    ec_context.set_device_signals(device_signals);
+
+    if looks_like_browser
+        && is_navigation_request(&req)
+        && let Err(err) = ec_context
+            .generate_if_needed(&state.settings, None, services)
+            .await
+    {
+        log::error!("Edge Cookie generation failed for the publisher path: {err:?}");
+    }
     let auction = AuctionDispatch {
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
@@ -326,7 +382,7 @@ async fn dispatch_fallback(
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are
     // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
+    let mut response = buffer_publisher_response_async(
         publisher_response,
         &method,
         &state.settings,
@@ -334,7 +390,30 @@ async fn dispatch_fallback(
         &state.orchestrator,
         services,
     )
-    .await
+    .await?;
+
+    // Write the Edge Cookie. Until this ran, this adapter resolved an identity
+    // per request and then dropped it on the floor: the cookie was never set,
+    // so every visitor looked new on their next request and no identity could
+    // be carried at all.
+    //
+    // The identity graph is `None` because this adapter has no `EcKvStore`
+    // implementation, which is a separate trait from the platform key-value
+    // store and a separate defect. Passing `None` is the shape the function
+    // already takes for a deployment without a graph, so tombstones and
+    // cross-partner reconciliation do not run here yet.
+    let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+    ec_finalize_response(
+        &state.settings,
+        &ec_context,
+        None,
+        &partner_registry,
+        eids_cookie.as_deref(),
+        sharedid_cookie.as_deref(),
+        &mut response,
+    );
+
+    Ok(response)
 }
 
 fn fallback_handler(
