@@ -80,9 +80,11 @@ pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
 
 /// Returns `true` when the request looks like a top-level document navigation.
 ///
-/// Uses [`Sec-Fetch-Dest`] when available (preferred — it is a forbidden
-/// header that cannot be spoofed by client-side JS). Falls back to checking
-/// the `Accept` header for an explicit `text/html` MIME type.
+/// Uses [`Sec-Fetch-Dest`] when available, which is preferred because
+/// client-side JavaScript cannot set it. Falls back to checking the `Accept`
+/// header for an explicit `text/html` MIME type, which is the path a current
+/// browser takes on a page served over plain HTTP, because the header is sent
+/// only to potentially trustworthy origins.
 ///
 /// This distinction prevents EC identity cookies from being generated on
 /// subresource requests (fonts, images, scripts) where browsers may omit
@@ -91,8 +93,15 @@ pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
 /// [`Sec-Fetch-Dest`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Dest
 #[must_use]
 pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
-    // Prefer Sec-Fetch-Dest (reliable, unspoofable by JS). All modern
-    // browsers send this header on every request.
+    // Prefer Sec-Fetch-Dest, which client-side JavaScript cannot set.
+    //
+    // Browsers send it only to potentially trustworthy origins, so it is
+    // absent for a page served over plain HTTP on a real hostname. Measured
+    // on 6 September 2026: Chrome navigating to such a page produced sixty
+    // requests carrying no Sec-Fetch-Dest at all. The Accept fallback below is
+    // not a courtesy to old clients, it is what carries a current browser on
+    // an insecure origin, and removing it would silently stop the server-side
+    // ad stack for every publisher not yet on TLS.
     if let Some(dest) = req
         .headers()
         .get("sec-fetch-dest")
