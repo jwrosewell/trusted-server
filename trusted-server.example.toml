@@ -328,6 +328,7 @@ sanitize_creatives = false
 providers = []
 timeout_ms = 2000
 # mediator = "adserver_mock"       # optional mediator integration
+# mediator = "ethical_adserver"    # arbitrate direct-sold demand vs programmatic
 # Context keys the JS client may forward into auction requests (allowlist;
 # empty blocks all).
 allowed_context_keys = []
@@ -629,4 +630,50 @@ container_id = "GTM-REPLACE-ME"
 # timeout_ms = 1000
 # Map auction context keys to mediation URL query params:
 # [integrations.adserver_mock.context_query_params]
+# example_segments = "segments"
+
+# Ethical Ad Server (EAS) mediator. Calls the EAS decision API for a
+# direct-sold ad and returns whichever is worth more, that ad or the best
+# programmatic bid already collected. Set `[auction] mediator` to
+# "ethical_adserver" to put it in the auction.
+# [integrations.ethical_adserver]
+# enabled = true
+# endpoint = "https://adserver.example.com/api/v1/decision/"
+# publisher = "example-publisher"
+# timeout_ms = 500
+# The decision API asks a server-to-server caller to identify itself here.
+# The end user's own agent is sent separately, so replace "examplepublisher".
+# user_agent = "trusted-server/1.0 +examplepublisher"
+# Minimum effective CPM the ad server must clear to be considered.
+# price_floor = 0.50
+# Limit the decision to certain campaign types, for example paid demand only.
+# campaign_types = ["paid"]
+# Keywords describing the page, used by the ad server for targeting.
+# keywords = ["example-topic"]
+# The decision API authenticates with a Django REST Framework token. It is a
+# credential, so it lives in the secret store and never in this file. Omit the
+# section when the ad server publisher allows unauthenticated decisions.
+# [integrations.ethical_adserver.api_token]
+# secret_store = "ts_secrets"
+# secret_name = "ethical_adserver_token"
+# Per-slot placement mapping. The decision API has no width or height, so each
+# slot names an EAS ad type slug. `div_id` defaults to the slot id, `priority`
+# runs 1 (lowest) to 10 (highest) and decides which slot EAS fills, since it
+# returns at most one ad per call. `width` and `height` default to the slot's
+# banner format in the auction request.
+#
+# Name an ad type whose template renders the advertisement. The ad server's
+# default template renders the view pixel alone for a headline, content and
+# call-to-action advertisement, so a slot won with that markup would show a
+# reader nothing. A slug the ad server does not know is not rejected either,
+# it simply never fills, so check the slug against the ad server before
+# blaming a lack of demand.
+# [integrations.ethical_adserver.slots.header-banner]
+# ad_type = "ts-server-side-tpl-v1"
+# priority = 10
+# Fallback ad type by banner size, for slots with no entry above.
+# [integrations.ethical_adserver.ad_types_by_format]
+# "300x250" = "ts-server-side-tpl-v1"
+# Map auction context keys to decision URL query params:
+# [integrations.ethical_adserver.context_query_params]
 # example_segments = "segments"

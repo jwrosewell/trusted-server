@@ -164,6 +164,12 @@ const BUILT_IN_PROVIDER_BUILDERS: &[AuctionProviderBuilder] = &[
         crate::integrations::adserver_mock::register_providers,
         crate::integrations::adserver_mock::validate,
     ),
+    AuctionProviderBuilder::new(
+        "ethical_adserver",
+        crate::integrations::CORE_SOURCE,
+        crate::integrations::ethical_adserver::register_providers,
+        crate::integrations::ethical_adserver::validate,
+    ),
 ];
 
 /// The built-in auction provider builders, in registration order.

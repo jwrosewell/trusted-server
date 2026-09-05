@@ -16,6 +16,7 @@ pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
 pub mod didomi;
+pub mod ethical_adserver;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
