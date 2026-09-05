@@ -43,3 +43,8 @@ tower = { workspace = true, features = ["util"] }
 # Test fixture only. It proves the integration seam from outside core and must
 # never reach a production build, so it stays a dev-dependency.
 trusted-server-integration-seam-probe = { path = "../integrations/seam-probe" }
+# The vendor geo provider, a dev-dependency for the same reason as the probe
+# above: this adapter stays neutral and a deployment that wants this vendor
+# composes it in itself. The test proves that composition works, which is the
+# thing the crate's own tests cannot show from inside it.
+trusted-server-geo-51degrees = { workspace = true }
