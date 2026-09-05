@@ -430,9 +430,18 @@ async fn dispatch_fallback(
 ///
 /// Mirrors the Fastly adapter, which builds a graph only when `[ec] ec_store`
 /// is set. The difference is that this adapter opens a local database file, so
-/// failing to open it is fatal rather than deferred: an appliance that cannot
-/// keep identity should say so at startup instead of quietly issuing nothing
-/// on every request afterwards.
+/// the failure happens at startup rather than on the first request.
+///
+/// What that failure does is worth stating exactly, because this adapter is
+/// inconsistent about it and the difference is not obvious from here. An error
+/// returned from this function reaches `build_state`, and `routes` turns that
+/// into `startup_error_router`, so **the process keeps running and answers
+/// every route with the error**. It does not exit. `init_kv_store` in `main.rs`
+/// does exit on the same class of fault, so the platform store and the identity
+/// store, both durable state this appliance cannot work without, fail two
+/// different ways. Neither is obviously wrong: refusing every request is
+/// visible and does not restart-loop a container, exiting is unmissable. They
+/// should agree, and today they do not.
 fn open_ec_identity_graph(
     settings: &Settings,
 ) -> Result<Option<KvIdentityGraph>, Report<TrustedServerError>> {
