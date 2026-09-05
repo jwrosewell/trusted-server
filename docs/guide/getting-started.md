@@ -101,7 +101,10 @@ the file. That is deliberate, because the store holds identity and consent
 state, and a lost consent withdrawal cannot be told apart from a reader who
 never withdrew.
 
-> **Dev server limitations:** The Axum adapter does not support geo lookup,
+> **Dev server limitations:** The Axum adapter has no geolocation of its own,
+> so with no `[geo] provider` selected every request resolves the permission
+> policy's declared jurisdiction rather than one from the request. A provider
+> supplied by an integration module can be selected. It also does not support
 > config/secret-store writes, or admin key-management routes.
 > See [Architecture](/guide/architecture) for the full list.
 

@@ -5373,6 +5373,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "trusted-server-core",
+ "trusted-server-geo-51degrees",
  "trusted-server-integration-seam-probe",
 ]
 
