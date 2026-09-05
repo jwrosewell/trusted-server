@@ -70,7 +70,12 @@ pub enum EcKvWriteOutcome {
 /// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
 /// write precondition failures are part of the normal control flow and are
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
-pub trait EcKvStore {
+/// The bound is `Send + Sync` because an adapter that serves requests on more
+/// than one thread holds one store for the process and shares it. The Fastly
+/// implementation is single-threaded and satisfies it trivially; a native
+/// adapter does not, and without the bound the graph cannot be held in shared
+/// application state at all.
+pub trait EcKvStore: Send + Sync {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
 
