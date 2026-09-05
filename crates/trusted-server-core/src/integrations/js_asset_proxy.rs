@@ -630,6 +630,7 @@ mod tests {
     fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
         let processor = create_html_processor(HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "publisher.example.com".to_string(),

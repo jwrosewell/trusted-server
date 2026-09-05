@@ -631,6 +631,8 @@ struct ProcessResponseParams<'a> {
     shared_template_authorized: bool,
     /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
     csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
+    /// See [`HtmlStreamProcessorParams::csp_nonce`].
+    csp_nonce: Option<&'a str>,
 }
 
 struct PublisherBodyProcessor {
@@ -659,6 +661,7 @@ impl PublisherBodyProcessor {
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
+                csp_nonce: params.csp_nonce.clone(),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -740,6 +743,7 @@ fn process_response_streaming<W: Write>(
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
+            csp_nonce: params.csp_nonce.map(str::to_string),
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -1241,6 +1245,13 @@ struct HtmlStreamProcessorParams<'a> {
     shared_template_authorized: bool,
     /// Where the transform records a response-bound CSP nonce, when one matters.
     csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// The nonce the origin's enforced `Content-Security-Policy` header admits scripts
+    /// with, read by [`csp_script_nonce`] while the response headers were still in hand.
+    ///
+    /// Stamped onto every script the processor injects. Without it, a publisher running
+    /// a nonce policy has the browser refuse the whole client side and nothing reports
+    /// that it happened.
+    csp_nonce: Option<String>,
 }
 
 /// The diagnostics decision the template may carry.
@@ -1414,6 +1425,7 @@ fn create_html_stream_processor(
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
+        .with_csp_nonce(params.csp_nonce.clone())
         .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
     Ok(create_html_processor(config))
@@ -1616,6 +1628,8 @@ pub struct OwnedProcessResponseParams {
     /// rescanned from the output, which cannot tell a `nonce` attribute from the same
     /// word inside a script.
     pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// See [`HtmlStreamProcessorParams::csp_nonce`].
+    pub(crate) csp_nonce: Option<String>,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2021,6 +2035,8 @@ fn build_template_assembly_params(
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
+        // A nonced response never reaches the cache, so an assembled template has none.
+        csp_nonce: None,
         // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
         seam_ad_slots: None,
@@ -2784,6 +2800,7 @@ pub fn stream_publisher_body<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
+        csp_nonce: params.csp_nonce.as_deref(),
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -2886,6 +2903,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.clone(),
+        csp_nonce: params.csp_nonce.clone(),
     }) {
         Ok(processor) => processor,
         Err(err) => {
@@ -4876,6 +4894,9 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
+            // Read before the body is taken, while the origin's enforced policy is
+            // still on the response. The header itself is forwarded untouched.
+            let csp_nonce = csp_script_nonce(response.headers());
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
 
@@ -4887,6 +4908,7 @@ pub async fn handle_publisher_request(
                     // present on the live path so no future caller has to remember to
                     // supply it — the handlers themselves stay gated on authorization.
                     csp_nonce_observed: Some(Arc::new(AtomicBool::new(false))),
+                    csp_nonce,
                     template_cache_key,
                     seam_ad_slots,
                     policy_headers,
@@ -5971,6 +5993,48 @@ fn origin_shared_ttl_at(
         return Err(TemplateCacheBypassReason::NoPositiveFreshness);
     }
     Ok(capped)
+}
+
+/// The nonce the origin's enforced `Content-Security-Policy` admits scripts with.
+///
+/// Reads the enforced header only. A report-only policy refuses nothing, so a nonce found
+/// there has no bearing on what runs. The directive that governs script elements is
+/// `script-src-elem`, then `script-src`, then `default-src`, in that order of
+/// precedence, and the first nonce in the first of those that is present wins. Where a
+/// response carries more than one enforced policy the first with a nonce is taken; a
+/// second policy with a different nonce cannot be satisfied by any single attribute.
+///
+/// Returns `None` when there is no enforced nonce, or when the value is not well formed.
+#[must_use]
+fn csp_script_nonce(headers: &edgezero_core::http::HeaderMap) -> Option<String> {
+    headers
+        .get_all("content-security-policy")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(csp_script_nonce_in_policy)
+}
+
+/// The script nonce named by one policy string, if any.
+fn csp_script_nonce_in_policy(policy: &str) -> Option<String> {
+    let directive_value = |name: &str| {
+        policy.split(';').find_map(|directive| {
+            let mut tokens = directive.split_whitespace();
+            let directive_name = tokens.next()?;
+            directive_name
+                .eq_ignore_ascii_case(name)
+                .then(|| tokens.collect::<Vec<_>>())
+        })
+    };
+    let sources = ["script-src-elem", "script-src", "default-src"]
+        .into_iter()
+        .find_map(directive_value)?;
+    sources.into_iter().find_map(|source| {
+        let trimmed = source.trim_matches('\'');
+        let nonce = trimmed
+            .strip_prefix("nonce-")
+            .or_else(|| trimmed.strip_prefix("NONCE-"))?;
+        crate::html_processor::csp_nonce_is_well_formed(nonce).then(|| nonce.to_string())
+    })
 }
 
 fn replayable_policy_headers(
@@ -7523,6 +7587,7 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -7803,6 +7868,7 @@ mod tests {
 
             let config = HtmlProcessorConfig {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
@@ -15583,6 +15649,7 @@ mod tests {
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15636,6 +15703,7 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15678,6 +15746,7 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15798,6 +15867,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -15856,6 +15926,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -15917,6 +15988,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -15978,6 +16050,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -16039,6 +16112,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -16088,6 +16162,7 @@ mod tests {
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -16281,6 +16356,7 @@ mod tests {
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -16350,6 +16426,7 @@ mod tests {
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -16421,6 +16498,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -16485,6 +16563,7 @@ mod tests {
             .expect("should build response");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -16631,6 +16710,7 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -17015,6 +17095,7 @@ mod tests {
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                csp_nonce: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -17202,6 +17283,7 @@ mod tests {
             .collect();
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -17277,6 +17359,7 @@ mod tests {
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -17335,6 +17418,7 @@ mod tests {
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -17448,6 +17532,7 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -17510,6 +17595,7 @@ mod tests {
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            csp_nonce: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -20599,5 +20685,105 @@ mod tests {
 
             assert_only_renderable_slot_was_auctioned(&captured);
         }
+    }
+}
+
+#[cfg(test)]
+mod csp_script_nonce_tests {
+    use super::csp_script_nonce;
+    use edgezero_core::http::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                *name,
+                HeaderValue::from_str(value).expect("should be a header value"),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn reads_the_nonce_from_script_src() {
+        let map = headers(&[(
+            "content-security-policy",
+            "default-src 'none'; script-src 'strict-dynamic' 'nonce-abc123+/=' 'self'",
+        )]);
+        assert_eq!(
+            csp_script_nonce(&map).as_deref(),
+            Some("abc123+/="),
+            "should take the nonce from script-src"
+        );
+    }
+
+    #[test]
+    fn script_src_elem_takes_precedence_over_script_src() {
+        let map = headers(&[(
+            "content-security-policy",
+            "script-src 'nonce-general'; script-src-elem 'nonce-elements'",
+        )]);
+        assert_eq!(
+            csp_script_nonce(&map).as_deref(),
+            Some("elements"),
+            "script-src-elem governs script elements and must win"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_src() {
+        let map = headers(&[(
+            "content-security-policy",
+            "default-src 'nonce-fallback' 'self'",
+        )]);
+        assert_eq!(
+            csp_script_nonce(&map).as_deref(),
+            Some("fallback"),
+            "default-src governs scripts when script-src is absent"
+        );
+    }
+
+    #[test]
+    fn ignores_a_report_only_policy() {
+        let map = headers(&[(
+            "content-security-policy-report-only",
+            "script-src 'nonce-reported'",
+        )]);
+        assert_eq!(
+            csp_script_nonce(&map),
+            None,
+            "a report-only policy refuses nothing, so its nonce means nothing"
+        );
+    }
+
+    #[test]
+    fn returns_none_without_a_nonce() {
+        let map = headers(&[(
+            "content-security-policy",
+            "script-src 'self' https://cdn.example",
+        )]);
+        assert_eq!(csp_script_nonce(&map), None, "no nonce, nothing to relay");
+    }
+
+    #[test]
+    fn refuses_a_nonce_that_could_escape_an_attribute() {
+        let map = headers(&[(
+            "content-security-policy",
+            "script-src 'nonce-abc\"><script>x</script>'",
+        )]);
+        assert_eq!(
+            csp_script_nonce(&map),
+            None,
+            "a value with a quote or angle bracket must never reach an attribute"
+        );
+    }
+
+    #[test]
+    fn takes_the_first_enforced_policy_with_a_nonce() {
+        let map = headers(&[
+            ("content-security-policy", "img-src 'self'"),
+            ("content-security-policy", "script-src 'nonce-second'"),
+        ]);
+        assert_eq!(csp_script_nonce(&map).as_deref(), Some("second"));
     }
 }

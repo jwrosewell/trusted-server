@@ -209,6 +209,16 @@ pub struct HtmlProcessorConfig {
     /// `None` on every path that cannot store a shared template, so an ordinary inline
     /// request does not pay for handlers whose only consumer is the template-cache gate.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// The nonce the origin's enforced `Content-Security-Policy` admits scripts with,
+    /// when it has one.
+    ///
+    /// Under a nonce policy the browser runs only scripts carrying the response's nonce,
+    /// and under `'strict-dynamic'` that is the only admission there is: host sources and
+    /// `'self'` are ignored. Every script this processor injects is stamped with it, so
+    /// the policy the publisher wrote keeps holding and the injected scripts are admitted
+    /// the way the publisher's own are. The header itself is passed through untouched.
+    /// Checked by [`csp_nonce_is_well_formed`] before use.
+    pub csp_nonce: Option<String>,
 }
 
 impl HtmlProcessorConfig {
@@ -233,6 +243,7 @@ impl HtmlProcessorConfig {
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
+            csp_nonce: None,
         }
     }
 
@@ -282,12 +293,74 @@ impl HtmlProcessorConfig {
         self
     }
 
+    /// Stamp every injected script with the response's CSP nonce.
+    ///
+    /// A value that is not well formed is dropped rather than written into an attribute,
+    /// because the nonce is the one string from a response header that ends up inside the
+    /// markup this processor emits.
+    #[must_use]
+    pub fn with_csp_nonce(mut self, nonce: Option<String>) -> Self {
+        self.csp_nonce = nonce.filter(|value| {
+            let well_formed = csp_nonce_is_well_formed(value);
+            if !well_formed {
+                log::warn!(
+                    "Content-Security-Policy nonce is not well formed; injected scripts will not carry it"
+                );
+            }
+            well_formed
+        });
+        self
+    }
+
     /// Attach the request-scoped `DataDome` client-tag suppression decision.
     #[must_use]
     pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
         self.suppress_datadome_client_side_tag = suppress;
         self
     }
+}
+
+/// Whether a nonce may be written into a `nonce` attribute.
+///
+/// A CSP nonce is base64, so the accepted characters are the base64 and base64url
+/// alphabets with padding. Anything else, a quote or an angle bracket above all, is
+/// refused so that a header value can never break out of the attribute it is written
+/// into.
+#[must_use]
+pub fn csp_nonce_is_well_formed(nonce: &str) -> bool {
+    !nonce.is_empty()
+        && nonce.len() <= 256
+        && nonce.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'_' | b'-')
+        })
+}
+
+/// Add `nonce="…"` to every `<script` open tag in markup this processor generated.
+///
+/// The markup is Trusted Server's own, assembled from format strings, so an open tag is
+/// exactly `<script` followed by whitespace or `>`. A tag that already carries a nonce is
+/// left alone. Publisher markup never passes through here.
+#[must_use]
+pub fn stamp_script_nonce(markup: &str, nonce: &str) -> String {
+    const OPEN: &str = "<script";
+    let mut out = String::with_capacity(markup.len() + 64);
+    let mut rest = markup;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        out.push_str(&rest[..at + OPEN.len()]);
+        let is_open_tag = after.starts_with('>') || after.starts_with(char::is_whitespace);
+        if is_open_tag {
+            let tag_end = after.find('>').unwrap_or(after.len());
+            if !after[..tag_end].contains("nonce=") {
+                out.push_str(" nonce=\"");
+                out.push_str(nonce);
+                out.push('"');
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -373,6 +446,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
     let body_close = config.body_close.clone();
+    let csp_nonce = config.csp_nonce.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
@@ -405,6 +479,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
+            let csp_nonce = csp_nonce.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -448,6 +523,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     // HTML parsing completes. Empty when none are enabled.
                     let deferred_ids = integrations.js_module_ids_deferred();
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
+                    // Everything above is Trusted Server's own markup, so one pass over
+                    // it marks every script the way the publisher's policy requires.
+                    if let Some(nonce) = csp_nonce.as_deref() {
+                        snippet = stamp_script_nonce(&snippet, nonce);
+                    }
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -465,6 +545,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
             let body_close = body_close.clone();
+            let csp_nonce = csp_nonce.clone();
             move |el| {
                 if matches!(body_close, BodyCloseInjection::None) {
                     return Ok(());
@@ -472,6 +553,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
                 let body_close = body_close.clone();
+                let csp_nonce = csp_nonce.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
@@ -485,9 +567,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                                 BodyCloseInjection::Marker(marker) => marker.clone(),
                                 BodyCloseInjection::InlineBids => {
                                     let script_guard = state.lock().expect("should lock bid state");
-                                    match &*script_guard {
+                                    let script = match &*script_guard {
                                         Some(s) => s.clone(),
                                         None => build_empty_bids_script(),
+                                    };
+                                    match csp_nonce.as_deref() {
+                                        Some(nonce) => stamp_script_nonce(&script, nonce),
+                                        None => script,
                                     }
                                 }
                                 // Unreachable: the element handler returned early
@@ -833,6 +919,7 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -1806,6 +1893,7 @@ mod tests {
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1884,6 +1972,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1923,6 +2012,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1963,6 +2053,7 @@ mod tests {
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -2017,6 +2108,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2049,6 +2141,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2074,6 +2167,7 @@ mod tests {
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: observer,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2210,6 +2304,7 @@ mod tests {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2261,6 +2356,121 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+
+    #[test]
+    fn stamps_nonce_on_every_generated_script_tag() {
+        let markup = concat!(
+            "<script>window.a=1;</script>",
+            "<script src=\"/static/tsjs=x.js\" id=\"trustedserver-js\"></script>",
+            "<script src=\"/static/tsjs=y.js\" defer></script>",
+        );
+        let stamped = stamp_script_nonce(markup, "abc123");
+        assert_eq!(
+            stamped,
+            concat!(
+                "<script nonce=\"abc123\">window.a=1;</script>",
+                "<script nonce=\"abc123\" src=\"/static/tsjs=x.js\" id=\"trustedserver-js\"></script>",
+                "<script nonce=\"abc123\" src=\"/static/tsjs=y.js\" defer></script>",
+            ),
+            "every open tag should carry the nonce and nothing else should change"
+        );
+    }
+
+    #[test]
+    fn stamping_leaves_a_tag_that_already_has_a_nonce_and_closing_tags_alone() {
+        let markup = "<script nonce=\"keep\">x</script><scripty></scripty>";
+        assert_eq!(
+            stamp_script_nonce(markup, "abc123"),
+            markup,
+            "an existing nonce is kept, a closing tag is not an open tag, and a different element is untouched"
+        );
+    }
+
+    #[test]
+    fn nonce_well_formedness_admits_base64_and_refuses_markup() {
+        assert!(csp_nonce_is_well_formed(
+            "DlGuCCYr9fPWrDlvR0+SAutGOj58Z+1eSjYNKax6G+3hYzwAfP"
+        ));
+        assert!(csp_nonce_is_well_formed("url-safe_value=="));
+        assert!(!csp_nonce_is_well_formed(""), "empty is not a nonce");
+        assert!(
+            !csp_nonce_is_well_formed("abc\"def"),
+            "a quote would end the attribute"
+        );
+        assert!(
+            !csp_nonce_is_well_formed("abc>def"),
+            "an angle bracket would end the tag"
+        );
+        assert!(
+            !csp_nonce_is_well_formed("abc def"),
+            "whitespace would start another attribute"
+        );
+        assert!(
+            !csp_nonce_is_well_formed(&"a".repeat(257)),
+            "an absurd length is refused"
+        );
+    }
+
+    #[test]
+    fn injected_scripts_carry_the_response_nonce() {
+        let mut config = create_test_config();
+        config = config.with_csp_nonce(Some("abc123".to_owned()));
+        config.ad_slots_script =
+            Some(r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string());
+        config.body_close = BodyCloseInjection::InlineBids;
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(
+                b"<html><head><script>publisher();</script></head><body><p>a</p></body></html>",
+                true,
+            )
+            .expect("should process");
+        let output = String::from_utf8(output).expect("should be UTF-8");
+
+        let opens = output.matches("<script").count();
+        let stamped = output.matches("<script nonce=\"abc123\"").count();
+        assert_eq!(
+            opens - 1,
+            stamped,
+            "every injected script must carry the nonce; only the publisher's own script may lack it: {output}"
+        );
+        assert!(
+            output.contains("<script>publisher();</script>"),
+            "the publisher's own script is not Trusted Server's to stamp: {output}"
+        );
+        assert!(
+            output.contains("nonce=\"abc123\" src=\"/static/tsjs="),
+            "the bundle tag must carry the nonce: {output}"
+        );
+    }
+
+    #[test]
+    fn injected_scripts_carry_no_nonce_when_the_response_has_none() {
+        let mut config = create_test_config();
+        config.ad_slots_script =
+            Some(r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string());
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(b"<html><head></head><body></body></html>", true)
+            .expect("should process");
+        let output = String::from_utf8(output).expect("should be UTF-8");
+
+        assert!(
+            !output.contains("nonce="),
+            "no policy, no nonce attribute: {output}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_nonce_is_dropped_rather_than_written() {
+        let config = create_test_config().with_csp_nonce(Some("abc\"><x".to_owned()));
+        assert_eq!(
+            config.csp_nonce, None,
+            "a value that could escape an attribute is refused"
         );
     }
 }

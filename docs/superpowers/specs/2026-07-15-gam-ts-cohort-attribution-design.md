@@ -85,13 +85,18 @@ unmarked.
   the delivery failure is monitored separately. This design adds no response
   buffering; configurations with HTML post-processors retain their existing
   buffering behavior.
-- The publisher Content Security Policy allows Trusted Server's bare inline
-  scripts to execute. Initial `adSlots`, the GPT enable flag, the GPT bootstrap,
-  and the `bids`/`adInit` invocation are all nonce-less inline scripts; Trusted
-  Server does not currently propagate a publisher nonce or update CSP hashes. A
-  policy that blocks those scripts makes the initial TS ad stack inert and is
-  ineligible at launch even if it allows the synchronous first-party TSJS
-  bundle.
+- The publisher Content Security Policy admits Trusted Server's injected
+  scripts. When the origin's enforced policy carries a script nonce, Trusted
+  Server reads it from the response header and stamps it on every script it
+  injects: initial `adSlots`, the GPT enable flag, the GPT bootstrap, the
+  `bids`/`adInit` invocation, and the TSJS bundle tag itself. The bundle needs
+  it as much as the inline scripts do, because under `'strict-dynamic'` the
+  browser ignores host sources and `'self'` and a nonce is the only admission;
+  being served first-party does not help it. Two policies are not honoured: a
+  hash-based policy, which Trusted Server does not update, and a nonce policy
+  delivered in a `<meta>` element rather than a header, which the streaming
+  transform sees only after it has injected. Either makes the TS ad stack inert
+  and is ineligible at launch.
 - Each in-scope HTML document uses one document-local GPT PubAds service. A
   marked parent does not mark a nested GPT instance. The publisher-only bundle
   attribute is deliberately non-secret and can be copied, so the implementation
