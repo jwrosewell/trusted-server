@@ -76,7 +76,12 @@ export async function requiredPermissionIsSet(): Promise<boolean> {
  */
 export function writeCookie(name: string, value: string): void {
   const secure = location.protocol === 'https:' ? '; Secure' : '';
-  document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; SameSite=Lax${secure}`;
+  // Written raw, not percent encoded, because the vendor's own JavaScript
+  // writes it raw and the server has to read either. The values are digits or
+  // base64, and base64's `+`, `/` and `=` are all legal cookie characters, so
+  // nothing here needs escaping. Encoding would make our cookies readable and
+  // the vendor's not, which is the opposite of the point.
+  document.cookie = `${name}=${value}; Path=/; SameSite=Lax${secure}`;
 }
 
 /**

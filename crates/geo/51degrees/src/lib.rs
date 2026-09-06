@@ -489,6 +489,7 @@ mod tests {
             .request_url(&crate::client::Evidence {
                 client_ip: "2.125.160.216".to_owned(),
                 user_agent: "Mozilla/5.0".to_owned(),
+                browser: Vec::new(),
             })
             .expect("should build the request URL");
 

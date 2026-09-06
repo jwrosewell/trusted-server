@@ -62,7 +62,42 @@ pub fn evidence_for(request_info: &dyn RequestInfo) -> Evidence {
     Evidence {
         client_ip,
         user_agent: request_info.user_agent().to_owned(),
+        browser: browser_evidence(request_info),
     }
+}
+
+/// Reads the evidence the browser gathered out of the request's cookies.
+///
+/// The screen and the high entropy client hints exist only in the browser, so
+/// the page writes them to `51D_` cookies and they arrive here on the next
+/// request. Nothing is invented when they are absent: a first page view simply
+/// has none, and the service answers from the `User-Agent` as it always did.
+fn browser_evidence(request_info: &dyn RequestInfo) -> Vec<(&'static str, String)> {
+    let Some(header) = request_info.header("cookie") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    // The order follows BROWSER_EVIDENCE rather than the header, so the same
+    // evidence always produces the same cache key whatever order the browser
+    // sent the cookies in.
+    for name in crate::client::BROWSER_EVIDENCE {
+        if let Some(value) = cookie_value(header, name) {
+            found.push((*name, value));
+        }
+    }
+    found
+}
+
+/// The value of one cookie in a `Cookie` header, or `None`.
+///
+/// Split on the first `=` only, because a base64 value carries its own `=`
+/// padding and splitting on every one would truncate it.
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header.split(';').find_map(|part| {
+        let part = part.trim();
+        let (key, value) = part.split_once('=')?;
+        (key == name && !value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 /// Reads a string property from the response's `device` element.
@@ -399,6 +434,93 @@ mod tests {
             attributes.is_none(),
             "an outage must leave the bid request describing the device as unknown, which \
              is true, rather than guessing at a make and model, which would misprice it"
+        );
+    }
+
+    fn request_with_cookies(cookies: &str) -> OwnedRequestInfo {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static(CHROME),
+        );
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_str(cookies).expect("should build the test header"),
+        );
+        OwnedRequestInfo::new("2.125.160.216".to_owned(), headers)
+    }
+
+    #[test]
+    fn the_browsers_evidence_is_read_off_the_request() {
+        let request = request_with_cookies(
+            "ts-ec=something; 51D_ScreenPixelsWidth=1080; 51D_ScreenPixelsHeight=2424",
+        );
+
+        let evidence = evidence_for(&request);
+
+        assert_eq!(
+            evidence.browser,
+            vec![
+                ("51D_ScreenPixelsWidth", "1080".to_owned()),
+                ("51D_ScreenPixelsHeight", "2424".to_owned()),
+            ],
+            "the screen exists only in the browser, so this is the only way the server \
+             ever learns it"
+        );
+    }
+
+    #[test]
+    fn a_first_page_view_carries_no_browser_evidence() {
+        // Nothing has run in the browser yet. This is the ordinary first visit
+        // and it must not invent anything: the service answers from the
+        // User-Agent as it always did.
+        let request = request_with_cookies("ts-ec=something");
+
+        assert!(evidence_for(&request).browser.is_empty());
+    }
+
+    #[test]
+    fn a_base64_value_survives_its_own_padding() {
+        // The high entropy hints are base64 and carry `=` padding. Splitting a
+        // cookie on every `=` rather than the first would truncate the value
+        // and the service would read a corrupted one.
+        let request = request_with_cookies("51D_GetHighEntropyValues=eyJtb2RlbCI6IlBpeGVsIn0=");
+
+        let evidence = evidence_for(&request);
+
+        assert_eq!(
+            evidence.browser,
+            vec![(
+                "51D_GetHighEntropyValues",
+                "eyJtb2RlbCI6IlBpeGVsIn0=".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_order_is_fixed_whatever_order_the_browser_sent() {
+        // The evidence is part of the cache key, so two requests carrying the
+        // same cookies in a different order have to produce the same key.
+        let one = evidence_for(&request_with_cookies(
+            "51D_ScreenPixelsWidth=1080; 51D_ScreenPixelsHeight=2424",
+        ));
+        let two = evidence_for(&request_with_cookies(
+            "51D_ScreenPixelsHeight=2424; 51D_ScreenPixelsWidth=1080",
+        ));
+
+        assert_eq!(one.browser, two.browser);
+    }
+
+    #[test]
+    fn an_empty_cookie_value_is_not_evidence() {
+        let request = request_with_cookies("51D_ScreenPixelsWidth=; 51D_ScreenPixelsHeight=2424");
+
+        let evidence = evidence_for(&request);
+
+        assert_eq!(
+            evidence.browser,
+            vec![("51D_ScreenPixelsHeight", "2424".to_owned())],
+            "an empty value tells the service nothing and would only split the cache"
         );
     }
 

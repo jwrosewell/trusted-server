@@ -78,6 +78,14 @@ pub struct Evidence {
     pub client_ip: String,
     /// The visitor's `User-Agent`.
     pub user_agent: String,
+    /// What the browser gathered and left in `51D_` cookies, in the fixed
+    /// order of [`BROWSER_EVIDENCE`].
+    ///
+    /// Part of the key, not a decoration on the side. A visitor whose client
+    /// hints arrive on their second request has different evidence from the
+    /// same visitor on their first, and serving them the first answer would
+    /// throw away the very thing the browser was asked to gather.
+    pub browser: Vec<(&'static str, String)>,
 }
 
 /// A decoded cloud response, shared between the providers of one request.
@@ -235,6 +243,10 @@ pub fn query_parameters(evidence: &Evidence, want_identity: bool) -> Vec<(String
         ("client-ip".to_owned(), evidence.client_ip.clone()),
         ("User-Agent".to_owned(), evidence.user_agent.clone()),
     ];
+    // What the browser gathered, under the bare names the service reads.
+    for (name, value) in &evidence.browser {
+        parameters.push(((*name).to_owned(), value.clone()));
+    }
     let want_device = !evidence.user_agent.trim().is_empty();
     let properties = IP_PROPERTIES
         .iter()
@@ -248,6 +260,22 @@ pub fn query_parameters(evidence: &Evidence, want_identity: bool) -> Vec<(String
     }
     parameters
 }
+
+/// The evidence names the browser writes and the service reads.
+///
+/// These are the service's own names, written by its own JavaScript, so the
+/// server reads them whether our module or the vendor's bundle gathered them.
+///
+/// They are passed to the service **bare**, exactly as they appear here.
+/// Measured against the live service on 6 September 2026: sending
+/// `51D_ScreenPixelsWidth=999` changes the answer, while `cookie.`, `query.`
+/// and the bare property name are all accepted and silently ignored. That is
+/// the same trap as `query.client-ip`, and it fails by looking like it worked.
+pub const BROWSER_EVIDENCE: &[&str] = &[
+    "51D_ScreenPixelsWidth",
+    "51D_ScreenPixelsHeight",
+    "51D_GetHighEntropyValues",
+];
 
 /// IP intelligence properties this crate reads.
 ///
@@ -401,6 +429,7 @@ impl CloudClient {
         let evidence = Evidence {
             client_ip: address,
             user_agent: String::new(),
+            browser: Vec::new(),
         };
         let answer = self.fetch(&evidence, services).await?;
         self.cache.put(evidence, answer.clone());
@@ -520,6 +549,7 @@ mod tests {
         Evidence {
             client_ip: "2.125.160.216".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
+            browser: Vec::new(),
         }
     }
 
@@ -546,6 +576,45 @@ mod tests {
     }
 
     #[test]
+    fn the_browser_evidence_is_sent_under_the_bare_names_the_service_reads() {
+        let with_screen = Evidence {
+            client_ip: "2.125.160.216".to_owned(),
+            user_agent: "Mozilla/5.0".to_owned(),
+            browser: vec![("51D_ScreenPixelsWidth", "1080".to_owned())],
+        };
+
+        let parameters = query_parameters(&with_screen, false);
+
+        assert!(
+            parameters
+                .iter()
+                .any(|(name, value)| name == "51D_ScreenPixelsWidth" && value == "1080"),
+            "the service reads the bare name. Measured: `cookie.`, `query.` and the bare \
+             property name are all accepted and silently ignored, so a prefix here would \
+             throw the browser's work away while looking like it worked"
+        );
+    }
+
+    #[test]
+    fn evidence_the_browser_gathered_changes_the_cache_key() {
+        let cache = AnswerCache::new();
+        let first_visit = evidence();
+        cache.put(first_visit.clone(), answer("GB"));
+
+        let with_screen = Evidence {
+            browser: vec![("51D_ScreenPixelsWidth", "1080".to_owned())],
+            ..first_visit
+        };
+
+        assert!(
+            cache.get(&with_screen).is_none(),
+            "a visitor whose client hints arrived on their second request has different \
+             evidence from their first, and serving the first answer would discard the \
+             very thing the browser was asked to gather"
+        );
+    }
+
+    #[test]
     fn different_evidence_does_not_share_an_answer() {
         let cache = AnswerCache::new();
         cache.put(evidence(), answer("GB"));
@@ -553,6 +622,7 @@ mod tests {
         let other = Evidence {
             client_ip: "8.8.8.8".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
+            browser: Vec::new(),
         };
 
         assert!(
@@ -569,6 +639,7 @@ mod tests {
         let other = Evidence {
             client_ip: evidence().client_ip,
             user_agent: "curl/8".to_owned(),
+            browser: Vec::new(),
         };
 
         assert!(
@@ -585,6 +656,7 @@ mod tests {
                 Evidence {
                     client_ip: format!("10.0.0.{index}"),
                     user_agent: "Mozilla/5.0".to_owned(),
+                    browser: Vec::new(),
                 },
                 answer("GB"),
             );
@@ -603,6 +675,7 @@ mod tests {
         let address_only = Evidence {
             client_ip: "2.125.160.216".to_owned(),
             user_agent: String::new(),
+            browser: Vec::new(),
         };
 
         let parameters = query_parameters(&address_only, true);
