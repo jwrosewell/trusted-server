@@ -97,6 +97,29 @@ pub struct FiftyOneDegreesGeoConfig {
     /// `https://cloud.example.com/api/v4/<resource key>.json`. Both are just a
     /// URL to this provider, which is why there is no separate key setting to
     /// get wrong or to leak into a log.
+    ///
+    /// # Restrict the key to your domains
+    ///
+    /// A resource key is created in the 51Degrees configurator, which lets you
+    /// name the domains it may be used from. A key created without that list
+    /// works from anywhere, so anyone who reads it can spend your allowance
+    /// against your account.
+    ///
+    /// The restriction is checked against the origin the request declares,
+    /// which a browser sends of its own accord, so a restricted key read out of
+    /// a page is not usable from anywhere else without deliberately stripping
+    /// that header. A key with no domain list has nothing to check.
+    ///
+    /// **Name your domains for any key used in production.** It costs nothing,
+    /// and it is the difference between a key that is merely visible and a key
+    /// that is usable. Client-side deployment makes this sharper, because
+    /// viewing source reveals the key, but a key in server configuration
+    /// reaches a log or a screen share often enough to be worth restricting
+    /// either way.
+    ///
+    /// A server-to-server call sends no origin of its own, so the caller has to
+    /// present one for a restricted key to work. The 51Degrees cloud request
+    /// engine does this through its configured cloud request origin.
     #[validate(url)]
     pub endpoint: String,
 
