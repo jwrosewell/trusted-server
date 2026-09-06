@@ -489,11 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn critical_ch_is_off_unless_a_deployment_asks_for_it() {
-        // The default is the load-bearing part. Critical-CH makes a browser
-        // reissue the navigation rather than render the page, so switching it
-        // on doubles the first request of every session. That is a deployment's
-        // trade to make, not one to inherit by accident.
+    fn a_deployment_can_turn_critical_ch_off() {
+        // On by default, because without it the first page view of a session is
+        // priced on a User-Agent alone. A deployment that would rather serve
+        // that page immediately can switch it off, and this is that switch.
         let headers = provider_with(false).client_hint_headers(&answer_naming_hints());
 
         assert!(

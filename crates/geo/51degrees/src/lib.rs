@@ -119,14 +119,23 @@ pub struct FiftyOneDegreesGeoConfig {
     /// Whether to ask the browser to retry the first navigation carrying its
     /// client hints, by sending `Critical-CH`.
     ///
-    /// Off by default, and the default is the important part. `Critical-CH`
-    /// makes a browser reissue the navigation rather than render the page, so
-    /// the first request of a session costs two origin fetches instead of one.
-    /// What it buys is a first page view that already has the hints, rather
-    /// than one served blind while the hints arrive for the second. That is a
-    /// real trade between latency and accuracy, and it is a deployment's to
-    /// make rather than ours to assume.
-    #[serde(default)]
+    /// **On by default.** Without it the first page view of a session is served
+    /// blind, with the hints arriving only in time for the second, so the first
+    /// auction of every session is priced on a User-Agent alone. With it the
+    /// browser reissues the navigation and the first page is priced properly.
+    /// The cost is one extra origin fetch at the start of a session, paid once.
+    ///
+    /// # Why this cannot loop
+    ///
+    /// The retry is bounded by the hints, not by anything this crate does. A
+    /// browser retries only when the named hints were absent from the request,
+    /// and the retried request carries them, so the second response satisfies
+    /// the check and is rendered. A browser that does not support client hints
+    /// at all ignores the header rather than retrying forever.
+    ///
+    /// Set to `false` on a deployment that would rather serve the first page
+    /// immediately and accept a worse first auction.
+    #[serde(default = "default_critical_client_hints")]
     pub critical_client_hints: bool,
 }
 
@@ -137,6 +146,10 @@ impl trusted_server_core::settings::IntegrationConfig for FiftyOneDegreesGeoConf
 }
 
 const fn default_enabled() -> bool {
+    true
+}
+
+const fn default_critical_client_hints() -> bool {
     true
 }
 
@@ -341,6 +354,29 @@ mod tests {
             "should take the ISO alpha-2 country code"
         );
         assert_eq!(geo.city, "Reading", "should take the town as the city");
+    }
+
+    #[test]
+    fn critical_client_hints_is_on_unless_a_deployment_turns_it_off() {
+        // The default decides what every deployment that says nothing gets, so
+        // it is asserted rather than left to the serde attribute.
+        let configured: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json"
+        }))
+        .expect("should read a configuration naming only the endpoint");
+
+        assert!(
+            configured.critical_client_hints,
+            "without it the first page view of a session is priced on a User-Agent alone"
+        );
+
+        let switched_off: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json",
+            "critical_client_hints": false
+        }))
+        .expect("should read the switch");
+
+        assert!(!switched_off.critical_client_hints);
     }
 
     #[test]
