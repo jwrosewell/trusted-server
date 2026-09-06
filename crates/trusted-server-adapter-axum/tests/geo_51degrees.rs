@@ -179,3 +179,21 @@ endpoint = "http://127.0.0.1:8080/api/v4/json"
         "a device selector naming a module nothing supplies must stop the deployment          rather than fall back to the User-Agent, which would look like device          detection was working"
     );
 }
+
+/// The provider is reachable from the shipped binary, not just from a test
+/// that hands the builder over itself.
+///
+/// Every test above passes the builder explicitly, which proves the seam works
+/// and says nothing about whether the running server ever uses it. Before this
+/// was checked, it did not: `build_state` composed an empty builder list, so a
+/// deployment writing `[geo] provider = "fiftyone_degrees"` was refused at
+/// startup by a binary that contained the module.
+#[test]
+fn the_running_binary_offers_this_vendor_to_a_deployment() {
+    let offered = trusted_server_adapter_axum::app::vendor_builder_ids();
+
+    assert!(
+        offered.contains(&"fiftyone_degrees"),
+        "the adapter must hand this module to the registry for any deployment to          select it, offered: {offered:?}"
+    );
+}

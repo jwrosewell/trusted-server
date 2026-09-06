@@ -105,7 +105,36 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
     let kv_path = init_kv_store(&EnvConfig::from_env())?;
     log::info!("KV store opened at {}", kv_path.display());
-    build_state_with_settings(settings)
+    build_state_with_registrations(settings, &vendor_builders(), &[])
+}
+
+/// The vendor modules this adapter compiles in and offers to a deployment.
+///
+/// The adapter is the composition root, so a vendor crate is reachable only if
+/// this list carries its builder. A crate that compiles, whose own tests pass,
+/// and that nothing hands to the registry is a provider no deployment can
+/// select, and the selector then fails at startup naming a module that is
+/// physically present in the binary.
+///
+/// Offering a module is not enabling it. Every builder here reads its own
+/// `[integrations.<id>]` block and declares nothing when the deployment has
+/// written none, so a configuration that names no vendor behaves exactly as it
+/// did before the crate was linked in.
+fn vendor_builders() -> Vec<IntegrationBuilder> {
+    vec![trusted_server_geo_51degrees::builder()]
+}
+
+/// The ids of the vendor modules [`vendor_builders`] offers.
+///
+/// Exposed so a test can assert that the shipped binary really offers a
+/// module, which is a different question from whether a test that supplies the
+/// builder itself can select one.
+#[must_use]
+pub fn vendor_builder_ids() -> Vec<&'static str> {
+    vendor_builders()
+        .iter()
+        .map(IntegrationBuilder::id)
+        .collect()
 }
 
 /// Build the application state from explicit settings.

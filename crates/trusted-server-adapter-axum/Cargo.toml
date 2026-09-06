@@ -34,6 +34,16 @@ simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { workspace = true, features = ["util"] }
 trusted-server-core = { workspace = true }
+# The vendor geo and device provider. A real dependency, not a dev one: this
+# adapter is the composition root, so a module it does not hand to the registry
+# is one no deployment can select, and the selector then fails at startup
+# naming a module that is compiled into the binary. Core stays neutral, which
+# is the rule; the adapter composing a vendor is how that rule is kept.
+#
+# Linking it does not turn it on. Its builder reads its own
+# `[integrations.fiftyone_degrees]` block and declares nothing when a
+# deployment has written none.
+trusted-server-geo-51degrees = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
@@ -47,8 +57,3 @@ tower = { workspace = true, features = ["util"] }
 # Test fixture only. It proves the integration seam from outside core and must
 # never reach a production build, so it stays a dev-dependency.
 trusted-server-integration-seam-probe = { path = "../integrations/seam-probe" }
-# The vendor geo provider, a dev-dependency for the same reason as the probe
-# above: this adapter stays neutral and a deployment that wants this vendor
-# composes it in itself. The test proves that composition works, which is the
-# thing the crate's own tests cannot show from inside it.
-trusted-server-geo-51degrees = { workspace = true }
