@@ -5077,6 +5077,7 @@ fn apply_auction_eids_and_device(
             user_agent: None,
             ip: None,
             geo: None,
+            attributes: None,
         });
         device.ip = client_ip;
         device.geo = targeting.geo.cloned();
@@ -5127,6 +5128,7 @@ pub(crate) fn build_auction_request(
             user_agent: Some(ua.to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         }),
         site: Some(SiteInfo {
             domain: publisher_domain.to_owned(),

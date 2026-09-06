@@ -1760,6 +1760,7 @@ mod tests {
                 region: Some("CA".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
         let settings = create_test_settings();
         let services = noop_services();

@@ -222,6 +222,9 @@ pub fn convert_tsjs_to_auction_request(
             .map(str::to_string),
         ip: services.client_info().client_ip.map(|ip| ip.to_string()),
         geo,
+        // Filled by the caller, which is async and can ask the device
+        // provider. This builder is synchronous, so it cannot.
+        attributes: None,
     });
 
     // Forward allowed config entries from the JS request into the context map.

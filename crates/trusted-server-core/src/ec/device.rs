@@ -17,11 +17,80 @@
 //! - **`known_browser`** — `true` if `ja4_class` + `h2_fp_hash` match a known
 //!   browser pattern; `false` for known bots; `None` for unknown
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::kv_types::KvDevice;
 use crate::evidence::RequestInfo;
 use crate::settings::Settings;
+
+/// Device attributes for the bid request, as distinct from the gate signals.
+///
+/// Kept apart from [`DeviceSignals`] on purpose. Those signals answer one
+/// question, whether this request looks like a browser, and are stored in the
+/// identity graph. These answer a different one, what a bidder is being asked
+/// to price, and are stored nowhere. Merging them would put advertising fields
+/// into a type the identity path serialises.
+///
+/// Every field is optional because every source is partial. A provider that
+/// resolves a device type but not a model fills what it has, and the `OpenRTB`
+/// device object simply omits the rest, which is what a bidder expects.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAttributes {
+    /// `OpenRTB` device type, from the specification's table: 1 mobile or
+    /// tablet, 2 personal computer, 3 connected television, 4 phone, 5 tablet,
+    /// 6 connected device, 7 set top box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<i32>,
+    /// Hardware vendor, the `make` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make: Option<String>,
+    /// Hardware model, the `model` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Operating system name, the `os` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Operating system version, the `osv` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    /// Screen width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_width: Option<i32>,
+    /// Screen height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_height: Option<i32>,
+}
+
+impl DeviceAttributes {
+    /// Whether anything was resolved.
+    ///
+    /// A provider that resolved nothing should not put an empty device object
+    /// on the request, because an empty object and an absent one mean the same
+    /// thing to a bidder and the absent one is smaller.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Maps a device-type name to the `OpenRTB` code.
+    ///
+    /// Names come from a detection provider and are matched case-insensitively.
+    /// An unrecognised name resolves nothing rather than guessing, because a
+    /// wrong device type is worse for a bidder than an absent one.
+    #[must_use]
+    pub fn device_type_from_name(name: &str) -> Option<i32> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "phone" | "smartphone" => Some(4),
+            "tablet" => Some(5),
+            "desktop" | "notebook" | "smallscreen" => Some(2),
+            "tv" | "smarttv" => Some(3),
+            "console" | "mediahub" | "iot" => Some(6),
+            "settopbox" => Some(7),
+            _ => None,
+        }
+    }
+}
 
 /// Device signals derived from a single request.
 ///
@@ -161,6 +230,26 @@ pub trait DeviceProvider: Send + Sync {
     /// no permission.
     fn required_permissions(&self) -> crate::permissions::PermissionSet {
         crate::permissions::PermissionSet::none()
+    }
+
+    /// Attributes for the bid request, when this provider can resolve them.
+    ///
+    /// Separate from [`detect`](Self::detect) because the two answer different
+    /// questions and have different costs. The gate signals must always be
+    /// produced, so `detect` is infallible. These are optional: a provider that
+    /// reads only the User-Agent has nothing useful to say about a model or a
+    /// screen size, and the default returns nothing so no existing provider
+    /// changes.
+    ///
+    /// A provider that resolves nothing should return `None` rather than an
+    /// empty value, because an absent device object and an empty one mean the
+    /// same to a bidder and the absent one is smaller.
+    async fn advertising_attributes(
+        &self,
+        _request_info: &dyn RequestInfo,
+        _services: &crate::platform::RuntimeServices,
+    ) -> Option<DeviceAttributes> {
+        None
     }
 }
 
