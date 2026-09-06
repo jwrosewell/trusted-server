@@ -46,6 +46,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
+use trusted_server_core::ec::provider::EcProviderSelection;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
 use trusted_server_core::platform::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
@@ -269,6 +270,31 @@ impl PlatformGeo for FiftyOneDegreesGeo {
 /// Where this module came from, reported when two modules claim one id.
 const SOURCE: &str = "trusted-server-geo-51degrees";
 
+/// Whether any selected provider actually reads client hints.
+///
+/// Only the device and identity providers do. The device answer is a statement
+/// about the hardware and the browser, which is what a hint carries, and the
+/// identifier is derived from that same evidence. Geo resolves a country from
+/// the client address, and no client hint says anything about where a request
+/// came from, so a deployment running geo alone gains nothing from the
+/// delegation and should not have a meta tag in every page for it.
+///
+/// This gates the markup. The `Accept-CH` and `Critical-CH` headers are gated
+/// separately and more narrowly, because the only seam that reaches a response
+/// header belongs to the identity provider: a deployment selecting the device
+/// provider without the identity provider gets the delegation tag and no
+/// headers. The tag is the part that matters, since delegation in the markup
+/// carries the hints on the very first request with no round trip, but the
+/// asymmetry is real and worth knowing.
+fn client_hints_are_read(settings: &Settings) -> bool {
+    let device_selects_us = settings.device.provider.as_deref() == Some(PROVIDER_ID);
+    let identity_selects_us = matches!(
+        settings.ec.provider.as_ref(),
+        Some(EcProviderSelection::Named(key)) if key == PROVIDER_ID
+    );
+    device_selects_us || identity_selects_us
+}
+
 /// Reads this provider's configuration block, when the deployment has one.
 fn read_config(
     settings: &Settings,
@@ -295,13 +321,18 @@ pub fn register(
         config.timeout_ms,
         config.identity,
     ));
+    let mut builder = IntegrationRegistration::builder(PROVIDER_ID);
+    if client_hints_are_read(settings) {
+        // The client hint delegation. It has to be in the served markup,
+        // because a browser ignores a Delegate-CH meta tag that JavaScript
+        // added, so no script in the page can do this and a publisher cannot
+        // do it with a tag manager either.
+        builder = builder
+            .with_head_injector(Arc::new(FiftyOneDegreesHeadInjector::new(&config.endpoint)));
+    }
+
     Ok(Some(
-        IntegrationRegistration::builder(PROVIDER_ID)
-            // The client hint delegation. It has to be in the served markup,
-            // because a browser ignores a Delegate-CH meta tag that JavaScript
-            // added, so no script in the page can do this and a publisher
-            // cannot do it with a tag manager either.
-            .with_head_injector(Arc::new(FiftyOneDegreesHeadInjector::new(&config.endpoint)))
+        builder
             .with_geo_provider(Arc::new(FiftyOneDegreesGeo::new(
                 config.enabled,
                 Arc::clone(&client),

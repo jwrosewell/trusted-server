@@ -388,3 +388,72 @@ fn the_browser_module_joins_the_injected_bundle() {
          or the client evidence it gathers is never gathered, got {immediate:?}"
     );
 }
+
+/// The client hint delegation appears only for the providers that read hints.
+///
+/// Geo resolves a country from the client address, and no client hint says
+/// anything about where a request came from. So a deployment running geo alone
+/// gains nothing from the delegation, and putting a meta tag in every one of a
+/// publisher's pages for a third party it does not consult would be a real
+/// cost for no return.
+#[test]
+fn geo_alone_puts_no_client_hint_delegation_in_the_page() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "https://cloud.51degrees.com/api/v4/json"
+"#,
+    );
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert!(
+        registration.head_injectors.is_empty(),
+        "geo does not read client hints, so nothing should be written into the page"
+    );
+}
+
+/// Device detection does read them, so selecting it brings the delegation.
+#[test]
+fn selecting_device_detection_brings_the_delegation() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "https://cloud.51degrees.com/api/v4/json"
+"#,
+    );
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert_eq!(
+        registration.head_injectors.len(),
+        1,
+        "the device answer is a statement about the hardware and the browser, which is \
+         exactly what a client hint carries"
+    );
+}
+
+/// So does identity, because the identifier is derived from that same evidence.
+#[test]
+fn selecting_identity_brings_the_delegation() {
+    let settings = settings_selecting_identity("");
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert_eq!(registration.head_injectors.len(), 1);
+}
