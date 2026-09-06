@@ -35,6 +35,8 @@
 //! provider leaves the region unset and says so once per process. Populating
 //! it needs a name-to-code mapping that nothing here owns yet.
 
+pub mod client;
+
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
