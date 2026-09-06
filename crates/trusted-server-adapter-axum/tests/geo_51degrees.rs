@@ -249,8 +249,15 @@ fn a_51degrees_identifier_survives_core_read_back_verbatim() {
     // A real identifier shape from a live staging response, shortened. The
     // mixed case, the plus and the trailing equals are the parts that break
     // under the built-in rules.
-    const IDENTIFIER: &str =
-        "v5zpMhSCBhtlg5lPPDsacnjSwVYotOIo-oQd-99fsXtdaBgUAMPyE_fQnVliHW_LlthFKzlO6D";
+    // A genuine 51Did in cookie form, issued by the live service for the
+    // documentation address 2.125.160.216. It has to be real, because the
+    // provider now parses the OWID envelope before accepting anything, and a
+    // string of the right length and alphabet is not an envelope.
+    const IDENTIFIER: &str = concat!(
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
+    );
 
     let settings = settings_selecting_identity("");
 
@@ -324,8 +331,15 @@ fn an_identifier_this_module_did_not_create_is_refused() {
 /// bug reached production, so the same round trip is asked of the wrapped form.
 #[test]
 fn the_identifier_survives_the_wrapper_the_running_server_uses() {
-    const IDENTIFIER: &str =
-        "v5zpMhSCBhtlg5lPPDsacnjSwVYotOIo-oQd-99fsXtdaBgUAMPyE_fQnVliHW_LlthFKzlO6D";
+    // A genuine 51Did in cookie form, issued by the live service for the
+    // documentation address 2.125.160.216. It has to be real, because the
+    // provider now parses the OWID envelope before accepting anything, and a
+    // string of the right length and alphabet is not an envelope.
+    const IDENTIFIER: &str = concat!(
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
+    );
 
     let settings = settings_selecting_identity("");
     let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(

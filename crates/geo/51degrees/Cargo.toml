@@ -15,6 +15,12 @@ workspace = true
 
 [dependencies]
 trusted-server-core = { workspace = true }
+# Reads and verifies the OWID envelope a 51Did is carried in. Needed because
+# the resolve endpoint accepts a value posted by the browser, and an identifier
+# taken on trust could be anyone's, which would link this visitor to another
+# person's identity graph row. Pure parsing and signature checking, no HTTP of
+# its own, so the caller supplies both the key and the transport.
+fodid = "4.5.3"
 async-trait = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }

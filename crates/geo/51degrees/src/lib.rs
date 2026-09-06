@@ -39,6 +39,7 @@ pub mod client;
 pub mod device;
 pub mod head;
 pub mod identity;
+pub mod verify;
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};

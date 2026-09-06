@@ -60,6 +60,7 @@ use trusted_server_core::provider_code;
 use crate::PROVIDER_ID;
 use crate::client::{CloudAnswer, CloudClient};
 use crate::device::evidence_for_usage;
+use crate::verify::{self, KeyCache};
 
 /// This provider's registered code, the `51dd~` namespace of every identifier
 /// it creates.
@@ -154,16 +155,23 @@ const MAX_ID_BYTES: usize = 250;
 pub struct FiftyOneDegreesIdentity {
     client: Arc<CloudClient>,
     critical_client_hints: bool,
+    /// The signers whose public keys this process has fetched.
+    ///
+    /// Shared by the two paths an identifier arrives on, so a key fetched
+    /// while accepting a client-posted value is the one read-back uses a
+    /// moment later.
+    keys: KeyCache,
 }
 
 impl FiftyOneDegreesIdentity {
     /// Creates a provider sharing one client, and so one call, with the other
     /// providers this crate supplies.
     #[must_use]
-    pub const fn new(client: Arc<CloudClient>, critical_client_hints: bool) -> Self {
+    pub fn new(client: Arc<CloudClient>, critical_client_hints: bool) -> Self {
         Self {
             client,
             critical_client_hints,
+            keys: KeyCache::new(),
         }
     }
 
@@ -317,7 +325,29 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
     fn accepts_id(&self, value: &str) -> bool {
         // Not the default. The default describes the built-in HMAC shape and
         // would refuse every identifier this provider creates.
-        is_well_formed(value)
+        if !is_well_formed(value) {
+            return false;
+        }
+
+        // An incoming cookie is a value the browser sent, so the shape check
+        // alone answers only "it looks like base64 of about the right length",
+        // which anyone can produce. Verify the signature when the signer's key
+        // is already known.
+        //
+        // This method cannot await, so it cannot fetch a key it does not have.
+        // Before the first fetch, a well-formed value is accepted, which is
+        // the behavior every version of this provider had until now. That
+        // window closes on the first request that reaches the client or
+        // generation path, both of which fetch. Narrowing it further means
+        // core asking this question somewhere it can await.
+        let Some(identifier) = verify::parse(value) else {
+            return false;
+        };
+        let (signer, _) = verify::signer_of(&identifier);
+        match self.keys.cached(&signer) {
+            Some(pem) => verify::signature_is_valid(&identifier, &pem),
+            None => true,
+        }
     }
 
     fn normalize_id_for_kv(&self, value: &str) -> String {
@@ -336,14 +366,57 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
 
     async fn resolve_from_client(
         &self,
-        _input: &ClientResolveInput<'_>,
-        _services: &RuntimeServices,
+        input: &ClientResolveInput<'_>,
+        services: &RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        // This provider creates entirely at the edge, so there is nothing for
-        // the page to post back. Accepting a client-supplied identifier here
-        // would let a browser choose its own 51Did, which is exactly what a
-        // server-derived identifier exists to prevent.
-        Ok(GeneratedEdgeCookie::default())
+        // The page has obtained a 51Did itself, which is the deployment where
+        // the identifier binds to the visitor's own connection rather than to
+        // this appliance's. The value arrives from the browser, so it is
+        // proved before it is believed.
+        let posted = core::str::from_utf8(input.payload)
+            .unwrap_or_default()
+            .trim();
+        if posted.is_empty() {
+            return Ok(GeneratedEdgeCookie::default());
+        }
+
+        // Core strips the provider code before this point, so what arrives is
+        // this provider's own value part.
+        let Some(identifier) = verify::parse(posted) else {
+            log::warn!("51Degrees resolve refused: the posted value is not an OWID envelope");
+            return Ok(GeneratedEdgeCookie::default());
+        };
+
+        // The envelope names its own signer. A forged claim simply names a
+        // signer whose key will not verify it, so the claim is safe to follow.
+        let (signer, version) = verify::signer_of(&identifier);
+        let pem = match self.keys.fetch(&signer, version, services).await {
+            Ok(pem) => pem,
+            Err(error) => {
+                // Unverifiable is refused, not accepted. An identifier taken on
+                // trust could be another visitor's, which would key this
+                // visitor into that person's identity graph row.
+                log::warn!(
+                    "51Degrees resolve refused: could not obtain the public key for `{signer}`: {error:?}"
+                );
+                return Ok(GeneratedEdgeCookie::default());
+            }
+        };
+
+        if !verify::signature_is_valid(&identifier, &pem) {
+            log::warn!("51Degrees resolve refused: the signature from `{signer}` did not verify");
+            return Ok(GeneratedEdgeCookie::default());
+        }
+
+        let value = to_cookie_form(posted);
+        if !is_well_formed(&value) {
+            return Ok(GeneratedEdgeCookie::default());
+        }
+        log::info!("51Degrees resolve accepted a client-created identifier signed by `{signer}`");
+        Ok(GeneratedEdgeCookie {
+            id: Some(value),
+            response_headers: Vec::new(),
+        })
     }
 }
 
@@ -352,19 +425,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// An identifier with the shape the live service returns: 184 characters
-    /// of standard base64, five `+`, four `/`, and `==` padding, measured
-    /// against a real staging response on 6 September 2026.
+    /// A genuine 51Did, in cookie form, issued by the live service on
+    /// 6 September 2026 for the documentation address `2.125.160.216` and a
+    /// public User-Agent, with usage `standard`.
     ///
-    /// Built rather than copied, so no real identifier is written into the
-    /// source. Copying one by hand is also how the first version of this test
-    /// was wrong: a character was lost in transcription, the length stopped
-    /// being one base64 can have, and the test then failed against correct
-    /// code.
+    /// A real one rather than a constructed one, because verification parses
+    /// the OWID envelope and a synthetic string of the right length and
+    /// alphabet is not an envelope. That is the point of the check, so the
+    /// fixture has to be able to pass it.
+    ///
+    /// It is an identifier and not a credential: it names no person, it is
+    /// derived from a documentation address, and it grants nothing to whoever
+    /// holds it.
+    ///
+    /// The envelope carries an issue date. If a signature check ever becomes
+    /// time sensitive this fixture will start failing, and the fix is to
+    /// re-issue it rather than to weaken the test.
     const RAW: &str = concat!(
-        "v5zpMhSCBhtlg5lPPDsacnjSwVYotOIo+oQd+99fsXtdaBgUAMPyE/fQnVliHW/LlthFKzlO6D",
-        "WFOWKCVg8r7HPDsGJN1O4dr7FcChb2AHP+3UtX/Lf+/CQ64yDqdIJWGRcf3P4tAjfNhLqygBkw",
-        "bWGVHVJOp3qPk9TOj+cqEqqeGxPsqLrCBQ==",
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
     );
 
     fn provider() -> FiftyOneDegreesIdentity {
@@ -384,7 +464,8 @@ mod tests {
 
     #[test]
     fn a_real_identifier_becomes_a_cookie_core_will_carry() {
-        let created = identifier_from_answer(&answer_with(RAW)).expect("the service returned one");
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
 
         assert!(
             created
@@ -403,12 +484,18 @@ mod tests {
     fn the_fixture_is_the_shape_the_service_returns() {
         // A fixture that drifts from the real shape tests nothing, and this
         // file exists because the exact length and alphabet are what break.
-        assert_eq!(RAW.len(), 184, "a measured identifier is 184 characters");
-        assert!(RAW.contains('+') && RAW.contains('/') && RAW.ends_with("=="));
         assert_eq!(
-            RAW.trim_end_matches('=').len() % 4,
-            2,
-            "base64 ending in two padding characters leaves a remainder of two"
+            RAW.len(),
+            182,
+            "a measured identifier is 182 in cookie form"
+        );
+        assert!(
+            RAW.contains('-') || RAW.contains('_'),
+            "the cookie form uses the URL-safe alphabet"
+        );
+        assert!(
+            crate::verify::parse(RAW).is_some(),
+            "the fixture has to be a real envelope, because verification parses it"
         );
     }
 
@@ -428,14 +515,16 @@ mod tests {
 
     #[test]
     fn the_cookie_form_returns_the_service_spelling_exactly() {
-        let cookie = to_cookie_form(RAW);
+        // RAW is already the cookie form, so the round trip is checked from
+        // the service's own spelling, which is what from_cookie_form produces.
+        let service_spelling = from_cookie_form(RAW);
 
-        assert_ne!(
-            cookie, RAW,
-            "the raw form cannot be carried, so it has to change"
+        assert!(
+            service_spelling.contains('+') || service_spelling.contains('/'),
+            "the service uses the standard alphabet, so the way back has to restore it"
         );
         assert_eq!(
-            from_cookie_form(&cookie),
+            to_cookie_form(&service_spelling),
             RAW,
             "the substitution is only safe because the way back is exact, and anything \
              handing this identifier to 51Degrees needs the spelling it issued"
@@ -445,7 +534,8 @@ mod tests {
     #[test]
     fn an_identifier_survives_the_round_trip_verbatim() {
         let provider = provider();
-        let created = identifier_from_answer(&answer_with(RAW)).expect("the service returned one");
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
 
         assert!(
             provider.accepts_id(&created),
@@ -464,7 +554,8 @@ mod tests {
         // The point of the two overrides, stated as a test rather than as a
         // comment. If these defaults ever start accepting this shape the
         // overrides can go; until then removing them silently breaks identity.
-        let created = identifier_from_answer(&answer_with(RAW)).expect("the service returned one");
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
 
         assert!(
             !trusted_server_core::ec::generation::is_valid_ec_id(&created),
