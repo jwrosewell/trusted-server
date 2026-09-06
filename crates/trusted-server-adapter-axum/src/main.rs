@@ -1,9 +1,7 @@
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::addr::resolve_bind_addr;
 use edgezero_core::app::Hooks as _;
-use edgezero_core::env_config::EnvConfig;
 use trusted_server_adapter_axum::app::TrustedServerApp;
-use trusted_server_adapter_axum::platform::init_kv_store;
 use trusted_server_adapter_axum::tls::{self, TlsPaths};
 
 #[allow(clippy::print_stderr)]
@@ -43,19 +41,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-
-    // Open the persistent KV store before the first request can arrive, and
-    // refuse to start if it cannot be opened. Serving traffic without it would
-    // silently drop the identity and consent state the store holds, and a
-    // dropped consent withdrawal is indistinguishable from a reader who never
-    // withdrew.
-    match init_kv_store(&EnvConfig::from_env()) {
-        Ok(path) => log::info!("KV store opened at {}", path.display()),
-        Err(err) => {
-            log::error!("failed to open the KV store: {err:?}");
-            std::process::exit(1);
-        }
-    }
 
     let router = TrustedServerApp::routes();
 

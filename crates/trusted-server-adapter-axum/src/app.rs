@@ -2,8 +2,10 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::ec_kv::{AxumEcKvStore, ec_identity_path};
+use crate::platform::init_kv_store;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -79,15 +81,30 @@ pub struct AppState {
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
+/// Opens the persistent key-value store here rather than in `main`, so that a
+/// store that cannot be opened fails the same way a missing identity store
+/// already does: [`TrustedServerApp::routes`] turns the error into
+/// [`startup_error_router`] and the process stays up answering every route with
+/// it. In a container that is the more useful failure, because the healthcheck
+/// then reports unhealthy, an orchestrator stops routing to it and an operator
+/// can read the logs. Exiting instead restart-loops under
+/// `restart: unless-stopped` and takes the logs with each restart.
+///
+/// This is the production path only. `routes_with_registrations` reaches
+/// [`build_state_with_registrations`] directly, so tests neither open the store
+/// nor contend on its exclusive file lock.
+///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when settings, the key-value store, the auction
+/// orchestrator, or the integration registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
     let settings =
         get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let kv_path = init_kv_store(&EnvConfig::from_env())?;
+    log::info!("KV store opened at {}", kv_path.display());
     build_state_with_settings(settings)
 }
 
