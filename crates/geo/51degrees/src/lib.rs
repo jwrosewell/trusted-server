@@ -37,6 +37,7 @@
 
 pub mod client;
 pub mod device;
+pub mod head;
 pub mod identity;
 
 use std::net::IpAddr;
@@ -53,6 +54,7 @@ use validator::Validate;
 
 use crate::client::CloudClient;
 use crate::device::FiftyOneDegreesDevice;
+use crate::head::FiftyOneDegreesHeadInjector;
 use crate::identity::FiftyOneDegreesIdentity;
 
 /// Identifier for this vendor's module.
@@ -269,6 +271,11 @@ pub fn register(
     ));
     Ok(Some(
         IntegrationRegistration::builder(PROVIDER_ID)
+            // The client hint delegation. It has to be in the served markup,
+            // because a browser ignores a Delegate-CH meta tag that JavaScript
+            // added, so no script in the page can do this and a publisher
+            // cannot do it with a tag manager either.
+            .with_head_injector(Arc::new(FiftyOneDegreesHeadInjector::new(&config.endpoint)))
             .with_geo_provider(Arc::new(FiftyOneDegreesGeo::new(
                 config.enabled,
                 Arc::clone(&client),
