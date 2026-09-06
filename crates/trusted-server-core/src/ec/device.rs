@@ -194,8 +194,11 @@ impl DeviceSignals {
 /// These signals serve identity gating and bot detection, not bid enrichment.
 /// [`DeviceSignals`] deliberately carries only the coarse browser and bot
 /// classification the Edge Cookie gate needs, not a full device-detection
-/// result such as make, model, OS version, or screen size. A richer device
-/// model for the ad request is a separate concern.
+/// result such as make, model, OS version, or screen size. Those are
+/// [`DeviceAttributes`], answered by
+/// [`advertising_attributes`](DeviceProvider::advertising_attributes) on this
+/// same trait, so one provider answers both questions from one lookup while
+/// the two answers stay separate types with separate lifetimes.
 /// Uses `#[async_trait(?Send)]` for the same reason as
 /// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
 /// object stays `Send + Sync` so it can be shared and run multi-threaded,

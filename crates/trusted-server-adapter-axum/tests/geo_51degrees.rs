@@ -113,3 +113,69 @@ endpoint = "not-a-url"
         "a bad endpoint must stop the deployment rather than fail on the first visitor"
     );
 }
+
+/// The same module supplies the device provider, so the device selector must
+/// reach it too.
+///
+/// Worth its own test rather than folding into the one above, because the two
+/// selectors are separate code paths and a module that supplies two providers
+/// is exactly where one of them gets forgotten. The device selector is also
+/// validated in a different place from the geo selector, so a name that works
+/// for one is not evidence about the other.
+#[test]
+fn the_device_selector_resolves_the_same_vendors_provider() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "http://127.0.0.1:8080/api/v4/json"
+"#,
+    );
+
+    let router =
+        TrustedServerApp::routes_with_registrations(settings, &[geo_51degrees::builder()], &[]);
+
+    assert!(
+        router.is_ok(),
+        "a deployment asking this vendor for device detection as well as location \
+         must be able to select both from one module: {:?}",
+        router.err()
+    );
+}
+
+#[test]
+fn naming_the_module_for_devices_without_supplying_its_builder_fails_at_startup() {
+    // No geo selector here, so the device path is tested on its own. Leaving
+    // geo unset without acknowledging it is itself refused, which is why the
+    // single-jurisdiction acknowledgement is present rather than a geo
+    // provider that would drag the other selector into this test.
+    let settings = settings_with(
+        r#"
+[geo]
+assume_single_jurisdiction = true
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "http://127.0.0.1:8080/api/v4/json"
+"#,
+    );
+    assert_eq!(
+        settings.device.provider.as_deref(),
+        Some("fiftyone_degrees"),
+        "the selector must have parsed, or this test proves nothing"
+    );
+
+    let router = TrustedServerApp::routes_with_registrations(settings, &[], &[]);
+
+    assert!(
+        router.is_err(),
+        "a device selector naming a module nothing supplies must stop the deployment          rather than fall back to the User-Agent, which would look like device          detection was working"
+    );
+}

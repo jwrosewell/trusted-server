@@ -711,6 +711,27 @@ pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServi
         .build()
 }
 
+/// Build a [`RuntimeServices`] carrying a device provider, so a test can drive
+/// the device seam rather than setting the resolved attributes by hand.
+///
+/// Setting the attributes directly would prove the `OpenRTB` mapping and
+/// nothing about whether any provider is ever asked, which is the half of the
+/// chain that actually breaks.
+pub(crate) fn noop_services_with_device_provider(
+    device_provider: Arc<dyn crate::ec::device::DeviceProvider>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
+        .with_device_provider(device_provider)
+}
+
 /// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
 /// exercise the seam an opaque-identifier vendor provider reaches core through.
 pub(crate) fn noop_services_with_ec_provider(

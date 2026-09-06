@@ -4341,6 +4341,16 @@ pub async fn handle_publisher_request(
                     path_label: "Server-side",
                 },
             );
+
+            // Fill the device object the bidder prices on. Separate from the
+            // synchronous builder above because a provider that resolves a
+            // model reaches a service to do it.
+            crate::auction::formats::attach_device_attributes(
+                &mut auction_request,
+                req.headers(),
+                services,
+            )
+            .await;
             let auction_context = AuctionContext {
                 settings,
                 request: &req,
@@ -6680,6 +6690,16 @@ pub async fn handle_page_bids(
                     path_label: "Page-bids",
                 },
             );
+
+            // Fill the device object the bidder prices on. Separate from the
+            // synchronous builder above because a provider that resolves a
+            // model reaches a service to do it.
+            crate::auction::formats::attach_device_attributes(
+                &mut auction_request,
+                req.headers(),
+                services,
+            )
+            .await;
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);

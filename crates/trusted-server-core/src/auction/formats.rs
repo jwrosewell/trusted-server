@@ -552,6 +552,56 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     Ok(OpenRtbResponseConversion { response, delivery })
 }
 
+/// Fills the bid request's device attributes from the selected device
+/// provider.
+///
+/// Separate from [`convert_tsjs_to_auction_request`] and from the publisher's
+/// own builder because both of those are synchronous and a provider that
+/// resolves a device model has to reach a service to do it. Every real auction
+/// path calls this after building its request, so the three surfaces offer the
+/// same inventory rather than one of them being richer by accident.
+///
+/// Does nothing when no module supplies a device provider, and nothing when
+/// the provider resolves nothing. Neither is a failure: a bidder reads an
+/// absent field as unknown, which is true, whereas a default would be a claim.
+///
+/// The consent-denied path deliberately does not call this. That path builds a
+/// request shape only, to echo the request id back in a no-bid response, and
+/// makes no outbound call of any kind.
+pub async fn attach_device_attributes(
+    request: &mut AuctionRequest,
+    headers: &http::HeaderMap,
+    services: &RuntimeServices,
+) {
+    let Some(provider) = services.device_provider() else {
+        return;
+    };
+    let client_ip = services
+        .client_info()
+        .client_ip
+        .map_or_else(String::new, |address| address.to_string());
+    let request_info = crate::evidence::BorrowedRequestInfo::new(&client_ip, Some(headers));
+    let Some(attributes) = provider
+        .advertising_attributes(&request_info, services)
+        .await
+    else {
+        return;
+    };
+
+    // The publisher path leaves the device object out entirely when the
+    // request carried no User-Agent, so this creates one rather than dropping
+    // attributes that were resolved.
+    request
+        .device
+        .get_or_insert(DeviceInfo {
+            user_agent: None,
+            ip: None,
+            geo: None,
+            attributes: None,
+        })
+        .attributes = Some(attributes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +625,141 @@ mod tests {
 
     fn make_settings() -> Settings {
         create_test_settings()
+    }
+
+    /// A device provider that resolves fixed attributes, standing in for a
+    /// vendor that reaches a service.
+    #[derive(Debug)]
+    struct StubDeviceProvider {
+        attributes: Option<crate::ec::device::DeviceAttributes>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceProvider for StubDeviceProvider {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn detect(
+            &self,
+            request_info: &dyn crate::evidence::RequestInfo,
+            _services: &RuntimeServices,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals::derive_ua_only(request_info.user_agent())
+        }
+
+        async fn advertising_attributes(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _services: &RuntimeServices,
+        ) -> Option<crate::ec::device::DeviceAttributes> {
+            self.attributes.clone()
+        }
+    }
+
+    fn stub_attributes() -> crate::ec::device::DeviceAttributes {
+        crate::ec::device::DeviceAttributes {
+            device_type: Some(4),
+            make: Some("ExampleCorp".to_owned()),
+            model: Some("EX-1".to_owned()),
+            os: Some("Android".to_owned()),
+            os_version: Some("15.0".to_owned()),
+            screen_width: Some(1080),
+            screen_height: Some(2400),
+        }
+    }
+
+    fn request_with_device(device: Option<DeviceInfo>) -> AuctionRequest {
+        let mut request = make_auction_request();
+        request.device = device;
+        request
+    }
+
+    #[tokio::test]
+    async fn the_selected_provider_fills_the_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_provider(
+            std::sync::Arc::new(StubDeviceProvider {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(&mut request, &http::HeaderMap::new(), &services).await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "a resolved device must reach the request the bidder is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_device_provider_leaves_the_request_untouched() {
+        let services = crate::platform::test_support::noop_services();
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(&mut request, &http::HeaderMap::new(), &services).await;
+
+        assert!(
+            request
+                .device
+                .as_ref()
+                .is_some_and(|device| device.attributes.is_none()),
+            "the default deployment supplies no device provider and must send no attributes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_resolves_nothing_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_provider(
+            std::sync::Arc::new(StubDeviceProvider { attributes: None }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(&mut request, &http::HeaderMap::new(), &services).await;
+
+        assert!(
+            request.device.is_none(),
+            "an unresolved device must not become an empty device object, which a bidder \
+             reads as a claim that the fields are absent rather than unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_attributes_create_the_device_object_when_there_was_none() {
+        let services = crate::platform::test_support::noop_services_with_device_provider(
+            std::sync::Arc::new(StubDeviceProvider {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        // The publisher path leaves the device object out entirely when the
+        // request carried no User-Agent, so this is a real state and not a
+        // contrived one.
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(&mut request, &http::HeaderMap::new(), &services).await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "attributes that were resolved must not be dropped for want of a device object"
+        );
     }
 
     fn make_auction_request() -> AuctionRequest {

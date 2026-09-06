@@ -28,11 +28,17 @@
 //! wrong results. Every failure is retried by the next caller.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
-use trusted_server_core::platform::PlatformError;
+use trusted_server_core::platform::{
+    PlatformBackendSpec, PlatformError, PlatformHttpRequest, RuntimeServices,
+};
+
+use crate::BACKEND_DISCRIMINATOR;
 
 /// Entries held before the oldest is dropped.
 ///
@@ -137,6 +143,23 @@ impl AnswerCache {
         Some(entry.answer.clone())
     }
 
+    /// Returns any fresh answer stored for this address, whatever evidence
+    /// it was stored under.
+    ///
+    /// Only the `ip` element of the returned answer describes the address.
+    /// See [`CloudClient::answer_for_address`], the sole caller, for why that
+    /// is enough for the geo provider and wrong for anyone else.
+    #[must_use]
+    pub fn any_for_address(&self, client_ip: &str) -> Option<CloudAnswer> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .iter()
+            .find(|(evidence, entry)| {
+                evidence.client_ip == client_ip && entry.stored.elapsed() < ENTRY_LIFETIME
+            })
+            .map(|(_, entry)| entry.answer.clone())
+    }
+
     /// Stores an answer, dropping expired entries and then the oldest if the
     /// cache is still full.
     pub fn put(&self, evidence: Evidence, answer: CloudAnswer) {
@@ -200,6 +223,12 @@ pub fn query_parameters(evidence: &Evidence, want_identity: bool) -> Vec<(String
 }
 
 /// IP intelligence properties this crate reads.
+///
+/// There is no continent property. Asking for `ip.Continent` returns an empty
+/// `ip` element, which is exactly what asking for a property that does not
+/// exist returns, while `ip.CountryCode` comes back with its value and, on an
+/// unentitled key, the reason it is null. So the geo answer never carries a
+/// continent, and [`crate::geo_from_response`] does not read one.
 const IP_PROPERTIES: &[&str] = &[
     "ip.CountryCode",
     "ip.Region",
@@ -209,6 +238,16 @@ const IP_PROPERTIES: &[&str] = &[
 ];
 
 /// Device properties that map onto the `OpenRTB` device object.
+///
+/// Measured against the live service on 6 September 2026 with the resource key
+/// on this machine: `DeviceType`, `IsMobile`, `IsCrawler`, `ScreenPixelsWidth`
+/// and `ScreenPixelsHeight` resolve. `HardwareVendor`, `HardwareName`,
+/// `HardwareModel`, `PlatformName`, `PlatformVersion`, `BrowserName` and
+/// `BrowserVersion` each come back null with a reason saying they are a paid
+/// feature needing a license key. They are still requested here, because the
+/// same code then fills the make, model and operating system the moment an
+/// entitled key is configured, and until then those bid request fields are
+/// absent rather than invented.
 const DEVICE_PROPERTIES: &[&str] = &[
     "device.DeviceType",
     "device.HardwareVendor",
@@ -244,6 +283,206 @@ pub fn version_url(endpoint: &str) -> Result<String, Report<PlatformError>> {
         .change_context(PlatformError::Geo)
         .attach("could not build the version URL")?;
     Ok(root.into())
+}
+
+// ---------------------------------------------------------------------------
+// The call
+// ---------------------------------------------------------------------------
+
+/// Cap on the response body read from the service.
+///
+/// The `areas` property alone is a multipolygon that runs to tens of
+/// kilobytes, so this is generous rather than tight. It exists so a wrong
+/// endpoint cannot grow the process heap without bound.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Calls the cloud service, and hands one answer to every provider that asks.
+///
+/// Held as an `Arc` by each provider this crate supplies, so they share the
+/// cache rather than each keeping their own.
+#[derive(Debug)]
+pub struct CloudClient {
+    endpoint: String,
+    timeout: Duration,
+    want_identity: bool,
+    cache: AnswerCache,
+}
+
+impl CloudClient {
+    /// Creates a client for one endpoint.
+    #[must_use]
+    pub fn new(endpoint: String, timeout_ms: u32, want_identity: bool) -> Self {
+        Self {
+            endpoint,
+            timeout: Duration::from_millis(u64::from(timeout_ms)),
+            want_identity,
+            cache: AnswerCache::new(),
+        }
+    }
+
+    /// The configured endpoint, for a caller reporting what it talks to.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The answer for a request whose address and `User-Agent` are both known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Geo`] when the service cannot be reached, does
+    /// not answer with a success status, or does not answer with JSON.
+    pub async fn answer(
+        &self,
+        evidence: &Evidence,
+        services: &RuntimeServices,
+    ) -> Result<CloudAnswer, Report<PlatformError>> {
+        if let Some(found) = self.cache.get(evidence) {
+            return Ok(found);
+        }
+        let answer = self.fetch(evidence, services).await?;
+        self.cache.put(evidence.clone(), answer.clone());
+        Ok(answer)
+    }
+
+    /// The answer for a caller that knows the address but not the
+    /// `User-Agent`.
+    ///
+    /// `PlatformGeo::lookup` receives a client address and the runtime
+    /// services. No `User-Agent` reaches it through that seam, so the geo
+    /// provider cannot build the key the device provider builds, and an exact
+    /// match would miss an answer already paid for.
+    ///
+    /// Reusing an entry stored under a different key is sound here and only
+    /// here, because the `ip` element depends on the address alone. The
+    /// `device` and `fodid` elements of the same entry describe whichever
+    /// `User-Agent` made that call, so **only the `ip` element of this answer
+    /// may be read**, and the geo provider is the only caller.
+    ///
+    /// # Errors
+    ///
+    /// As [`answer`](Self::answer).
+    pub async fn answer_for_address(
+        &self,
+        client_ip: IpAddr,
+        services: &RuntimeServices,
+    ) -> Result<CloudAnswer, Report<PlatformError>> {
+        let address = client_ip.to_string();
+        if let Some(found) = self.cache.any_for_address(&address) {
+            return Ok(found);
+        }
+        let evidence = Evidence {
+            client_ip: address,
+            user_agent: String::new(),
+        };
+        let answer = self.fetch(&evidence, services).await?;
+        self.cache.put(evidence, answer.clone());
+        Ok(answer)
+    }
+
+    /// Builds the request URL for one piece of evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Geo`] when the endpoint is not a URL.
+    pub fn request_url(&self, evidence: &Evidence) -> Result<String, Report<PlatformError>> {
+        let mut url = url::Url::parse(&self.endpoint)
+            .change_context(PlatformError::Geo)
+            .attach_with(|| format!("endpoint is not a URL: {}", self.endpoint))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (name, value) in query_parameters(evidence, self.want_identity) {
+                // An empty parameter is not evidence. Sending one asks the
+                // service to describe an empty User-Agent rather than leaving
+                // the question unasked.
+                if value.is_empty() {
+                    continue;
+                }
+                pairs.append_pair(&name, &value);
+            }
+        }
+        Ok(url.into())
+    }
+
+    /// Builds the backend registration for the configured endpoint.
+    ///
+    /// Core has an internal helper that does this for its own integrations,
+    /// but it is crate-private, so a vendor crate outside core builds the spec
+    /// itself. The discriminator keeps this crate's dynamic backend distinct
+    /// from any other caller that happens to target the same host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Geo`] when the endpoint is not a URL or has no
+    /// host.
+    pub fn backend_spec(&self) -> Result<PlatformBackendSpec, Report<PlatformError>> {
+        let parsed = url::Url::parse(&self.endpoint)
+            .change_context(PlatformError::Geo)
+            .attach_with(|| format!("endpoint is not a URL: {}", self.endpoint))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| Report::new(PlatformError::Geo).attach("endpoint has no host"))?
+            .to_owned();
+        Ok(PlatformBackendSpec {
+            scheme: parsed.scheme().to_owned(),
+            host,
+            port: parsed.port(),
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: self.timeout,
+            between_bytes_timeout: self.timeout,
+            discriminator: Some(BACKEND_DISCRIMINATOR.to_owned()),
+        })
+    }
+
+    /// Makes one call and decodes the answer.
+    async fn fetch(
+        &self,
+        evidence: &Evidence,
+        services: &RuntimeServices,
+    ) -> Result<CloudAnswer, Report<PlatformError>> {
+        let url = self.request_url(evidence)?;
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(&url)
+            .header(http::header::ACCEPT, "application/json")
+            .body(EdgeBody::empty())
+            .change_context(PlatformError::Geo)
+            .attach("could not build the cloud request")?;
+
+        let backend = services
+            .backend()
+            .ensure(&self.backend_spec()?)
+            .change_context(PlatformError::Geo)
+            .attach("could not resolve a backend for the cloud endpoint")?;
+
+        let response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(request, backend))
+            .await
+            .change_context(PlatformError::Geo)
+            .attach("the cloud service did not answer")?;
+
+        let status = response.response.status();
+        if !status.is_success() {
+            return Err(Report::new(PlatformError::Geo)
+                .attach(format!("the cloud service answered {status}")));
+        }
+
+        let bytes = response
+            .response
+            .into_body()
+            .into_bytes_bounded(MAX_RESPONSE_BYTES)
+            .await
+            .change_context(PlatformError::Geo)
+            .attach("could not read the cloud response body")?;
+
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .change_context(PlatformError::Geo)
+            .attach("the cloud service did not return JSON")?;
+
+        Ok(CloudAnswer::new(body))
+    }
 }
 
 #[cfg(test)]
