@@ -49,7 +49,9 @@ Native Axum dev/test adapter (native binary):
 
 - Local development and integration-test adapter — not a production-equivalent runtime
 - Platform implementations backed by environment variables instead of Fastly stores
-- Listens on `http://localhost:8787` by default
+- Listens on `http://localhost:8787` by default, or terminates TLS on the same
+  address when `TRUSTED_SERVER_TLS_CERTIFICATE_PATH` and
+  `TRUSTED_SERVER_TLS_PRIVATE_KEY_PATH` are both set
 - KV store is a persistent `redb` database file, created on first start at
   `.edgezero/trusted_server_kv.redb`. Override the whole path with
   `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__PATH`, or just the file name with
