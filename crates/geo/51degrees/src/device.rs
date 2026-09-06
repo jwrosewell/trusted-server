@@ -55,6 +55,14 @@ impl FiftyOneDegreesDevice {
 /// for a second call to learn what the device provider already asked.
 #[must_use]
 pub fn evidence_for(request_info: &dyn RequestInfo) -> Evidence {
+    evidence_for_usage(request_info, None)
+}
+
+/// The evidence key for a caller that is also asking for an identifier.
+///
+/// Separate because the usage belongs in the key. See [`Evidence::usage`].
+#[must_use]
+pub fn evidence_for_usage(request_info: &dyn RequestInfo, usage: Option<&'static str>) -> Evidence {
     let raw = request_info.client_ip();
     let client_ip = raw
         .parse::<IpAddr>()
@@ -62,6 +70,7 @@ pub fn evidence_for(request_info: &dyn RequestInfo) -> Evidence {
     Evidence {
         client_ip,
         user_agent: request_info.user_agent().to_owned(),
+        usage,
         browser: browser_evidence(request_info),
     }
 }

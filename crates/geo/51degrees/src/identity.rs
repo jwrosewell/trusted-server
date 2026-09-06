@@ -53,13 +53,13 @@ use trusted_server_core::ec::provider::{
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permissions::{Permission, PermissionSet};
+use trusted_server_core::permissions::{Permission, PermissionSet, PermissionState};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::provider_code;
 
 use crate::PROVIDER_ID;
 use crate::client::{CloudAnswer, CloudClient};
-use crate::device::evidence_for;
+use crate::device::evidence_for_usage;
 
 /// This provider's registered code, the `51dd~` namespace of every identifier
 /// it creates.
@@ -68,6 +68,77 @@ use crate::device::evidence_for;
 /// colliding identifier. Core applies it at creation and checks it at
 /// read-back, and this provider only ever sees its own value part.
 pub const IDENTITY_PROVIDER_CODE: ProviderCode = provider_code!("51dd");
+
+/// How the identifier may be used, written into the identifier the service
+/// signs.
+///
+/// This is not a hint that selects an engine. Measured against the live service
+/// on 6 September 2026: two calls asking for the same usage share 96 characters
+/// of 184, and changing the usage collapses that to 22. So the value is part of
+/// the identifier, and an identifier created under one usage is not usable as
+/// another.
+///
+/// `marketing` is deliberately absent. The service returned no identifier at
+/// all for it on the key measured, so offering it would be offering a value
+/// that silently yields nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    /// The visitor permits personalized advertising.
+    Personalized,
+    /// The visitor permits storage but not personalized advertising.
+    Standard,
+    /// Everything else, including a visitor who has not been asked yet.
+    NonMarketing,
+}
+
+impl Usage {
+    /// The spelling the service expects.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Personalized => "personalized",
+            Self::Standard => "standard",
+            Self::NonMarketing => "non-marketing",
+        }
+    }
+
+    /// The usage the resolved permissions imply.
+    ///
+    /// # The mapping, and why it is the permissions rather than a setting
+    ///
+    /// The usage has to be the visitor's own answer. A configured constant
+    /// would stamp every identifier the same whatever anyone chose, which is
+    /// how this provider behaved until now and is the defect this replaces.
+    /// The permission state is the resolved answer for this request, by
+    /// whatever route it was established, so it is the honest source.
+    ///
+    /// Selecting personalized advertising is the permission that distinguishes
+    /// personalized from standard. Storing on the device is the floor for
+    /// having an identifier at all. Neither, or no permission state supplied,
+    /// falls to non-marketing, which is the last resort rather than the
+    /// default.
+    ///
+    /// # What this does not fix
+    ///
+    /// Timing. On a first page view, before the visitor has answered, the
+    /// permissions are the policy baseline and not a choice, so the identifier
+    /// can still be created too early carrying non-marketing. Correcting that
+    /// means replacing an identifier when the choice arrives, which the
+    /// client-cycle specification currently refuses.
+    #[must_use]
+    pub fn from_permissions(permissions: Option<&PermissionState>) -> Self {
+        let Some(permissions) = permissions else {
+            return Self::NonMarketing;
+        };
+        if permissions.is_set(Permission::SelectPersonalisedAds) {
+            return Self::Personalized;
+        }
+        if permissions.is_set(Permission::StoreOnDevice) {
+            return Self::Standard;
+        }
+        Self::NonMarketing
+    }
+}
 
 /// The longest identifier this provider will accept.
 ///
@@ -219,10 +290,12 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
     async fn generate(
         &self,
         request_info: &dyn RequestInfo,
-        _input: &IdentityInput<'_>,
+        input: &IdentityInput<'_>,
         services: &RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        let evidence = evidence_for(request_info);
+        // The visitor's own answer, not a constant. See `Usage`.
+        let usage = Usage::from_permissions(input.permissions);
+        let evidence = evidence_for_usage(request_info, Some(usage.as_str()));
         // A failure here is not an error the request should carry. The caller
         // logs a failed generation and serves the response with no Edge Cookie,
         // which is what a service outage should cost: no identity, not a broken

@@ -78,6 +78,21 @@ pub struct Evidence {
     pub client_ip: String,
     /// The visitor's `User-Agent`.
     pub user_agent: String,
+    /// How the identifier this call creates may be used, when identity is
+    /// being asked for.
+    ///
+    /// Part of the key, and it has to be, because the service writes this into
+    /// the identifier it signs rather than treating it as a hint. Measured on
+    /// 6 September 2026: two calls asking for the same usage share 96
+    /// characters of 184, and changing the usage collapses that to 22. So an
+    /// answer fetched for one usage is the wrong answer for another, and
+    /// sharing it would hand a visitor an identifier stamped with a permission
+    /// they did not give.
+    ///
+    /// `None` for a caller that is not asking for an identifier at all, which
+    /// is the geo and device path.
+    pub usage: Option<&'static str>,
+
     /// What the browser gathered and left in `51D_` cookies, in the fixed
     /// order of [`BROWSER_EVIDENCE`].
     ///
@@ -254,8 +269,14 @@ pub fn query_parameters(evidence: &Evidence, want_identity: bool) -> Vec<(String
     for property in properties {
         parameters.push(("values".to_owned(), (*property).to_owned()));
     }
-    if want_identity && want_device {
-        parameters.push(("id.usage".to_owned(), "non-marketing".to_owned()));
+    // The usage is the visitor's, not a constant. A call that names no usage
+    // asks for no identifier, because the engine does not run without one and
+    // says nothing about why.
+    if let Some(usage) = evidence.usage
+        && want_identity
+        && want_device
+    {
+        parameters.push(("id.usage".to_owned(), usage.to_owned()));
         parameters.push(("values".to_owned(), "FODiD.IdProbGlobal".to_owned()));
     }
     parameters
@@ -429,6 +450,7 @@ impl CloudClient {
         let evidence = Evidence {
             client_ip: address,
             user_agent: String::new(),
+            usage: None,
             browser: Vec::new(),
         };
         let answer = self.fetch(&evidence, services).await?;
@@ -549,6 +571,7 @@ mod tests {
         Evidence {
             client_ip: "2.125.160.216".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
+            usage: None,
             browser: Vec::new(),
         }
     }
@@ -580,6 +603,7 @@ mod tests {
         let with_screen = Evidence {
             client_ip: "2.125.160.216".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
+            usage: None,
             browser: vec![("51D_ScreenPixelsWidth", "1080".to_owned())],
         };
 
@@ -622,6 +646,7 @@ mod tests {
         let other = Evidence {
             client_ip: "8.8.8.8".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
+            usage: None,
             browser: Vec::new(),
         };
 
@@ -639,6 +664,7 @@ mod tests {
         let other = Evidence {
             client_ip: evidence().client_ip,
             user_agent: "curl/8".to_owned(),
+            usage: None,
             browser: Vec::new(),
         };
 
@@ -656,6 +682,7 @@ mod tests {
                 Evidence {
                     client_ip: format!("10.0.0.{index}"),
                     user_agent: "Mozilla/5.0".to_owned(),
+                    usage: None,
                     browser: Vec::new(),
                 },
                 answer("GB"),
@@ -675,6 +702,7 @@ mod tests {
         let address_only = Evidence {
             client_ip: "2.125.160.216".to_owned(),
             user_agent: String::new(),
+            usage: None,
             browser: Vec::new(),
         };
 
@@ -699,23 +727,59 @@ mod tests {
     }
 
     #[test]
-    fn the_identity_parameters_are_both_present_or_neither() {
-        let with = query_parameters(&evidence(), true);
-        let without = query_parameters(&evidence(), false);
+    fn the_identity_parameters_follow_the_usage_in_the_evidence() {
+        let asked = Evidence {
+            usage: Some("personalized"),
+            ..evidence()
+        };
+
+        let parameters = query_parameters(&asked, true);
 
         assert!(
-            with.iter()
-                .any(|(k, v)| k == "id.usage" && v == "non-marketing"),
-            "the 51Did engine does not run at all without id.usage, and says nothing when it does not"
+            parameters
+                .iter()
+                .any(|(k, v)| k == "id.usage" && v == "personalized"),
+            "the usage is the visitor's answer and is written into the identifier the              service signs, so it has to be the one the caller derived rather than a              constant"
         );
         assert!(
-            with.iter()
+            parameters
+                .iter()
                 .any(|(k, v)| k == "values" && v == "FODiD.IdProbGlobal"),
             "a property that is not requested is not returned"
         );
+    }
+
+    #[test]
+    fn no_usage_means_no_identifier_is_asked_for() {
+        // The geo and device path. The engine does not run without a usage and
+        // says nothing about why, so asking for the property while naming no
+        // usage would be asking for an answer that never arrives.
+        let parameters = query_parameters(&evidence(), true);
+
+        assert!(!parameters.iter().any(|(k, _)| k == "id.usage"));
         assert!(
-            !without.iter().any(|(k, _)| k == "id.usage"),
-            "a deployment not using identity should not ask for it"
+            !parameters.iter().any(|(_, v)| v == "FODiD.IdProbGlobal"),
+            "requesting the property without a usage buys nothing"
+        );
+    }
+
+    #[test]
+    fn a_different_usage_is_a_different_answer() {
+        let cache = AnswerCache::new();
+        let standard = Evidence {
+            usage: Some("standard"),
+            ..evidence()
+        };
+        cache.put(standard.clone(), answer("GB"));
+
+        let personalized = Evidence {
+            usage: Some("personalized"),
+            ..standard
+        };
+
+        assert!(
+            cache.get(&personalized).is_none(),
+            "the service writes the usage into the identifier it signs, so reusing an              answer across usages would hand a visitor an identifier stamped with a              permission they did not give"
         );
     }
 
