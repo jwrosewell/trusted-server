@@ -27,6 +27,10 @@ validator = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# The tests that drive `detect` against a service that cannot be reached need a
+# runtime, because that is the one behavior in this crate whose failure is
+# silent: reading an outage as a bot stops Edge Cookie issuance for everyone.
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named
 # maintainer of every adapter. This one has a vendor owner from the start,

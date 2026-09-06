@@ -130,9 +130,11 @@ fn platform_class(name: &str) -> Option<&'static str> {
 
 /// Improves the User-Agent baseline with whatever the service resolved.
 ///
-/// Written as a free function taking the baseline so it can be tested without
-/// a runtime, which is the only way the browser and bot decision gets tested
-/// at all: `detect` needs a live service.
+/// Written as a free function taking the baseline so the improvement it makes
+/// can be tested without a runtime or a service. The other half, what happens
+/// when the service cannot be reached, is driven through
+/// [`DeviceProvider::detect`] itself in this module's tests, because a wrong
+/// answer there is silent and expensive.
 #[must_use]
 pub fn signals_from_answer(baseline: DeviceSignals, answer: &CloudAnswer) -> DeviceSignals {
     let mut signals = baseline;
@@ -237,6 +239,167 @@ mod tests {
         let mut body = serde_json::Map::new();
         body.insert("device".to_owned(), device);
         CloudAnswer::new(serde_json::Value::Object(body))
+    }
+
+    // -----------------------------------------------------------------------
+    // Driving `detect` with a service that cannot be reached
+    // -----------------------------------------------------------------------
+    //
+    // The claim in this file that would cost the most if it were wrong is that
+    // a failed call falls back to the User-Agent rather than reporting a bot.
+    // Reporting a bot stops Edge Cookie issuance for every visitor, and stops
+    // it silently: the pages serve correctly and nothing says why. So the
+    // failure is driven here rather than reasoned about.
+
+    use std::sync::Arc;
+    use trusted_server_core::evidence::OwnedRequestInfo;
+    use trusted_server_core::platform::{
+        ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+        PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+        UnavailableHttpClient, UnavailableKvStore,
+    };
+
+    /// Stores that answer nothing. This provider reads neither.
+    struct StubStore;
+
+    impl PlatformConfigStore for StubStore {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    impl PlatformSecretStore for StubStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), error_stack::Report<PlatformError>> {
+            Err(error_stack::Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// A backend that resolves, so the failure under test is the call itself
+    /// and not the registration in front of it.
+    struct ResolvingBackend;
+
+    impl PlatformBackend for ResolvingBackend {
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, error_stack::Report<PlatformError>> {
+            Ok("fiftyone_degrees_test".to_owned())
+        }
+
+        fn ensure(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, error_stack::Report<PlatformError>> {
+            Ok("fiftyone_degrees_test".to_owned())
+        }
+    }
+
+    /// Services whose HTTP client fails every request, which is what a service
+    /// outage looks like from inside this crate.
+    fn services_that_cannot_reach_the_service() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(StubStore))
+            .secret_store(Arc::new(StubStore))
+            .kv_store(Arc::new(UnavailableKvStore))
+            .backend(Arc::new(ResolvingBackend))
+            .http_client(Arc::new(UnavailableHttpClient))
+            .geo(Arc::new(DisabledGeo))
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
+    const CHROME: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                          (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+    fn chrome_request() -> OwnedRequestInfo {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static(CHROME),
+        );
+        OwnedRequestInfo::new("2.125.160.216".to_owned(), headers)
+    }
+
+    fn unreachable_provider() -> FiftyOneDegreesDevice {
+        FiftyOneDegreesDevice::new(Arc::new(CloudClient::new(
+            "https://cloud.example.com/api/v4/json".to_owned(),
+            500,
+            false,
+        )))
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_service_leaves_a_browser_looking_like_a_browser() {
+        let signals = unreachable_provider()
+            .detect(&chrome_request(), &services_that_cannot_reach_the_service())
+            .await;
+
+        assert!(
+            signals.looks_like_browser,
+            "an outage must not be read as a bot. If it is, no visitor is issued an Edge \
+             Cookie for as long as the outage lasts, the pages serve correctly, and \
+             nothing anywhere says why"
+        );
+        assert_eq!(
+            signals,
+            DeviceSignals::derive_ua_only(CHROME),
+            "the fallback is the built-in User-Agent answer, unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_service_resolves_no_bid_request_attributes() {
+        let attributes = unreachable_provider()
+            .advertising_attributes(&chrome_request(), &services_that_cannot_reach_the_service())
+            .await;
+
+        assert!(
+            attributes.is_none(),
+            "an outage must leave the bid request describing the device as unknown, which \
+             is true, rather than guessing at a make and model, which would misprice it"
+        );
     }
 
     #[test]

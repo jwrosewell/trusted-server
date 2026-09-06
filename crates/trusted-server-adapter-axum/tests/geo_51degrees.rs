@@ -313,3 +313,51 @@ fn an_identifier_this_module_did_not_create_is_refused() {
          the same identity graph row from different evidence"
     );
 }
+
+/// The identifier also survives the wrapper production puts in front of the
+/// provider.
+///
+/// The round-trip test above drives the provider the registry resolved. The
+/// running server does not use that directly: it hands it to core, which wraps
+/// it in an internal shared-provider type before anything calls it. A wrapper
+/// that forgets to delegate one method is how the original identifier-dropping
+/// bug reached production, so the same round trip is asked of the wrapped form.
+#[test]
+fn the_identifier_survives_the_wrapper_the_running_server_uses() {
+    const IDENTIFIER: &str =
+        "v5zpMhSCBhtlg5lPPDsacnjSwVYotOIo-oQd-99fsXtdaBgUAMPyE_fQnVliHW_LlthFKzlO6D";
+
+    let settings = settings_selecting_identity("");
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let wrapped = trusted_server_core::ec::provider::build_shared_provider(
+        &settings.ec,
+        None,
+        registry.ec_provider(),
+    )
+    .expect("the selection should resolve")
+    .expect("a named provider should build");
+
+    let full = trusted_server_core::ec::provider::apply_provider_code(&*wrapped, IDENTIFIER);
+
+    assert_eq!(
+        full,
+        format!("51dd~{IDENTIFIER}"),
+        "the wrapper must report the module's own code, not a default"
+    );
+    assert!(
+        trusted_server_core::ec::provider::provider_owns_id(&*wrapped, &full),
+        "the wrapper must delegate the module's read-back rule, or the identifier is \
+         written and then dropped with nothing to see"
+    );
+    assert_eq!(
+        trusted_server_core::ec::provider::provider_kv_key(&*wrapped, &full),
+        full,
+        "the wrapper must delegate the module's key rule, or distinct identifiers fold \
+         onto one storage key"
+    );
+}
