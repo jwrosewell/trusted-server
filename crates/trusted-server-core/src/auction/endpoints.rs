@@ -26,7 +26,7 @@ use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
 use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
+    attach_device_attributes, convert_to_openrtb_response, convert_to_openrtb_response_with_report,
     convert_tsjs_to_auction_request,
 };
 use super::telemetry::{
@@ -280,6 +280,11 @@ pub async fn handle_auction(
         ec_id,
         geo,
     )?;
+
+    // Ask the selected device provider what the bidder should be told about
+    // the device. Done here rather than in the builder above, which is
+    // synchronous and cannot reach a provider.
+    attach_device_attributes(&mut auction_request, http_req.headers(), services).await;
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
