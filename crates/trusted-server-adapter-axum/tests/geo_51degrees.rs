@@ -361,3 +361,30 @@ fn the_identifier_survives_the_wrapper_the_running_server_uses() {
          onto one storage key"
     );
 }
+
+/// The browser module reaches the page, rather than merely existing on disk.
+///
+/// A module joins the injected bundle only when a browser module serves its
+/// integration id and the integration is enabled. Both halves are easy to get
+/// wrong independently: a directory named differently from the id builds
+/// happily and is never served, and an integration that is registered but not
+/// enabled is skipped. Neither failure says anything, so it is asserted here
+/// rather than assumed from the build output.
+#[test]
+fn the_browser_module_joins_the_injected_bundle() {
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let immediate = registry.js_module_ids_immediate();
+
+    assert!(
+        immediate.contains(&"fiftyone_degrees"),
+        "the browser module must be in the bundle the appliance injects on every page, \
+         or the client evidence it gathers is never gathered, got {immediate:?}"
+    );
+}
