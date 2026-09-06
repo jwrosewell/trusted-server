@@ -302,66 +302,6 @@ pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedSer
 pub type IntegrationPrepareRequestFn =
     fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
 
-/// Adds the proxy hosts each module declares to the operator's allow list.
-///
-/// A module that needs to reach a host through the first-party proxy declares
-/// it with
-/// [`with_required_proxy_domain`](registry::IntegrationRegistrationBuilder::with_required_proxy_domain).
-/// This is where those declarations meet `proxy.allowed_domains`, and it is
-/// called by a composition root before the settings are shared.
-///
-/// # Why an empty list is left alone
-///
-/// An empty `proxy.allowed_domains` is open mode: every host is permitted.
-/// Adding one entry to an empty list does not widen it, it **closes** it, and
-/// every host the deployment reaches that is not the one entry stops working.
-/// So a module's declaration is honoured only when the operator has already
-/// restricted the list, which is the only case where the declaration was
-/// needed. A deployment in open mode already permits the module.
-///
-/// # Why it logs
-///
-/// The allow list is a security control. Widening it silently would leave an
-/// operator auditing that list with no way to know what was added or why, so
-/// every addition names the module that asked for it.
-///
-/// # Errors
-///
-/// Returns an error when a module's builder fails to produce its registration,
-/// which is the same failure the registry would report a moment later.
-pub fn apply_module_proxy_domains(
-    settings: &mut crate::settings::Settings,
-    integrations: &[IntegrationBuilder],
-) -> Result<(), Report<TrustedServerError>> {
-    // Open mode already permits every host, and closing it here would break
-    // every other host the deployment reaches.
-    if settings.proxy.allowed_domains.is_empty() {
-        return Ok(());
-    }
-
-    for builder in integrations {
-        let Some(registration) = builder.build(settings)? else {
-            continue;
-        };
-        for host in registration.required_proxy_domains {
-            if settings
-                .proxy
-                .allowed_domains
-                .iter()
-                .any(|existing| existing == &host)
-            {
-                continue;
-            }
-            log::info!(
-                "proxy.allowed_domains: adding `{host}`, required by integration module `{}`",
-                registration.integration_id
-            );
-            settings.proxy.allowed_domains.push(host);
-        }
-    }
-    Ok(())
-}
-
 /// Source label for the built-in integrations.
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
