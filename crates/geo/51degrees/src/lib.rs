@@ -267,8 +267,21 @@ pub fn register(
         config.timeout_ms,
         config.identity,
     ));
+    // The host this module has to reach. Derived from the configured
+    // endpoint rather than hard-coded, so a deployment pointing at its own
+    // private cloud declares that host instead of the public one and there is
+    // no second setting to keep in step.
+    let required_host = url::Url::parse(&config.endpoint)
+        .ok()
+        .and_then(|endpoint| endpoint.host_str().map(str::to_owned));
+
+    let mut builder = IntegrationRegistration::builder(PROVIDER_ID);
+    if let Some(host) = required_host {
+        builder = builder.with_required_proxy_domain(host);
+    }
+
     Ok(Some(
-        IntegrationRegistration::builder(PROVIDER_ID)
+        builder
             .with_geo_provider(Arc::new(FiftyOneDegreesGeo::new(
                 config.enabled,
                 Arc::clone(&client),

@@ -618,6 +618,19 @@ pub struct IntegrationRegistration {
     /// never in the unified bundle and never as a deferred tag; the
     /// integration injects the tag itself when it decides to.
     pub js_standalone: bool,
+    /// Hosts this module must be able to reach through the first-party proxy.
+    ///
+    /// `proxy.allowed_domains` is an operator's security control: it decides
+    /// which hosts may be signed, fetched and redirected to. A module that
+    /// needs a host has to be in that list or its requests are blocked, and
+    /// the block is quiet, showing up as a feature that does not work rather
+    /// than as an error.
+    ///
+    /// Declaring the host here lets the module say what it needs instead of
+    /// the operator having to know. The declaration is honoured only when the
+    /// operator has already restricted the list, and every addition is logged
+    /// naming the module, so the list is widened but never silently.
+    pub required_proxy_domains: Vec<String>,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -663,6 +676,7 @@ impl IntegrationRegistrationBuilder {
                 js_disabled: false,
                 js_module: None,
                 js_standalone: false,
+                required_proxy_domains: Vec::new(),
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -788,6 +802,17 @@ impl IntegrationRegistrationBuilder {
         self.registration.js_standalone = true;
         self.registration.js_disabled = false;
         self.registration.js_deferred = false;
+        self
+    }
+
+    /// Declare a host this module must reach through the first-party proxy.
+    ///
+    /// Call once per host. See
+    /// [`required_proxy_domains`](IntegrationRegistration::required_proxy_domains)
+    /// for when the declaration is honoured.
+    #[must_use]
+    pub fn with_required_proxy_domain(mut self, host: impl Into<String>) -> Self {
+        self.registration.required_proxy_domains.push(host.into());
         self
     }
 

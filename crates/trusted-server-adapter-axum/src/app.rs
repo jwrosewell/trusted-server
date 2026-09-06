@@ -165,10 +165,16 @@ fn build_state_with_settings(
 /// fail to initialize, which includes two builders claiming the same
 /// integration id or auction provider name.
 pub fn build_state_with_registrations(
-    settings: Settings,
+    mut settings: Settings,
     integrations: &[IntegrationBuilder],
     auction_providers: &[AuctionProviderBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // A module that needs to reach a host through the first-party proxy says
+    // so, rather than the operator having to know. This runs before anything
+    // reads the settings, so every later reader sees one effective list. It
+    // leaves an empty list alone, because empty is open mode and adding an
+    // entry would close it. Every addition is logged naming the module.
+    trusted_server_core::integrations::apply_module_proxy_domains(&mut settings, integrations)?;
     let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
     let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
 
