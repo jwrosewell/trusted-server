@@ -125,13 +125,21 @@ async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
     import.meta.url
   );
   const urlPath = decodeURIComponent(bootstrapUrl.pathname);
+  // Vite serves files outside the project root behind an `/@fs` prefix.
+  const unprefixed = urlPath.startsWith('/@fs/') ? urlPath.slice('/@fs'.length) : urlPath;
+  // A Windows path arrives here as `/D:/…` from both a `file:` URL and the
+  // `/@fs` form, and Node needs `D:/…`. Resolving the slashed form against the
+  // working directory produces `D:\D:\…`, a doubled drive letter, which is
+  // what this test failed on before. On POSIX the leading slash is the root
+  // and must stay.
+  const isWindowsAbsolute = /^\/[A-Za-z]:/.test(unprefixed);
   let bootstrapPath: string;
-  if (urlPath.startsWith('/@fs/')) {
-    bootstrapPath = urlPath.slice('/@fs'.length);
-  } else if (bootstrapUrl.protocol === 'file:') {
-    bootstrapPath = urlPath;
+  if (isWindowsAbsolute) {
+    bootstrapPath = unprefixed.slice(1);
+  } else if (bootstrapUrl.protocol === 'file:' || unprefixed !== urlPath) {
+    bootstrapPath = unprefixed;
   } else {
-    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
+    bootstrapPath = path.resolve(process.cwd(), `.${unprefixed}`);
   }
   const bootstrap = await readFile(bootstrapPath, 'utf8');
   const runBootstrap = new Function('window', 'googletag', bootstrap) as (
