@@ -115,6 +115,19 @@ pub struct FiftyOneDegreesGeoConfig {
     /// adds two parameters to the same call and costs no extra round trip.
     #[serde(default)]
     pub identity: bool,
+
+    /// Whether to ask the browser to retry the first navigation carrying its
+    /// client hints, by sending `Critical-CH`.
+    ///
+    /// Off by default, and the default is the important part. `Critical-CH`
+    /// makes a browser reissue the navigation rather than render the page, so
+    /// the first request of a session costs two origin fetches instead of one.
+    /// What it buys is a first page view that already has the hints, rather
+    /// than one served blind while the hints arrive for the second. That is a
+    /// real trade between latency and accuracy, and it is a deployment's to
+    /// make rather than ours to assume.
+    #[serde(default)]
+    pub critical_client_hints: bool,
 }
 
 impl trusted_server_core::settings::IntegrationConfig for FiftyOneDegreesGeoConfig {
@@ -281,7 +294,10 @@ pub fn register(
                 Arc::clone(&client),
             )))
             .with_device_provider(Arc::new(FiftyOneDegreesDevice::new(Arc::clone(&client))))
-            .with_ec_provider(Arc::new(FiftyOneDegreesIdentity::new(client)))
+            .with_ec_provider(Arc::new(FiftyOneDegreesIdentity::new(
+                client,
+                config.critical_client_hints,
+            )))
             .build(),
     ))
 }

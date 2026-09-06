@@ -116,6 +116,44 @@ impl IntegrationHeadInjector for FiftyOneDegreesHeadInjector {
     }
 }
 
+/// The properties in which the service names the hints it wants asked for.
+///
+/// The list is not ours to invent. The service returns one per product, and
+/// relaying them means the header follows the service rather than drifting from
+/// it when the service changes what it reads.
+const ACCEPT_CH_PROPERTIES: &[&str] = &[
+    "setheaderbrowseraccept-ch",
+    "setheaderhardwareaccept-ch",
+    "setheaderplatformaccept-ch",
+];
+
+/// The `Accept-CH` value the service asked for, or `None` when it named none.
+///
+/// The three properties overlap, so the union is taken and the order of first
+/// appearance kept, which makes the header stable between requests and so
+/// comparable in a log.
+#[must_use]
+pub fn accept_ch_from_answer(answer: &crate::client::CloudAnswer) -> Option<String> {
+    let device = answer.element("device")?;
+    let mut hints: Vec<&str> = Vec::new();
+    for property in ACCEPT_CH_PROPERTIES {
+        let Some(value) = device.get(*property).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        for hint in value.split(',').map(str::trim) {
+            // `Unknown` is how this service spells a property it could not
+            // determine, so it is a value that looks present and means absent.
+            if hint.is_empty() || hint.eq_ignore_ascii_case("Unknown") {
+                continue;
+            }
+            if !hints.iter().any(|seen| seen.eq_ignore_ascii_case(hint)) {
+                hints.push(hint);
+            }
+        }
+    }
+    (!hints.is_empty()).then(|| hints.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +170,54 @@ mod tests {
 
     static DOCUMENT_STATE: std::sync::OnceLock<IntegrationDocumentState> =
         std::sync::OnceLock::new();
+
+    #[test]
+    fn the_accept_ch_header_is_the_union_the_service_asked_for() {
+        // The three properties overlap. Measured values from the live service
+        // on 6 September 2026.
+        let answer = crate::client::CloudAnswer::new(serde_json::json!({"device": {
+            "setheaderbrowseraccept-ch":
+                "Sec-CH-UA,Sec-CH-UA-Full-Version-List,Sec-CH-UA-Mobile,Sec-CH-UA-Platform",
+            "setheaderhardwareaccept-ch": "Sec-CH-UA-Model,Sec-CH-UA-Mobile",
+            "setheaderplatformaccept-ch": "Sec-CH-UA-Platform,Sec-CH-UA-Platform-Version",
+        }}));
+
+        let header = accept_ch_from_answer(&answer).expect("the service named some");
+
+        assert_eq!(
+            header,
+            "Sec-CH-UA, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, \
+             Sec-CH-UA-Model, Sec-CH-UA-Platform-Version",
+            "the union in order of first appearance, so the header is stable between \
+             requests and comparable in a log"
+        );
+    }
+
+    #[test]
+    fn the_services_unknown_spelling_never_reaches_the_header() {
+        let answer = crate::client::CloudAnswer::new(serde_json::json!({"device": {
+            "setheaderbrowseraccept-ch": "Unknown",
+            "setheaderhardwareaccept-ch": "Sec-CH-UA-Model",
+        }}));
+
+        assert_eq!(
+            accept_ch_from_answer(&answer).as_deref(),
+            Some("Sec-CH-UA-Model"),
+            "`Unknown` is how this service spells absent, and asking a browser for a hint \
+             called Unknown would be asking for nothing at all"
+        );
+    }
+
+    #[test]
+    fn an_answer_naming_no_hints_produces_no_header() {
+        let answer = crate::client::CloudAnswer::new(serde_json::json!({"device": {}}));
+
+        assert!(
+            accept_ch_from_answer(&answer).is_none(),
+            "an empty header is not the same as no header, and sending one would tell a \
+             browser to stop sending the hints it already sends"
+        );
+    }
 
     #[test]
     fn the_tag_matches_the_shape_the_vendor_publishes() {

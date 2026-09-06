@@ -82,14 +82,49 @@ const MAX_ID_BYTES: usize = 250;
 #[derive(Debug)]
 pub struct FiftyOneDegreesIdentity {
     client: Arc<CloudClient>,
+    critical_client_hints: bool,
 }
 
 impl FiftyOneDegreesIdentity {
     /// Creates a provider sharing one client, and so one call, with the other
     /// providers this crate supplies.
     #[must_use]
-    pub const fn new(client: Arc<CloudClient>) -> Self {
-        Self { client }
+    pub const fn new(client: Arc<CloudClient>, critical_client_hints: bool) -> Self {
+        Self {
+            client,
+            critical_client_hints,
+        }
+    }
+
+    /// The client hint headers to set alongside the identifier.
+    ///
+    /// # Why these ride on the identity response
+    ///
+    /// `Accept-CH` and `Critical-CH` are response headers, so a meta tag cannot
+    /// carry them and the head injector cannot help. The only seam that reaches
+    /// a response header is the Edge Cookie provider's, and it fires when an
+    /// identifier is being created: no cookie yet, a provider selected, and the
+    /// permissions set.
+    ///
+    /// That firing condition happens to be the right one. A visitor with no
+    /// Edge Cookie is a visitor the browser has not yet been asked for hints,
+    /// and one who has both has already been asked. So the headers go out
+    /// exactly once per visitor rather than on every page.
+    fn client_hint_headers(
+        &self,
+        answer: &CloudAnswer,
+    ) -> Vec<(http::HeaderName, http::HeaderValue)> {
+        let Some(accept_ch) = crate::head::accept_ch_from_answer(answer) else {
+            return Vec::new();
+        };
+        let Ok(value) = http::HeaderValue::from_str(&accept_ch) else {
+            return Vec::new();
+        };
+        let mut headers = vec![(http::HeaderName::from_static("accept-ch"), value.clone())];
+        if self.critical_client_hints {
+            headers.push((http::HeaderName::from_static("critical-ch"), value));
+        }
+        headers
     }
 }
 
@@ -202,7 +237,7 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
 
         Ok(GeneratedEdgeCookie {
             id: identifier_from_answer(&answer),
-            response_headers: Vec::new(),
+            response_headers: self.client_hint_headers(&answer),
         })
     }
 
@@ -260,11 +295,14 @@ mod tests {
     );
 
     fn provider() -> FiftyOneDegreesIdentity {
-        FiftyOneDegreesIdentity::new(Arc::new(CloudClient::new(
-            "https://cloud.example.com/api/v4/json".to_owned(),
-            500,
-            true,
-        )))
+        FiftyOneDegreesIdentity::new(
+            Arc::new(CloudClient::new(
+                "https://cloud.example.com/api/v4/json".to_owned(),
+                500,
+                true,
+            )),
+            false,
+        )
     }
 
     fn answer_with(identifier: &str) -> CloudAnswer {
@@ -418,6 +456,74 @@ mod tests {
             "the raw alphabet is not the cookie alphabet, so a raw identifier arriving in \
              a cookie did not come from this provider"
         );
+    }
+
+    fn answer_naming_hints() -> CloudAnswer {
+        CloudAnswer::new(json!({"device": {
+            "setheaderbrowseraccept-ch": "Sec-CH-UA,Sec-CH-UA-Platform",
+            "setheaderhardwareaccept-ch": "Sec-CH-UA-Model",
+        }}))
+    }
+
+    fn provider_with(critical: bool) -> FiftyOneDegreesIdentity {
+        FiftyOneDegreesIdentity::new(
+            Arc::new(CloudClient::new(
+                "https://cloud.example.com/api/v4/json".to_owned(),
+                500,
+                true,
+            )),
+            critical,
+        )
+    }
+
+    #[test]
+    fn the_accept_ch_header_rides_out_with_the_identifier() {
+        let headers = provider_with(false).client_hint_headers(&answer_naming_hints());
+
+        assert_eq!(headers.len(), 1, "Accept-CH only, got {headers:?}");
+        assert_eq!(headers[0].0.as_str(), "accept-ch");
+        assert_eq!(
+            headers[0].1.to_str().expect("should be text"),
+            "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Model"
+        );
+    }
+
+    #[test]
+    fn critical_ch_is_off_unless_a_deployment_asks_for_it() {
+        // The default is the load-bearing part. Critical-CH makes a browser
+        // reissue the navigation rather than render the page, so switching it
+        // on doubles the first request of every session. That is a deployment's
+        // trade to make, not one to inherit by accident.
+        let headers = provider_with(false).client_hint_headers(&answer_naming_hints());
+
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.as_str() == "critical-ch"),
+            "got {headers:?}"
+        );
+    }
+
+    #[test]
+    fn critical_ch_is_sent_when_a_deployment_does_ask() {
+        let headers = provider_with(true).client_hint_headers(&answer_naming_hints());
+
+        let critical = headers
+            .iter()
+            .find(|(name, _)| name.as_str() == "critical-ch")
+            .expect("should be present when asked for");
+        assert_eq!(
+            critical.1.to_str().expect("should be text"),
+            "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Model",
+            "a browser retries only for the hints it was told are critical, so the two              headers have to name the same set"
+        );
+    }
+
+    #[test]
+    fn an_answer_naming_no_hints_sets_no_headers() {
+        let headers = provider_with(true).client_hint_headers(&CloudAnswer::new(json!({})));
+
+        assert!(headers.is_empty(), "got {headers:?}");
     }
 
     #[test]
