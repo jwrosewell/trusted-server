@@ -215,8 +215,15 @@ impl AnswerCache {
 ///
 /// Each property this crate reads is requested explicitly through `values`,
 /// because a product whose properties are not asked for is not returned.
-/// `Areas` is deliberately never requested: it is a multipolygon that runs to
-/// thousands of characters and nothing here reads it.
+///
+/// `Areas` is never requested and arrives anyway. Measured against the live
+/// service on 6 September 2026: asking for five `ip` properties returns the
+/// whole `ip` element, 5,059 bytes of it, including a multipolygon of several
+/// thousand characters that nothing here reads. Adding an `exclude` parameter
+/// changes nothing. So `values` narrows which products run, not which
+/// properties come back, and the geo answer carries that weight on every call.
+/// Nothing on this side can trim it, which makes it a question for whoever owns
+/// the service rather than a fault here.
 ///
 /// Device properties are asked for only when there is a `User-Agent` to answer
 /// them from. The geo provider cannot see one through its seam, so its call
@@ -655,7 +662,7 @@ mod tests {
             !parameters
                 .iter()
                 .any(|(_, v)| v.eq_ignore_ascii_case("ip.Areas")),
-            "Areas is a multipolygon of thousands of characters that nothing here reads"
+            "Areas is a multipolygon of thousands of characters that nothing here reads.              The service sends it regardless, which is measured and documented above, but              asking for it as well would be asking for weight twice over"
         );
     }
 }
