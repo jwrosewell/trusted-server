@@ -6,6 +6,17 @@
 //! calling three times for one request would triple the latency on the critical
 //! path for nothing.
 //!
+//! # What this actually costs, measured
+//!
+//! The first request from an address costs two calls, not one. Geo runs first
+//! in the request and cannot see the `User-Agent`, so it asks about the
+//! address alone, and the device provider then has to ask its own question.
+//! Every later request from that address, while the entry is fresh, costs at
+//! most one: geo reuses the device call's answer, and a repeat visitor with an
+//! unchanged `User-Agent` costs none. Read from the appliance's own log on
+//! 6 September 2026 rather than reasoned about, after the module heading here
+//! had claimed one call per request and the log said otherwise.
+//!
 //! # Why a cache rather than a per-request context
 //!
 //! The provider seam has no shared per-request store. `PlatformGeo::lookup`
@@ -206,16 +217,25 @@ impl AnswerCache {
 /// because a product whose properties are not asked for is not returned.
 /// `Areas` is deliberately never requested: it is a multipolygon that runs to
 /// thousands of characters and nothing here reads it.
+///
+/// Device properties are asked for only when there is a `User-Agent` to answer
+/// them from. The geo provider cannot see one through its seam, so its call
+/// would otherwise ask twelve device questions whose answers describe an empty
+/// `User-Agent` and which no caller may read.
 #[must_use]
 pub fn query_parameters(evidence: &Evidence, want_identity: bool) -> Vec<(String, String)> {
     let mut parameters = vec![
         ("client-ip".to_owned(), evidence.client_ip.clone()),
         ("User-Agent".to_owned(), evidence.user_agent.clone()),
     ];
-    for property in IP_PROPERTIES.iter().chain(DEVICE_PROPERTIES) {
+    let want_device = !evidence.user_agent.trim().is_empty();
+    let properties = IP_PROPERTIES
+        .iter()
+        .chain(if want_device { DEVICE_PROPERTIES } else { &[] });
+    for property in properties {
         parameters.push(("values".to_owned(), (*property).to_owned()));
     }
-    if want_identity {
+    if want_identity && want_device {
         parameters.push(("id.usage".to_owned(), "non-marketing".to_owned()));
         parameters.push(("values".to_owned(), "FODiD.IdProbGlobal".to_owned()));
     }
@@ -568,6 +588,33 @@ mod tests {
         assert!(
             held <= MAX_ENTRIES,
             "a crawler cycling addresses must not grow the process without limit, held {held}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_user_agent_asks_no_device_questions() {
+        let address_only = Evidence {
+            client_ip: "2.125.160.216".to_owned(),
+            user_agent: String::new(),
+        };
+
+        let parameters = query_parameters(&address_only, true);
+
+        assert!(
+            parameters
+                .iter()
+                .all(|(_, value)| !value.starts_with("device.")),
+            "the geo provider cannot see a User-Agent, so asking twelve device              questions would buy answers about an empty one that nothing may read"
+        );
+        assert!(
+            parameters
+                .iter()
+                .any(|(_, value)| value == "ip.CountryCode"),
+            "the address question is the one this call exists to ask"
+        );
+        assert!(
+            !parameters.iter().any(|(name, _)| name == "id.usage"),
+            "an identifier derived from an empty User-Agent is not one worth asking for"
         );
     }
 
