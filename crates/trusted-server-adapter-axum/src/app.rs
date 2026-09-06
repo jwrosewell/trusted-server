@@ -169,22 +169,25 @@ pub fn build_state_with_registrations(
     integrations: &[IntegrationBuilder],
     auction_providers: &[AuctionProviderBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+
     // Composition root: reject a provider selection this adapter can never
-    // supply, once, before any request is served. The Axum dev server injects
-    // no Edge Cookie provider into `RuntimeServices`, so `None` is exactly what
-    // `EcContext` sees per request; pass the injected provider here as well
-    // once this adapter supplies one.
+    // supply, once, before any request is served.
+    //
+    // The registry is built first because the check has to be asked the same
+    // question the request path answers. `build_per_request_services` injects
+    // the module-supplied provider into `RuntimeServices`, so passing `None`
+    // here refused every module-supplied Edge Cookie provider at start-up while
+    // the request path would have used it perfectly well. That was the state of
+    // this adapter until a vendor module first supplied one.
     //
     // This adapter checks rather than keeps what the check resolved, unlike the
     // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
     // whose application state is built once at start-up while theirs is rebuilt
-    // for every request. It injects and threads no provider, so `EcContext`
-    // resolves the selection itself on every request, building a fresh built-in
-    // provider that reads no request data. It supplies no host signals either,
-    // so the host-signals argument is `None`.
-    ensure_provider_available(&settings.ec, None, None)?;
-    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
-    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+    // for every request. It supplies no host signals, so that argument is
+    // `None`.
+    ensure_provider_available(&settings.ec, None, registry.ec_provider())?;
     let ec_identity_graph = open_ec_identity_graph(&settings)?;
 
     Ok(Arc::new(AppState {

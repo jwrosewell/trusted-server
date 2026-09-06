@@ -41,23 +41,27 @@ impl FiftyOneDegreesDevice {
     pub const fn new(client: Arc<CloudClient>) -> Self {
         Self { client }
     }
+}
 
-    /// Builds the evidence key for a request.
-    ///
-    /// The address is parsed and written back out rather than passed through,
-    /// so that this key and the geo provider's key are byte-identical for the
-    /// same visitor. The geo provider builds its key from an [`IpAddr`], and
-    /// `2001:db8::1` and `2001:0db8:0000::0001` are the same address written
-    /// two ways. Two spellings would be two cache entries and two calls.
-    fn evidence(request_info: &dyn RequestInfo) -> Evidence {
-        let raw = request_info.client_ip();
-        let client_ip = raw
-            .parse::<IpAddr>()
-            .map_or_else(|_| raw.to_owned(), |address| address.to_string());
-        Evidence {
-            client_ip,
-            user_agent: request_info.user_agent().to_owned(),
-        }
+/// Builds the evidence key for a request.
+///
+/// The address is parsed and written back out rather than passed through, so
+/// that this key and the geo provider's key are byte-identical for the same
+/// visitor. The geo provider builds its key from an [`IpAddr`], and
+/// `2001:db8::1` and `2001:0db8:0000::0001` are the same address written two
+/// ways. Two spellings would be two cache entries and two calls.
+///
+/// Shared with the identity provider, which must build the same key or it pays
+/// for a second call to learn what the device provider already asked.
+#[must_use]
+pub fn evidence_for(request_info: &dyn RequestInfo) -> Evidence {
+    let raw = request_info.client_ip();
+    let client_ip = raw
+        .parse::<IpAddr>()
+        .map_or_else(|_| raw.to_owned(), |address| address.to_string());
+    Evidence {
+        client_ip,
+        user_agent: request_info.user_agent().to_owned(),
     }
 }
 
@@ -191,7 +195,7 @@ impl DeviceProvider for FiftyOneDegreesDevice {
         services: &RuntimeServices,
     ) -> DeviceSignals {
         let baseline = DeviceSignals::derive_ua_only(request_info.user_agent());
-        let evidence = Self::evidence(request_info);
+        let evidence = evidence_for(request_info);
         match self.client.answer(&evidence, services).await {
             Ok(answer) => signals_from_answer(baseline, &answer),
             Err(error) => {
@@ -211,7 +215,7 @@ impl DeviceProvider for FiftyOneDegreesDevice {
         request_info: &dyn RequestInfo,
         services: &RuntimeServices,
     ) -> Option<DeviceAttributes> {
-        let evidence = Self::evidence(request_info);
+        let evidence = evidence_for(request_info);
         match self.client.answer(&evidence, services).await {
             Ok(answer) => attributes_from_answer(&answer),
             Err(error) => {

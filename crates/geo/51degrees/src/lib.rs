@@ -37,6 +37,7 @@
 
 pub mod client;
 pub mod device;
+pub mod identity;
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
@@ -52,6 +53,7 @@ use validator::Validate;
 
 use crate::client::CloudClient;
 use crate::device::FiftyOneDegreesDevice;
+use crate::identity::FiftyOneDegreesIdentity;
 
 /// Identifier for this vendor's module.
 ///
@@ -271,7 +273,8 @@ pub fn register(
                 config.enabled,
                 Arc::clone(&client),
             )))
-            .with_device_provider(Arc::new(FiftyOneDegreesDevice::new(client)))
+            .with_device_provider(Arc::new(FiftyOneDegreesDevice::new(Arc::clone(&client))))
+            .with_ec_provider(Arc::new(FiftyOneDegreesIdentity::new(client)))
             .build(),
     ))
 }

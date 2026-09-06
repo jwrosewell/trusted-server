@@ -47,6 +47,38 @@ fn settings_with(extra: &str) -> Settings {
     .expect("should parse the test settings")
 }
 
+/// Settings that write their own `[ec]` block, which `settings_with` bakes in.
+fn settings_selecting_identity(extra: &str) -> Settings {
+    Settings::from_toml(&format!(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "geo-51degrees-test-proxy-secret"
+
+            [geo]
+            provider = "fiftyone_degrees"
+
+            [ec]
+            provider = "fiftyone_degrees"
+
+            [ec.providers.fiftyone_degrees]
+
+            [integrations.fiftyone_degrees]
+            endpoint = "http://127.0.0.1:8080/api/v4/json"
+
+            {extra}
+        "#
+    ))
+    .expect("should parse the identity test settings")
+}
+
 /// The configuration block a deployment writes to use this provider.
 ///
 /// The endpoint is the self-hosted container's documented shape, which carries
@@ -195,5 +227,89 @@ fn the_running_binary_offers_this_vendor_to_a_deployment() {
     assert!(
         offered.contains(&"fiftyone_degrees"),
         "the adapter must hand this module to the registry for any deployment to          select it, offered: {offered:?}"
+    );
+}
+
+/// The same module supplies the Edge Cookie provider, so the identity selector
+/// must reach it, and an identifier it creates must survive core's read-back
+/// unchanged.
+///
+/// This is the acceptance gate for the seam, and it exists because this project
+/// has already shipped the failure it checks for. A vendor identifier was
+/// written to the cookie and silently dropped on read-back, because core judged
+/// and rewrote it by the built-in HMAC provider's rules. Nothing errored, and
+/// every visitor simply looked new on every request.
+///
+/// So the assertions below are on the three functions core actually uses,
+/// driven through the trait object the registry resolved rather than through
+/// the concrete type, because a wrapper that forgets to delegate one of them is
+/// how the original fault reached production.
+#[test]
+fn a_51degrees_identifier_survives_core_read_back_verbatim() {
+    // A real identifier shape from a live staging response, shortened. The
+    // mixed case, the plus and the trailing equals are the parts that break
+    // under the built-in rules.
+    const IDENTIFIER: &str =
+        "v5zpMhSCBhtlg5lPPDsacnjSwVYotOIo-oQd-99fsXtdaBgUAMPyE_fQnVliHW_LlthFKzlO6D";
+
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let provider = registry
+        .ec_provider()
+        .expect("`[ec] provider = \"fiftyone_degrees\"` should resolve this module's provider");
+
+    let full = trusted_server_core::ec::provider::apply_provider_code(&*provider, IDENTIFIER);
+
+    assert_eq!(
+        full,
+        format!("51dd~{IDENTIFIER}"),
+        "the cookie value should be this provider's registered code and its own value"
+    );
+    assert!(
+        trusted_server_core::ec::provider::provider_owns_id(&*provider, &full),
+        "an identifier this provider created must be one core reads back, or every \
+         visitor looks new on every request and nothing reports an error"
+    );
+    // Core keeps the code prefix on the storage key and lets the provider
+    // normalize only its own value part, so the key is the whole cookie value
+    // and the part that matters is that the value half is untouched.
+    let key = trusted_server_core::ec::provider::provider_kv_key(&*provider, &full);
+    assert_eq!(
+        key, full,
+        "the identifier is base64 and case-sensitive, so the storage key must carry \
+         the value unchanged rather than lowercased into a collision"
+    );
+    assert!(
+        key.ends_with(IDENTIFIER),
+        "the value half of the key must be byte-identical to what the service issued, \
+         got {key}"
+    );
+}
+
+/// The read-back check is not vacuous: an identifier from another provider is
+/// refused.
+#[test]
+fn an_identifier_this_module_did_not_create_is_refused() {
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+    let provider = registry.ec_provider().expect("should resolve the provider");
+
+    let built_in = format!("hmac~{}.abc123", "a".repeat(64));
+
+    assert!(
+        !trusted_server_core::ec::provider::provider_owns_id(&*provider, &built_in),
+        "another provider's identifier must not be adopted, or two providers would key \
+         the same identity graph row from different evidence"
     );
 }
