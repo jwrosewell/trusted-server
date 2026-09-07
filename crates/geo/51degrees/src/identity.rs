@@ -155,6 +155,8 @@ const MAX_ID_BYTES: usize = 250;
 pub struct FiftyOneDegreesIdentity {
     client: Arc<CloudClient>,
     critical_client_hints: bool,
+    /// Whether a 51Did's signature is checked before it is accepted.
+    verify_signatures: bool,
     /// The signers whose public keys this process has fetched.
     ///
     /// Shared by the two paths an identifier arrives on, so a key fetched
@@ -167,10 +169,15 @@ impl FiftyOneDegreesIdentity {
     /// Creates a provider sharing one client, and so one call, with the other
     /// providers this crate supplies.
     #[must_use]
-    pub fn new(client: Arc<CloudClient>, critical_client_hints: bool) -> Self {
+    pub fn new(
+        client: Arc<CloudClient>,
+        critical_client_hints: bool,
+        verify_signatures: bool,
+    ) -> Self {
         Self {
             client,
             critical_client_hints,
+            verify_signatures,
             keys: KeyCache::new(),
         }
     }
@@ -343,6 +350,11 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
         let Some(identifier) = verify::parse(value) else {
             return false;
         };
+        if !self.verify_signatures {
+            // Still required to be a real envelope, because a value that is not
+            // one was never issued by this provider whatever the setting says.
+            return true;
+        }
         let (signer, _) = verify::signer_of(&identifier);
         match self.keys.cached(&signer) {
             Some(pem) => verify::signature_is_valid(&identifier, &pem),
@@ -386,6 +398,18 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
             log::warn!("51Degrees resolve refused: the posted value is not an OWID envelope");
             return Ok(GeneratedEdgeCookie::default());
         };
+
+        if !self.verify_signatures {
+            log::warn!(
+                "51Degrees resolve accepted a client-created identifier without checking \
+                 its signature, because verify_signatures is off"
+            );
+            let value = to_cookie_form(posted);
+            return Ok(GeneratedEdgeCookie {
+                id: is_well_formed(&value).then_some(value),
+                response_headers: Vec::new(),
+            });
+        }
 
         // The envelope names its own signer. A forged claim simply names a
         // signer whose key will not verify it, so the claim is safe to follow.
@@ -455,6 +479,7 @@ mod tests {
                 true,
             )),
             false,
+            true,
         )
     }
 
@@ -637,6 +662,7 @@ mod tests {
                 true,
             )),
             critical,
+            true,
         )
     }
 

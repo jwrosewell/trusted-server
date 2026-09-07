@@ -162,6 +162,21 @@ pub struct FiftyOneDegreesGeoConfig {
     /// immediately and accept a worse first auction.
     #[serde(default = "default_critical_client_hints")]
     pub critical_client_hints: bool,
+
+    /// Whether to verify the signature on a 51Did before accepting it.
+    ///
+    /// On by default. An identifier arrives either from the browser, at the
+    /// resolve endpoint, or in a cookie the browser sends, and both are values
+    /// anyone can produce. One taken on trust could be another visitor's, which
+    /// would key this visitor into that person's row in the identity graph.
+    ///
+    /// The cost is one outbound call per signer to fetch a public key, made
+    /// rarely and cached. Turning it off leaves only a shape check, which
+    /// answers "this looks like base64 of about the right length" and nothing
+    /// more, so it is for a deployment that has a reason rather than a default
+    /// worth taking.
+    #[serde(default = "default_verify_signatures")]
+    pub verify_signatures: bool,
 }
 
 impl trusted_server_core::settings::IntegrationConfig for FiftyOneDegreesGeoConfig {
@@ -175,6 +190,10 @@ const fn default_enabled() -> bool {
 }
 
 const fn default_critical_client_hints() -> bool {
+    true
+}
+
+const fn default_verify_signatures() -> bool {
     true
 }
 
@@ -365,6 +384,7 @@ pub fn register(
             .with_ec_provider(Arc::new(FiftyOneDegreesIdentity::new(
                 client,
                 config.critical_client_hints,
+                config.verify_signatures,
             )))
             .build(),
     ))
@@ -409,6 +429,27 @@ mod tests {
             "should take the ISO alpha-2 country code"
         );
         assert_eq!(geo.city, "Reading", "should take the town as the city");
+    }
+
+    #[test]
+    fn signature_verification_is_on_unless_a_deployment_turns_it_off() {
+        // The default decides what a deployment that says nothing gets, and an
+        // identifier accepted without a signature check could be another
+        // visitor's, so this is asserted rather than left to the attribute.
+        let configured: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json"
+        }))
+        .expect("should read a configuration naming only the endpoint");
+
+        assert!(configured.verify_signatures);
+
+        let switched_off: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json",
+            "verify_signatures": false
+        }))
+        .expect("should read the switch");
+
+        assert!(!switched_off.verify_signatures);
     }
 
     #[test]

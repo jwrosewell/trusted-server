@@ -16,21 +16,33 @@
 //! whether it is one of ours. A shape check answers "it looks like base64 of
 //! about the right length", which anyone can produce.
 //!
-//! # What is verified
+//! # What is verified, and what cannot be
 //!
 //! A 51Did is carried in an OWID envelope, which names the domain that signed
-//! it and carries a signature over its payload. Verification is the envelope's
-//! signature against that domain's published public key. It proves the value
-//! was minted by that signer and has not been altered since. It does not prove
-//! the visitor is who they say they are, and nothing here claims otherwise.
+//! it and carries a signature over its payload. **The signature is the only
+//! thing this can check.** It proves the value was minted by that signer and
+//! has not been altered since.
 //!
-//! # The key
+//! It does **not** check the creator context, and from a server it cannot. The
+//! context belongs to the browser that obtained the identifier, and a call made
+//! from an appliance is a different caller on a different connection, so
+//! anything derived from the caller's own context would describe the appliance
+//! rather than the visitor. A signature is what a third party can verify about
+//! a value it did not create, and that is the right and only claim to make
+//! here.
 //!
-//! Published at `/owid/api/v{version}/public-key` on the signing domain, and
-//! fetched once per process through the platform HTTP client, so the fetch
-//! obeys the same backend and timeout rules as every other outbound call and
-//! works on every adapter. It is cached by domain and version, because a
-//! signer may rotate versions and a deployment may meet more than one signer.
+//! # The key, and whose job caching it is
+//!
+//! **Temporary.** The 51Degrees Rust package will own key caching, with the
+//! OWID code beneath it responsible for fetching from the source and honouring
+//! the validity window each key carries. This module holds a small cache only
+//! because that package is not ready, and it should be deleted rather than
+//! extended when it lands.
+//!
+//! Two things this placeholder gets wrong that the package will get right. It
+//! expires on a fixed interval rather than on the key's own start and end
+//! dates, which is the wrong rule and merely a safe one. And it caches per
+//! process rather than anywhere a short-lived edge instance could reuse.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
