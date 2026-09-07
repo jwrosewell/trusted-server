@@ -34,6 +34,7 @@
 mod extraction;
 pub mod gpp;
 pub mod jurisdiction;
+pub mod source;
 pub mod tcf;
 pub mod types;
 pub mod us_privacy;

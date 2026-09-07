@@ -384,7 +384,7 @@ enum RevokeSet {
 /// it says only how a decoded signal grants or revokes each Data Use, and the
 /// country/region baseline decides the rest.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SignalPolicy {
+pub struct SignalPolicy {
     /// Whether a present TCF record's grants and revokes apply. This never
     /// lets a TCF record override an opt-out signal: an opt-out always
     /// suppresses the Data Uses it revokes.
@@ -399,23 +399,27 @@ pub(crate) struct SignalPolicy {
 
 impl SignalPolicy {
     /// Whether a present TCF record's grants and revokes apply.
-    pub(crate) fn tcf_authoritative(&self) -> bool {
+    #[must_use]
+    pub fn tcf_authoritative(&self) -> bool {
         self.tcf_authoritative
     }
 
     /// The TCF purpose number that grants `permission`, or `None` when no purpose
     /// maps to it.
-    pub(crate) fn tcf_purpose(&self, permission: Permission) -> Option<u8> {
+    #[must_use]
+    pub fn tcf_purpose(&self, permission: Permission) -> Option<u8> {
         self.tcf_purpose.get(&permission.index()).copied()
     }
 
     /// The signals that constitute a US-style opt-out.
-    pub(crate) fn opt_out_sources(&self) -> &[OptOutSource] {
+    #[must_use]
+    pub fn opt_out_sources(&self) -> &[OptOutSource] {
         &self.opt_out_sources
     }
 
     /// Whether a US-style opt-out revokes `permission`.
-    pub(crate) fn opt_out_revokes(&self, permission: Permission) -> bool {
+    #[must_use]
+    pub fn opt_out_revokes(&self, permission: Permission) -> bool {
         match &self.opt_out_revokes {
             RevokeSet::None => false,
             RevokeSet::All => true,
@@ -945,7 +949,7 @@ impl Default for RevokeSpec {
 /// A single US-style opt-out signal source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OptOutSource {
+pub enum OptOutSource {
     /// The `Sec-GPC` request header (Global Privacy Control).
     Gpc,
     /// A GPP US sale opt-out.

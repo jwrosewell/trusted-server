@@ -10,6 +10,9 @@
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
+use std::sync::Arc;
+
+use crate::consent::source::{PermissionSignalSource, SignalInput};
 use crate::permissions::{
     Acquisition, ConsentSignal, OptOutSource, Permission, PermissionMaps, PermissionState,
     SignalPolicy,
@@ -157,30 +160,110 @@ fn permission_signal<'a>(
     consent: &'a ConsentContext,
     signals: &'a SignalPolicy,
 ) -> impl Fn(Permission) -> ConsentSignal + 'a {
+    let sources = builtin_sources();
     move |permission| {
-        if opt_out_present(consent, signals.opt_out_sources())
-            && signals.opt_out_revokes(permission)
+        let input = SignalInput {
+            consent,
+            policy: signals,
+        };
+        crate::consent::source::combine(&sources, permission, &input)
+    }
+}
+
+/// The signal models core supplies itself.
+///
+/// These four were decoded inline until the seam existed. They are the same
+/// rules, moved behind [`PermissionSignalSource`] so a fifth model can be added
+/// by a module instead of by editing core. A deployment that configures nothing
+/// gets exactly these, in this order, which is why the refactor is invisible.
+///
+/// The order does not decide the outcome, because [`combine`] lets a refusal
+/// win wherever it appears. It is kept as it was for readability.
+///
+/// [`combine`]: crate::consent::source::combine
+/// [`PermissionSignalSource`]: crate::consent::source::PermissionSignalSource
+fn builtin_sources() -> Vec<Arc<dyn PermissionSignalSource>> {
+    vec![
+        Arc::new(UsOptOutSource),
+        Arc::new(MalformedRecordSource),
+        Arc::new(TcfSource),
+    ]
+}
+
+/// A US-style opt-out, from Global Privacy Control, a GPP sale opt-out, or a
+/// US Privacy string.
+///
+/// Which of those count, and what an opt-out takes away, are both the policy's
+/// decisions rather than this source's. It only reads whether one is present.
+struct UsOptOutSource;
+
+impl PermissionSignalSource for UsOptOutSource {
+    fn id(&self) -> &'static str {
+        "us-opt-out"
+    }
+
+    fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+        if opt_out_present(input.consent, input.policy.opt_out_sources())
+            && input.policy.opt_out_revokes(permission)
         {
             return ConsentSignal::Revoke;
-        }
-        if consent.has_malformed_record() {
-            return ConsentSignal::Revoke;
-        }
-        if signals.tcf_authoritative()
-            && let Some(tcf) = crate::consent::effective_tcf(consent)
-        {
-            return match signals.tcf_purpose(permission) {
-                Some(purpose) => {
-                    if tcf.has_purpose_consent(usize::from(purpose)) {
-                        ConsentSignal::Grant
-                    } else {
-                        ConsentSignal::Revoke
-                    }
-                }
-                None => ConsentSignal::Neutral,
-            };
         }
         ConsentSignal::Neutral
+    }
+}
+
+/// A consent record that arrived and could not be read.
+///
+/// Distinct from no record at all. An absent record is silence and leaves the
+/// place baseline standing. A record that is present and malformed is a signal
+/// we cannot trust, so it revokes rather than being ignored.
+struct MalformedRecordSource;
+
+impl PermissionSignalSource for MalformedRecordSource {
+    fn id(&self) -> &'static str {
+        "malformed-record"
+    }
+
+    fn signal(&self, _permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+        if input.consent.has_malformed_record() {
+            return ConsentSignal::Revoke;
+        }
+        ConsentSignal::Neutral
+    }
+}
+
+/// TCF v2, when the policy says TCF answers for this deployment.
+///
+/// The mapping from permission to purpose is the policy's, so this source
+/// decodes and does not interpret. A permission no purpose maps to gets
+/// silence, not a refusal.
+struct TcfSource;
+
+impl PermissionSignalSource for TcfSource {
+    fn id(&self) -> &'static str {
+        "tcf"
+    }
+
+    fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+        if !input.policy.tcf_authoritative() {
+            return ConsentSignal::Neutral;
+        }
+        let Some(tcf) = crate::consent::effective_tcf(input.consent) else {
+            return ConsentSignal::Neutral;
+        };
+        match input.policy.tcf_purpose(permission) {
+            Some(purpose) => {
+                if tcf.has_purpose_consent(usize::from(purpose)) {
+                    ConsentSignal::Grant
+                } else {
+                    // A purpose the visitor did not consent to is a refusal,
+                    // not silence. Reading it as silence would leave the place
+                    // baseline standing and grant what they declined.
+                    ConsentSignal::Revoke
+                }
+            }
+            None => ConsentSignal::Neutral,
+        }
     }
 }
 
