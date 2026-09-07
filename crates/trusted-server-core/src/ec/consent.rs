@@ -167,6 +167,22 @@ fn permission_signal<'a>(
     sources: &'a [Arc<dyn PermissionSignalSource>],
 ) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
     move |permission, baseline| {
+        // A record that arrived and could not be read fails closed, ahead of
+        // every configured model and regardless of which are configured.
+        //
+        // This is not a signalling model and is deliberately not in the
+        // configured list. A publisher chooses which signals to act on; they do
+        // not choose what happens when one of those signals arrives unreadable.
+        // An unreadable record is a preference someone expressed that cannot be
+        // read, which is different from no record at all, so it must not
+        // degrade to the no-signal baseline.
+        //
+        // It overrides rather than taking a place in the order because the
+        // ordered rule would otherwise let a readable record from one model
+        // overwrite the refusal caused by an unreadable one from another.
+        if consent.has_malformed_record() {
+            return ConsentSignal::Revoke;
+        }
         crate::permission_signal::combine(sources, permission, consent, signals, baseline)
     }
 }
@@ -179,13 +195,7 @@ fn permission_signal<'a>(
 ///
 /// [`PermissionSignalConfig::validate_selection`]:
 ///     crate::settings::PermissionSignalConfig::validate_selection
-pub const SOURCE_IDS: &[&str] = &[
-    "gpc",
-    "gpp-sale-opt-out",
-    "us-privacy",
-    "malformed-record",
-    "tcf",
-];
+pub const SOURCE_IDS: &[&str] = &["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"];
 
 /// Every signal model core supplies, in the default order.
 ///
@@ -205,7 +215,6 @@ pub fn all_sources() -> Vec<Arc<dyn PermissionSignalSource>> {
         Arc::new(GpcSource),
         Arc::new(GppSaleOptOutSource),
         Arc::new(UsPrivacySource),
-        Arc::new(MalformedRecordSource),
         Arc::new(TcfSource),
     ]
 }
@@ -299,26 +308,6 @@ impl PermissionSignalSource for UsPrivacySource {
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         opt_out_signal(OptOutSource::UsPrivacyOptOut, permission, input)
-    }
-}
-
-/// A consent record that arrived and could not be read.
-///
-/// Distinct from no record at all. An absent record is silence and leaves the
-/// place baseline standing. A record that is present and malformed is a signal
-/// we cannot trust, so it revokes rather than being ignored.
-struct MalformedRecordSource;
-
-impl PermissionSignalSource for MalformedRecordSource {
-    fn id(&self) -> &'static str {
-        "malformed-record"
-    }
-
-    fn signal(&self, _permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
-        if input.consent.has_malformed_record() {
-            return ConsentSignal::Revoke;
-        }
-        ConsentSignal::Neutral
     }
 }
 
@@ -487,6 +476,49 @@ mod tests {
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
             "GPC should revoke the granted necessary.operations.storage and advertising_marketing.first_party.targeted baseline"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // An unreadable record. Not a model a publisher lists, so it applies
+    // whatever they configured, and it is not subject to the ordering.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_unreadable_record_revokes_even_with_no_models_configured() {
+        let consent = ConsentContext {
+            raw_tc_string: Some("this is not a TC string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert!(
+            consent.has_malformed_record(),
+            "the fixture has to actually be unreadable for this to test anything"
+        );
+        let geo = us_ca_geo();
+        let state = assemble_permissions_with(&consent, GeoStatus::Located(&geo), &[]);
+        assert!(
+            !state.is_set(Permission::StoreOnDevice),
+            "a preference someone expressed that cannot be read must not degrade to the \
+             no-signal baseline, and a publisher cannot configure that away"
+        );
+    }
+
+    #[test]
+    fn a_readable_record_does_not_overwrite_an_unreadable_one() {
+        // The regression the override exists to prevent: under the ordered
+        // rule alone, a TCF record that consents would be asked after the
+        // unreadable GPP string and would overwrite the refusal it caused.
+        let consent = ConsentContext {
+            tcf: Some(tcf_with_purposes(&[1, 4])),
+            raw_gpp_string: Some("this is not a GPP string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert!(consent.has_malformed_record());
+        let geo = us_ca_geo();
+        let state = assemble_permissions_with(&consent, GeoStatus::Located(&geo), &all_sources());
+        assert!(
+            !state.is_set(Permission::StoreOnDevice),
+            "one model arriving unreadable is not cured by another model arriving readable"
         );
     }
 

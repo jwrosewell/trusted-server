@@ -45,7 +45,7 @@ deployment's to set, not this code's to assume.
 
 ```toml
 [permission_signal]
-sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "malformed-record", "tcf"]
+sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "tcf"]
 ```
 
 A source not on the list does not run, and there is no separate switch. A
@@ -92,7 +92,23 @@ without changing a source.
 
 ## The models supplied
 
-Core supplies the models it already understood: a US-style opt-out (Global
-Privacy Control, a GPP sale opt-out, or a US Privacy string), a consent record
-that arrived unreadable, and TCF v2. A deployment configuring nothing gets
-those, in that order.
+Core supplies the models it already understood: Global Privacy Control, a GPP
+sale opt-out, a US Privacy string, and TCF v2. A deployment configuring
+nothing gets those, in that order.
+
+The three opt-outs are separate rather than one so that a publisher who does
+not act on Global Privacy Control can remove it and keep the other two.
+
+## What is not a source
+
+A consent record that arrives and cannot be read revokes, ahead of every
+configured model and whichever ones are configured. That is error handling,
+not a signalling model, so it is not in the list and cannot be removed. A
+publisher chooses which signals to act on; they do not choose what happens
+when one of those signals arrives unreadable. An unreadable record is a
+preference someone expressed that could not be read, which is not the same as
+no record at all, so it must not degrade to the no-signal baseline.
+
+It overrides rather than taking a place in the order, because the ordered rule
+would otherwise let a readable record from one model overwrite the refusal
+caused by an unreadable one from another.
