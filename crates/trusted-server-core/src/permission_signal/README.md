@@ -43,10 +43,17 @@ prior value standing, which is different from refusing.
 The last source with an opinion decides, so the order is the policy. It is a
 deployment's to set, not this code's to assume.
 
-Today the order is the order of the list handed to `combine`, which core
-assembles itself. Naming the sources in operator configuration arrives with
-the split into vendor crates, because a name in a configuration file is only
-useful once a source can come from outside core.
+```toml
+[permission_signal]
+sources = ["gpc", "gpp-sale-opt-out", "us-privacy", "malformed-record", "tcf"]
+```
+
+A source not on the list does not run, and there is no separate switch. A
+publisher who does not want to act on Global Privacy Control removes `"gpc"`
+from the list. Leaving the section out entirely runs every model the build
+knows about, in the default order, so a signal is never quietly ignored
+because someone forgot to list it. An unknown or repeated name is refused at
+startup, so a typo cannot silently stop a model being honored.
 
 The default order asks the signals needing no interaction first and the ones
 following a prompt after. Global Privacy Control withdraws personalisation on

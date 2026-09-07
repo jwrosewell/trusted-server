@@ -87,8 +87,23 @@ pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
 /// protectively rather than as the policy's declared default.
 #[must_use]
 pub fn assemble_permissions(consent: &ConsentContext, geo: GeoStatus<'_>) -> PermissionState {
+    assemble_permissions_with(consent, geo, &all_sources())
+}
+
+/// As [`assemble_permissions`], for a deployment that has named which signal
+/// models run and in what order.
+///
+/// A model missing from `sources` does not run, so a publisher removes one by
+/// leaving it out rather than by configuring it off. An empty slice runs none
+/// of them, which leaves every permission at its country and region baseline.
+#[must_use]
+pub fn assemble_permissions_with(
+    consent: &ConsentContext,
+    geo: GeoStatus<'_>,
+    sources: &[Arc<dyn PermissionSignalSource>],
+) -> PermissionState {
     let maps = PermissionMaps::standard();
-    let signal = permission_signal(consent, maps.signals());
+    let signal = permission_signal(consent, maps.signals(), sources);
     match geo {
         GeoStatus::Failed => PermissionMaps::floor_with(signal),
         GeoStatus::Located(_) | GeoStatus::NoLocation => {
@@ -149,14 +164,30 @@ pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
 fn permission_signal<'a>(
     consent: &'a ConsentContext,
     signals: &'a SignalPolicy,
+    sources: &'a [Arc<dyn PermissionSignalSource>],
 ) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
-    let sources = builtin_sources();
     move |permission, baseline| {
-        crate::permission_signal::combine(&sources, permission, consent, signals, baseline)
+        crate::permission_signal::combine(sources, permission, consent, signals, baseline)
     }
 }
 
-/// The signal models core supplies itself.
+/// The identifiers of every signal model core supplies, in the default order.
+///
+/// Configuration names sources from this list, and
+/// [`PermissionSignalConfig::validate_selection`] rejects a name that is not in
+/// it at startup rather than silently ignoring it.
+///
+/// [`PermissionSignalConfig::validate_selection`]:
+///     crate::settings::PermissionSignalConfig::validate_selection
+pub const SOURCE_IDS: &[&str] = &[
+    "gpc",
+    "gpp-sale-opt-out",
+    "us-privacy",
+    "malformed-record",
+    "tcf",
+];
+
+/// Every signal model core supplies, in the default order.
 ///
 /// These were decoded inline until the seam existed. They are the same rules,
 /// moved behind [`PermissionSignalSource`] so a further model can be added by a
@@ -164,37 +195,110 @@ fn permission_signal<'a>(
 ///
 /// The order runs the signals needing no interaction before the ones following
 /// a prompt, so a visitor who arrives with an opt-out and then answers a prompt
-/// has their answer applied. A deployment wanting the opposite puts the opt-out
-/// source last.
+/// has their answer applied. A deployment wanting the opposite reorders the
+/// list in configuration.
 ///
 /// [`PermissionSignalSource`]: crate::permission_signal::PermissionSignalSource
-fn builtin_sources() -> Vec<Arc<dyn PermissionSignalSource>> {
+#[must_use]
+pub fn all_sources() -> Vec<Arc<dyn PermissionSignalSource>> {
     vec![
-        Arc::new(UsOptOutSource),
+        Arc::new(GpcSource),
+        Arc::new(GppSaleOptOutSource),
+        Arc::new(UsPrivacySource),
         Arc::new(MalformedRecordSource),
         Arc::new(TcfSource),
     ]
 }
 
-/// A US-style opt-out, from Global Privacy Control, a GPP sale opt-out, or a
-/// US Privacy string.
+/// The sources a deployment named, in the order it named them.
 ///
-/// Which of those count, and what an opt-out takes away, are both the policy's
-/// decisions rather than this source's. It only reads whether one is present.
-struct UsOptOutSource;
+/// `None` means nothing was configured, which runs all of them in the default
+/// order. That is deliberate: a publisher gets every model the build knows
+/// about until they say otherwise, so a signal is never quietly ignored because
+/// someone forgot to list it.
+///
+/// A name that matches nothing is dropped here, having already been rejected at
+/// startup by [`PermissionSignalConfig::validate_selection`].
+///
+/// [`PermissionSignalConfig::validate_selection`]:
+///     crate::settings::PermissionSignalConfig::validate_selection
+#[must_use]
+pub fn sources_for(configured: Option<&[String]>) -> Vec<Arc<dyn PermissionSignalSource>> {
+    let all = all_sources();
+    let Some(names) = configured else {
+        return all;
+    };
+    names
+        .iter()
+        .filter_map(|name| {
+            all.iter()
+                .find(|source| source.id() == name.as_str())
+                .map(Arc::clone)
+        })
+        .collect()
+}
 
-impl PermissionSignalSource for UsOptOutSource {
+/// Whether one US-style opt-out takes `permission` away on this request.
+///
+/// Shared by the three sources below, which differ only in the signal they
+/// read. They are separate sources rather than one so that a publisher who does
+/// not want to act on Global Privacy Control can leave that source out of the
+/// configured list without also losing the GPP and US Privacy opt-outs.
+///
+/// Which signals count at all, and what an opt-out takes away, remain the
+/// policy's decisions. A source that the policy does not list stays silent even
+/// when configuration names it, so removing it from `opt_out_sources` in
+/// `permissions.yaml` and leaving it out of the list have the same effect.
+fn opt_out_signal(
+    source: OptOutSource,
+    permission: Permission,
+    input: &SignalInput<'_>,
+) -> ConsentSignal {
+    if input.policy.opt_out_sources().contains(&source)
+        && opt_out_present(input.consent, &[source])
+        && input.policy.opt_out_revokes(permission)
+    {
+        return ConsentSignal::Revoke;
+    }
+    ConsentSignal::Neutral
+}
+
+/// The `Sec-GPC` request header, Global Privacy Control.
+struct GpcSource;
+
+impl PermissionSignalSource for GpcSource {
     fn id(&self) -> &'static str {
-        "us-opt-out"
+        "gpc"
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
-        if opt_out_present(input.consent, input.policy.opt_out_sources())
-            && input.policy.opt_out_revokes(permission)
-        {
-            return ConsentSignal::Revoke;
-        }
-        ConsentSignal::Neutral
+        opt_out_signal(OptOutSource::Gpc, permission, input)
+    }
+}
+
+/// A GPP US sale opt-out.
+struct GppSaleOptOutSource;
+
+impl PermissionSignalSource for GppSaleOptOutSource {
+    fn id(&self) -> &'static str {
+        "gpp-sale-opt-out"
+    }
+
+    fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+        opt_out_signal(OptOutSource::GppSaleOptOut, permission, input)
+    }
+}
+
+/// A US Privacy string sale opt-out.
+struct UsPrivacySource;
+
+impl PermissionSignalSource for UsPrivacySource {
+    fn id(&self) -> &'static str {
+        "us-privacy"
+    }
+
+    fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+        opt_out_signal(OptOutSource::UsPrivacyOptOut, permission, input)
     }
 }
 
@@ -384,6 +488,135 @@ mod tests {
                 && !state.is_set(Permission::SelectPersonalisedAds),
             "GPC should revoke the granted necessary.operations.storage and advertising_marketing.first_party.targeted baseline"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Which models run. A publisher names them in [permission_signal]
+    // sources, and one left off the list does not run at all.
+    // ------------------------------------------------------------------
+
+    /// Every identifier except the one named, in the declared order.
+    fn every_source_except(excluded: &str) -> Vec<String> {
+        SOURCE_IDS
+            .iter()
+            .filter(|id| **id != excluded)
+            .map(|id| (*id).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_declared_identifiers_match_the_models_that_run() {
+        // Configuration is validated against SOURCE_IDS and resolved against
+        // all_sources, so the two drifting apart would let a name validate and
+        // then match nothing, silently dropping a model.
+        let running: Vec<&str> = all_sources().iter().map(|source| source.id()).collect();
+        assert_eq!(
+            running, SOURCE_IDS,
+            "SOURCE_IDS is what configuration is checked against, so it has to be what runs"
+        );
+    }
+
+    #[test]
+    fn naming_nothing_runs_every_model() {
+        let ids: Vec<&str> = sources_for(None).iter().map(|source| source.id()).collect();
+        assert_eq!(
+            ids, SOURCE_IDS,
+            "a publisher who configures nothing acts on every signal the build knows, so \
+             one is never ignored because they forgot to list it"
+        );
+    }
+
+    #[test]
+    fn the_configured_order_is_the_order_they_are_asked_in() {
+        let reversed: Vec<String> = SOURCE_IDS.iter().rev().map(|id| (*id).to_owned()).collect();
+        let ids: Vec<String> = sources_for(Some(&reversed))
+            .iter()
+            .map(|source| source.id().to_owned())
+            .collect();
+        assert_eq!(
+            ids, reversed,
+            "the list is the order, not merely the membership"
+        );
+    }
+
+    #[test]
+    fn a_model_left_off_the_list_does_not_run() {
+        let consent = ConsentContext {
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        let geo = us_ca_geo();
+
+        let everything =
+            assemble_permissions_with(&consent, GeoStatus::Located(&geo), &all_sources());
+        assert!(
+            !everything.is_set(Permission::StoreOnDevice),
+            "with every model running, the header takes storage away"
+        );
+
+        let without_gpc = every_source_except("gpc");
+        let pruned = assemble_permissions_with(
+            &consent,
+            GeoStatus::Located(&geo),
+            &sources_for(Some(&without_gpc)),
+        );
+        assert!(
+            pruned.is_set(Permission::StoreOnDevice),
+            "a publisher who does not want to act on Global Privacy Control removes it from \
+             the list, and the header then changes nothing"
+        );
+    }
+
+    #[test]
+    fn removing_one_opt_out_leaves_the_others_working() {
+        // The reason the three opt-outs are separate sources rather than one.
+        let consent = ConsentContext {
+            us_privacy: Some(crate::consent::types::UsPrivacy {
+                version: 1,
+                notice_given: crate::consent::PrivacyFlag::Yes,
+                opt_out_sale: crate::consent::PrivacyFlag::Yes,
+                lspa_covered: crate::consent::PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        let geo = us_ca_geo();
+        let without_gpc = every_source_except("gpc");
+        let state = assemble_permissions_with(
+            &consent,
+            GeoStatus::Located(&geo),
+            &sources_for(Some(&without_gpc)),
+        );
+        assert!(
+            !state.is_set(Permission::StoreOnDevice),
+            "dropping Global Privacy Control must not drop the US Privacy opt-out with it"
+        );
+    }
+
+    #[test]
+    fn running_no_models_leaves_the_place_baseline() {
+        let consent = ConsentContext {
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        let geo = us_ca_geo();
+        let state = assemble_permissions_with(&consent, GeoStatus::Located(&geo), &[]);
+        assert!(
+            state.is_set(Permission::StoreOnDevice),
+            "an empty list is a publisher acting on no signal at all, so only the country \
+             and region rules apply"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_resolves_to_nothing_rather_than_a_wrong_model() {
+        // Startup validation rejects this first. The check here is that if one
+        // ever reached this far it would drop out rather than match by position.
+        let named = vec!["not-a-source".to_owned(), "tcf".to_owned()];
+        let ids: Vec<&str> = sources_for(Some(&named))
+            .iter()
+            .map(|source| source.id())
+            .collect();
+        assert_eq!(ids, vec!["tcf"]);
     }
 
     // ------------------------------------------------------------------
