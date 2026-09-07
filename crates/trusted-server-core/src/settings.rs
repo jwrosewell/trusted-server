@@ -905,6 +905,68 @@ impl DeviceConfig {
     }
 }
 
+/// Which permission signal models run, and in what order.
+///
+/// Mapped from the `[permission_signal]` TOML section. Unlike the `[ec]`,
+/// `[geo]` and `[device]` selectors, which each name one provider, signals
+/// compose: a request can carry a TCF string and a Global Privacy Control
+/// header at once and both have something to say. So this names a list, and
+/// the order is the policy, because the last source with an opinion decides.
+///
+/// See `crates/trusted-server-core/src/permission_signal/README.md`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionSignalConfig {
+    /// The models to run, in order, named by the identifiers in
+    /// [`SOURCE_IDS`](crate::ec::consent::SOURCE_IDS).
+    ///
+    /// Absent means every model the build knows about, in the default order.
+    /// A publisher who does not want to act on one removes it from the list;
+    /// there is no separate switch, because a model that is not listed does not
+    /// run. An empty list runs none of them, leaving every permission at its
+    /// country and region baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<String>>,
+}
+
+impl PermissionSignalConfig {
+    /// Checks that every named model exists in this build and none is named
+    /// twice.
+    ///
+    /// Run at startup, so a typo is a refusal to boot rather than a signal that
+    /// silently stops being honored.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if a name is unknown or repeated.
+    pub fn validate_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(names) = self.sources.as_deref() else {
+            return Ok(());
+        };
+        for (position, name) in names.iter().enumerate() {
+            if !crate::ec::consent::SOURCE_IDS.contains(&name.as_str()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Permission signal source `{name}` is not available in this build. \
+                         Available sources are {}",
+                        crate::ec::consent::SOURCE_IDS.join(", ")
+                    ),
+                }));
+            }
+            if names[..position].contains(name) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Permission signal source `{name}` is named more than once in \
+                         [permission_signal] sources. Each source runs once, at one place \
+                         in the order"
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Geo / IP intelligence configuration.
 ///
 /// Mapped from the `[geo]` TOML section. Selects which provider resolves a
@@ -3010,6 +3072,10 @@ fn is_default_geo_config(value: &GeoConfig) -> bool {
     *value == GeoConfig::default()
 }
 
+fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
+    *value == PermissionSignalConfig::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3306,6 +3372,9 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "is_default_geo_config")]
     #[validate(nested)]
     pub geo: GeoConfig,
+    #[serde(default, skip_serializing_if = "is_default_permission_signal_config")]
+    #[validate(nested)]
+    pub permission_signal: PermissionSignalConfig,
 }
 
 impl Settings {
@@ -3397,6 +3466,7 @@ impl Settings {
         settings.ec.validate_provider_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
+        settings.permission_signal.validate_selection()?;
         GeoConfig::validate_permission_policy()?;
         settings
             .geo
@@ -8736,5 +8806,80 @@ formats = [{{ width = 300, height = 250 }}]
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_signal_config_tests {
+    use super::*;
+
+    fn config(sources: Option<&[&str]>) -> PermissionSignalConfig {
+        PermissionSignalConfig {
+            sources: sources.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
+        }
+    }
+
+    #[test]
+    fn no_section_is_allowed_and_means_every_model() {
+        let config = PermissionSignalConfig::default();
+        config
+            .validate_selection()
+            .expect("should accept a deployment that configures nothing");
+        assert!(
+            config.sources.is_none(),
+            "absent rather than empty, because the two mean opposite things"
+        );
+    }
+
+    #[test]
+    fn every_declared_source_is_accepted() {
+        config(Some(crate::ec::consent::SOURCE_IDS))
+            .validate_selection()
+            .expect("should accept the full list the example configuration ships");
+    }
+
+    #[test]
+    fn an_empty_list_is_accepted_as_acting_on_no_signal() {
+        config(Some(&[]))
+            .validate_selection()
+            .expect("should accept a publisher who acts on no signal at all");
+    }
+
+    #[test]
+    fn an_unknown_source_is_refused_at_startup() {
+        let error = config(Some(&["gpc", "gpq"]))
+            .validate_selection()
+            .expect_err("should refuse a name no model answers to");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("gpq"),
+            "the message should name the typo, so it can be found: {message}"
+        );
+        assert!(
+            message.contains("gpc"),
+            "and list what was available: {message}"
+        );
+    }
+
+    #[test]
+    fn naming_a_source_twice_is_refused() {
+        let error = config(Some(&["gpc", "tcf", "gpc"]))
+            .validate_selection()
+            .expect_err("should refuse a repeat, which has no meaning in an ordered list");
+        assert!(format!("{error:?}").contains("gpc"));
+    }
+
+    #[test]
+    fn the_section_round_trips_through_toml() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str(r#"sources = ["gpc", "tcf"]"#).expect("should parse the section");
+        assert_eq!(
+            parsed.sources.as_deref(),
+            Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
+            "the order written is the order read, because the order is the policy"
+        );
+        parsed
+            .validate_selection()
+            .expect("should accept two known sources");
     }
 }

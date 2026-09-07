@@ -374,7 +374,11 @@ impl EcContext {
         // signals. Downstream consumers read the stored result via
         // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
         // re-deriving it.
-        let permissions = consent::assemble_permissions(&consent, geo_status);
+        let permissions = consent::assemble_permissions_with(
+            &consent,
+            geo_status,
+            &consent::sources_for(settings.permission_signal.sources.as_deref()),
+        );
         let storage_acquisition = consent::storage_acquisition(geo_status);
         // With no provider selected nothing may create or use an identifier, so
         // the gate is closed rather than open by default.
