@@ -221,7 +221,6 @@ pull_sync_concurrency = 3
 #   "gpc",              # the Sec-GPC request header, Global Privacy Control
 #   "gpp-sale-opt-out", # a GPP US sale opt-out
 #   "us-privacy",       # a US Privacy string sale opt-out
-#   "malformed-record", # a consent record that arrived and could not be read
 #   "tcf",              # TCF v2
 # ]
 #
@@ -229,9 +228,9 @@ pull_sync_concurrency = 3
 # on Global Privacy Control can remove "gpc" and keep the GPP and US Privacy
 # opt-outs working.
 #
-# Removing "malformed-record" means a consent record that arrives unreadable
-# falls back to the country and region baseline instead of failing closed.
-# That is a real choice, so make it deliberately.
+# A consent record that arrives and cannot be read revokes, whichever models
+# are configured. That is error handling rather than a model to choose, so it
+# is not in this list and cannot be removed.
 #
 # The default order asks the signals needing no interaction before the ones
 # that follow a prompt, so a visitor who arrives with an opt-out and then

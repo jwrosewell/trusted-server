@@ -916,6 +916,60 @@ pub struct PermissionSignalConfig {
 }
 
 impl PermissionSignalConfig {
+    /// The models this configuration leaves out, in the declared order.
+    ///
+    /// Empty when nothing is configured, since that runs every model.
+    #[must_use]
+    pub fn omitted_sources(&self) -> Vec<&'static str> {
+        let Some(names) = self.sources.as_deref() else {
+            return Vec::new();
+        };
+        crate::ec::consent::SOURCE_IDS
+            .iter()
+            .copied()
+            .filter(|id| !names.iter().any(|name| name.as_str() == *id))
+            .collect()
+    }
+
+    /// Records the selection at startup, so which signals a deployment acts on
+    /// can be read from its log rather than inferred from its behavior.
+    ///
+    /// Any model left out is warned about, not merely noted. Removing one is a
+    /// deliberate choice a publisher is entitled to make, so it is not a
+    /// refusal, but a signal arriving on a request and then being ignored is
+    /// worth seeing in a log when someone asks why it had no effect.
+    pub fn log_selection(&self) {
+        let Some(names) = self.sources.as_deref() else {
+            log::info!(
+                "Permission signals: acting on every model, no [permission_signal] sources \
+                 configured"
+            );
+            return;
+        };
+
+        if names.is_empty() {
+            log::info!(
+                "Permission signals: acting on no model, [permission_signal] sources is \
+                 empty, so every permission stays at its country and region baseline"
+            );
+        } else {
+            log::info!(
+                "Permission signals: acting on {}, asked in that order",
+                names.join(", ")
+            );
+        }
+
+        let omitted = self.omitted_sources();
+        if !omitted.is_empty() {
+            log::warn!(
+                "Permission signals: not acting on {}, which are not in [permission_signal] \
+                 sources. A signal this deployment does not act on is read from the request \
+                 and then ignored",
+                omitted.join(", ")
+            );
+        }
+    }
+
     /// Checks that every named model exists in this build and none is named
     /// twice.
     ///
@@ -3450,6 +3504,7 @@ impl Settings {
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
         settings.permission_signal.validate_selection()?;
+        settings.permission_signal.log_selection();
         GeoConfig::validate_permission_policy()?;
         settings
             .geo
@@ -8758,6 +8813,46 @@ mod permission_signal_config_tests {
             .validate_selection()
             .expect_err("should refuse a repeat, which has no meaning in an ordered list");
         assert!(format!("{error:?}").contains("gpc"));
+    }
+
+    #[test]
+    fn only_models_a_publisher_chooses_to_act_on_are_listed() {
+        // A malformed consent record fails closed whatever is configured, so it
+        // is deliberately not among the names. It is what happens when a signal
+        // arrives unreadable, not a signal anyone elects to honor.
+        assert!(
+            !crate::ec::consent::SOURCE_IDS.contains(&"malformed-record"),
+            "error handling must not be listed as though it were a signalling model"
+        );
+    }
+
+    #[test]
+    fn configuring_nothing_omits_nothing() {
+        assert!(
+            PermissionSignalConfig::default()
+                .omitted_sources()
+                .is_empty(),
+            "no section runs every model, so nothing is left out to report"
+        );
+    }
+
+    #[test]
+    fn a_dropped_model_is_reported_as_omitted() {
+        let omitted = config(Some(&["gpc", "tcf"])).omitted_sources();
+        assert_eq!(
+            omitted,
+            vec!["gpp-sale-opt-out", "us-privacy"],
+            "what the log names has to be what was actually left out"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_omits_every_model() {
+        assert_eq!(
+            config(Some(&[])).omitted_sources().len(),
+            crate::ec::consent::SOURCE_IDS.len(),
+            "acting on no signal leaves every model out, and the log says so"
+        );
     }
 
     #[test]
