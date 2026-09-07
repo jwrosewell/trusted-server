@@ -710,7 +710,7 @@ impl PermissionMaps {
         &self,
         country: Option<&str>,
         region: Option<&str>,
-        signal: impl Fn(Permission) -> ConsentSignal,
+        signal: impl Fn(Permission, Acquisition) -> ConsentSignal,
     ) -> PermissionState {
         Self::resolve_rules(self.rules_or_default(country, region), signal)
     }
@@ -723,7 +723,9 @@ impl PermissionMaps {
     /// must not paper over, so nothing is set unless the session's signals
     /// grant it.
     #[must_use]
-    pub fn floor_with(signal: impl Fn(Permission) -> ConsentSignal) -> PermissionState {
+    pub fn floor_with(
+        signal: impl Fn(Permission, Acquisition) -> ConsentSignal,
+    ) -> PermissionState {
         Self::resolve_rules(None, signal)
     }
 
@@ -731,20 +733,24 @@ impl PermissionMaps {
     /// when no rules resolved.
     fn resolve_rules(
         rules: Option<&CountryRules>,
-        signal: impl Fn(Permission) -> ConsentSignal,
+        signal: impl Fn(Permission, Acquisition) -> ConsentSignal,
     ) -> PermissionState {
         let acquisition =
             |permission| rules.map_or(Acquisition::RequiresSignal, |r| r.rule_for(permission));
         let set = Permission::all()
-            .filter(
-                |&permission| match (acquisition(permission), signal(permission)) {
+            .filter(|&permission| {
+                // The baseline is passed to the signal as well as applied to
+                // its answer, because a source amends the place rules and
+                // cannot amend what it cannot see.
+                let baseline = acquisition(permission);
+                match (baseline, signal(permission, baseline)) {
                     (Acquisition::Denied, _) => false,
                     (Acquisition::Granted, ConsentSignal::Revoke) => false,
                     (Acquisition::Granted, _) => true,
                     (Acquisition::RequiresSignal, ConsentSignal::Grant) => true,
                     (Acquisition::RequiresSignal, _) => false,
-                },
-            )
+                }
+            })
             .collect();
         PermissionState { set }
     }
@@ -757,7 +763,7 @@ impl PermissionMaps {
     /// and is what a request resolves to when no signal is present.
     #[must_use]
     pub fn baseline(&self, country: Option<&str>, region: Option<&str>) -> PermissionState {
-        self.resolve_with(country, region, |_| ConsentSignal::Neutral)
+        self.resolve_with(country, region, |_, _| ConsentSignal::Neutral)
     }
 
     /// Convenience over [`resolve_with`](Self::resolve_with) for a boolean
@@ -769,7 +775,7 @@ impl PermissionMaps {
         country: Option<&str>,
         signal: impl Fn(Permission) -> bool,
     ) -> PermissionState {
-        self.resolve_with(country, None, |permission| {
+        self.resolve_with(country, None, |permission, _| {
             if signal(permission) {
                 ConsentSignal::Grant
             } else {
@@ -1434,7 +1440,7 @@ mod tests {
             "the top node grants storage, or this test proves nothing"
         );
         assert!(
-            !PermissionMaps::floor_with(|_| ConsentSignal::Neutral)
+            !PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral)
                 .is_set(Permission::StoreOnDevice),
             "the floor must not fall back to the top node"
         );
@@ -1626,7 +1632,7 @@ mod tests {
                 .is_set(Permission::StoreOnDevice),
             "the US baseline should set necessary.operations.storage"
         );
-        let revoked = maps.resolve_with(Some("US"), None, |p| {
+        let revoked = maps.resolve_with(Some("US"), None, |p, _| {
             if p == Permission::StoreOnDevice {
                 ConsentSignal::Revoke
             } else {
@@ -1708,7 +1714,7 @@ rules:
         // so it is not set even when a signal grants it.
         assert!(
             !maps
-                .resolve_with(Some("US"), Some("CA"), |_| ConsentSignal::Grant)
+                .resolve_with(Some("US"), Some("CA"), |_, _| ConsentSignal::Grant)
                 .is_set(Permission::SelectBasicAds),
             "the permissions map denies advertising_marketing.first_party.contextual even when a signal grants it"
         );

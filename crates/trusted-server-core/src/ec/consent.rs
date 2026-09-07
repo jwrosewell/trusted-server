@@ -12,7 +12,7 @@ use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
 use std::sync::Arc;
 
-use crate::consent::source::{PermissionSignalSource, SignalInput};
+use crate::permission_signal::{PermissionSignalSource, SignalInput};
 use crate::permissions::{
     Acquisition, ConsentSignal, OptOutSource, Permission, PermissionMaps, PermissionState,
     SignalPolicy,
@@ -136,52 +136,38 @@ pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
 /// only decodes the request and applies that policy, so no signal-to-permission
 /// policy lives in the code.
 ///
-/// It considers every source the policy names: a TCF record (a standalone TC
-/// string or the EU TCF section of a GPP string), and the US-style opt-out
-/// signals (GPC, a GPP sale opt-out, or a US Privacy opt-out). Precedence is
-/// most-restrictive-first and is fixed in code, not policy:
+/// The models it asks are the ones core supplies (see [`builtin_sources`]),
+/// each of which amends what the ones before it settled on. The order is the
+/// policy, and [`combine`] documents why. This function only assembles the
+/// list and hands each source the request.
 ///
-/// 1. A US-style opt-out revokes the Data Uses the policy lists, even when a
-///    TCF record consents. An opt-out is an explicit user signal, so no other
-///    signal may override it.
-/// 2. A consent record that is present but cannot be decoded revokes
-///    everything, so an unreadable expression of preference fails closed
-///    instead of degrading to the no-signal baseline.
-/// 3. When the policy marks TCF authoritative, a present TCF record then
-///    decides the mapped Data Uses: granted where the record consents to the
-///    mapped purpose, revoked where it does not, and neutral where no purpose
-///    is mapped. The `authoritative` flag governs only whether TCF grants and
-///    revokes apply, never whether an opt-out may be overridden.
+/// Whether an amendment changes anything is then decided by the country/region
+/// map, which drops a `granted` baseline on a `Revoke` and has nothing to drop
+/// where the permission is `requires_signal` or `denied`.
 ///
-/// Whether a `Revoke` changes anything is decided by the country/region map,
-/// which drops a `granted` baseline and has nothing to drop where the
-/// permission is `requires_signal` or `denied`.
+/// [`combine`]: crate::permission_signal::combine
 fn permission_signal<'a>(
     consent: &'a ConsentContext,
     signals: &'a SignalPolicy,
-) -> impl Fn(Permission) -> ConsentSignal + 'a {
+) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
     let sources = builtin_sources();
-    move |permission| {
-        let input = SignalInput {
-            consent,
-            policy: signals,
-        };
-        crate::consent::source::combine(&sources, permission, &input)
+    move |permission, baseline| {
+        crate::permission_signal::combine(&sources, permission, consent, signals, baseline)
     }
 }
 
 /// The signal models core supplies itself.
 ///
-/// These four were decoded inline until the seam existed. They are the same
-/// rules, moved behind [`PermissionSignalSource`] so a fifth model can be added
-/// by a module instead of by editing core. A deployment that configures nothing
-/// gets exactly these, in this order, which is why the refactor is invisible.
+/// These were decoded inline until the seam existed. They are the same rules,
+/// moved behind [`PermissionSignalSource`] so a further model can be added by a
+/// module instead of by editing core.
 ///
-/// The order does not decide the outcome, because [`combine`] lets a refusal
-/// win wherever it appears. It is kept as it was for readability.
+/// The order runs the signals needing no interaction before the ones following
+/// a prompt, so a visitor who arrives with an opt-out and then answers a prompt
+/// has their answer applied. A deployment wanting the opposite puts the opt-out
+/// source last.
 ///
-/// [`combine`]: crate::consent::source::combine
-/// [`PermissionSignalSource`]: crate::consent::source::PermissionSignalSource
+/// [`PermissionSignalSource`]: crate::permission_signal::PermissionSignalSource
 fn builtin_sources() -> Vec<Arc<dyn PermissionSignalSource>> {
     vec![
         Arc::new(UsOptOutSource),
@@ -401,15 +387,24 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Opt-out precedence pinning tests. These reinstate the behavior the
-    // consent module enforced before the permission model: an explicit
-    // opt-out signal suppresses storage and sharing even when a TCF record
-    // consents. The permission model must never let a CMP-written record
-    // override the visitor's own opt-out.
+    // Opt-out and prompt precedence.
+    //
+    // These replace an earlier set asserting the opposite, that an opt-out
+    // suppressed storage and sharing whatever else the request carried. The
+    // sources are now asked in order and each amends what the ones before it
+    // settled, so a later source can amend an opt-out.
+    //
+    // The default order asks the signals needing no interaction first and the
+    // ones following a prompt after, which is why a visitor who arrives with
+    // an opt-out and then answers a prompt has their answer applied. A
+    // deployment wanting the opposite puts the opt-out source last.
+    //
+    // The layering, the configuration and what a source may consult are in
+    // crates/trusted-server-core/src/permission_signal/README.md.
     // ------------------------------------------------------------------
 
     #[test]
-    fn gpc_suppresses_storage_even_with_a_consenting_tcf_record() {
+    fn a_prompt_answer_applies_over_a_gpc_signal() {
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             gpc: true,
@@ -418,14 +413,14 @@ mod tests {
         let geo = us_ca_geo();
         let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "GPC should suppress storage and sharing even when the TCF record consents"
+            state.is_set(Permission::StoreOnDevice),
+            "the visitor answered a prompt after arriving with GPC set, and under the \
+             default order the answer they gave is applied over the header they sent"
         );
     }
 
     #[test]
-    fn us_privacy_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
+    fn a_prompt_answer_applies_over_a_us_privacy_opt_out_signal() {
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             us_privacy: Some(crate::consent::types::UsPrivacy {
@@ -439,14 +434,14 @@ mod tests {
         let geo = us_ca_geo();
         let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "a US Privacy opt-out should suppress storage and sharing even when the TCF record consents"
+            state.is_set(Permission::StoreOnDevice),
+            "the visitor answered a prompt after arriving with a US Privacy opt-out, and under the \
+             default order the answer they gave amends the signal they sent"
         );
     }
 
     #[test]
-    fn gpp_sale_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
+    fn a_prompt_answer_applies_over_a_gpp_sale_opt_out_signal() {
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             gpp: Some(crate::consent::types::GppConsent {
@@ -460,9 +455,9 @@ mod tests {
         let geo = us_ca_geo();
         let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
-            !state.is_set(Permission::StoreOnDevice)
-                && !state.is_set(Permission::SelectPersonalisedAds),
-            "a GPP sale opt-out should suppress storage and sharing even when the TCF record consents"
+            state.is_set(Permission::StoreOnDevice),
+            "the visitor answered a prompt after arriving with a GPP sale opt-out, and under the \
+             default order the answer they gave amends the signal they sent"
         );
     }
 

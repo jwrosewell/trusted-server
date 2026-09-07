@@ -56,6 +56,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;
+pub mod permission_signal;
 pub mod permissions;
 pub mod platform;
 pub mod price_bucket;
