@@ -2,8 +2,10 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::ec_kv::{AxumEcKvStore, ec_identity_path};
+use crate::platform::init_kv_store;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -79,16 +81,60 @@ pub struct AppState {
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
+/// Opens the persistent key-value store here rather than in `main`, so that a
+/// store that cannot be opened fails the same way a missing identity store
+/// already does: [`TrustedServerApp::routes`] turns the error into
+/// [`startup_error_router`] and the process stays up answering every route with
+/// it. In a container that is the more useful failure, because the healthcheck
+/// then reports unhealthy, an orchestrator stops routing to it and an operator
+/// can read the logs. Exiting instead restart-loops under
+/// `restart: unless-stopped` and takes the logs with each restart.
+///
+/// This is the production path only. `routes_with_registrations` reaches
+/// [`build_state_with_registrations`] directly, so tests neither open the store
+/// nor contend on its exclusive file lock.
+///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when settings, the key-value store, the auction
+/// orchestrator, or the integration registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
     let settings =
         get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
-    build_state_with_settings(settings)
+    let kv_path = init_kv_store(&EnvConfig::from_env())?;
+    log::info!("KV store opened at {}", kv_path.display());
+    build_state_with_registrations(settings, &vendor_builders(), &[])
+}
+
+/// The vendor modules this adapter compiles in and offers to a deployment.
+///
+/// The adapter is the composition root, so a vendor crate is reachable only if
+/// this list carries its builder. A crate that compiles, whose own tests pass,
+/// and that nothing hands to the registry is a provider no deployment can
+/// select, and the selector then fails at startup naming a module that is
+/// physically present in the binary.
+///
+/// Offering a module is not enabling it. Every builder here reads its own
+/// `[integrations.<id>]` block and declares nothing when the deployment has
+/// written none, so a configuration that names no vendor behaves exactly as it
+/// did before the crate was linked in.
+fn vendor_builders() -> Vec<IntegrationBuilder> {
+    vec![trusted_server_geo_51degrees::builder()]
+}
+
+/// The ids of the vendor modules [`vendor_builders`] offers.
+///
+/// Exposed so a test can assert that the shipped binary really offers a
+/// module, which is a different question from whether a test that supplies the
+/// builder itself can select one.
+#[must_use]
+pub fn vendor_builder_ids() -> Vec<&'static str> {
+    vendor_builders()
+        .iter()
+        .map(IntegrationBuilder::id)
+        .collect()
 }
 
 /// Build the application state from explicit settings.
@@ -123,22 +169,25 @@ pub fn build_state_with_registrations(
     integrations: &[IntegrationBuilder],
     auction_providers: &[AuctionProviderBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+
     // Composition root: reject a provider selection this adapter can never
-    // supply, once, before any request is served. The Axum dev server injects
-    // no Edge Cookie provider into `RuntimeServices`, so `None` is exactly what
-    // `EcContext` sees per request; pass the injected provider here as well
-    // once this adapter supplies one.
+    // supply, once, before any request is served.
+    //
+    // The registry is built first because the check has to be asked the same
+    // question the request path answers. `build_per_request_services` injects
+    // the module-supplied provider into `RuntimeServices`, so passing `None`
+    // here refused every module-supplied Edge Cookie provider at start-up while
+    // the request path would have used it perfectly well. That was the state of
+    // this adapter until a vendor module first supplied one.
     //
     // This adapter checks rather than keeps what the check resolved, unlike the
     // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
     // whose application state is built once at start-up while theirs is rebuilt
-    // for every request. It injects and threads no provider, so `EcContext`
-    // resolves the selection itself on every request, building a fresh built-in
-    // provider that reads no request data. It supplies no host signals either,
-    // so the host-signals argument is `None`.
-    ensure_provider_available(&settings.ec, None, None)?;
-    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
-    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+    // for every request. It supplies no host signals, so that argument is
+    // `None`.
+    ensure_provider_available(&settings.ec, None, registry.ec_provider())?;
     let ec_identity_graph = open_ec_identity_graph(&settings)?;
 
     Ok(Arc::new(AppState {

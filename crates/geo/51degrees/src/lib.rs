@@ -35,34 +35,47 @@
 //! provider leaves the region unset and says so once per process. Populating
 //! it needs a name-to-code mapping that nothing here owns yet.
 
+pub mod client;
+pub mod device;
+pub mod head;
+pub mod identity;
+pub mod verify;
+
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt as _};
+use error_stack::Report;
 use serde::{Deserialize, Serialize};
+use trusted_server_core::ec::provider::EcProviderSelection;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
-use trusted_server_core::platform::{
-    GeoInfo, PlatformBackendSpec, PlatformError, PlatformGeo, PlatformHttpRequest, RuntimeServices,
-};
+use trusted_server_core::platform::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::Settings;
 use validator::Validate;
 
-/// Identifier for this provider, used as the `[geo] provider` selector value
-/// and as the backend discriminator.
-pub const GEO_PROVIDER_ID: &str = "fiftyone_degrees";
+use crate::client::CloudClient;
+use crate::device::FiftyOneDegreesDevice;
+use crate::head::FiftyOneDegreesHeadInjector;
+use crate::identity::FiftyOneDegreesIdentity;
+
+/// Identifier for this vendor's module.
+///
+/// One module supplies more than one provider, so this is the value a
+/// deployment writes for **both** `[geo] provider` and `[device] provider`,
+/// and it names the `[integrations.fiftyone_degrees]` configuration block they
+/// share.
+pub const PROVIDER_ID: &str = "fiftyone_degrees";
+
+/// Kept as the name the geo selector was introduced under.
+pub const GEO_PROVIDER_ID: &str = PROVIDER_ID;
+
+/// Folded into the dynamic backend name, so this crate's calls are not
+/// confused with another caller's to the same host.
+pub(crate) const BACKEND_DISCRIMINATOR: &str = PROVIDER_ID;
 
 /// The value the service uses for a property it could not determine.
 const UNKNOWN: &str = "Unknown";
-
-/// Cap on the response body read from the service.
-///
-/// The `areas` property alone is a multipolygon that runs to tens of
-/// kilobytes, so this is generous rather than tight. It exists so a wrong
-/// endpoint cannot grow the process heap without bound.
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Said once per process, not once per request, because the region gap is a
 /// property of the integration rather than of any one visitor.
@@ -85,6 +98,29 @@ pub struct FiftyOneDegreesGeoConfig {
     /// `https://cloud.example.com/api/v4/<resource key>.json`. Both are just a
     /// URL to this provider, which is why there is no separate key setting to
     /// get wrong or to leak into a log.
+    ///
+    /// # Restrict the key to your domains
+    ///
+    /// A resource key is created in the 51Degrees configurator, which lets you
+    /// name the domains it may be used from. A key created without that list
+    /// works from anywhere, so anyone who reads it can spend your allowance
+    /// against your account.
+    ///
+    /// The restriction is checked against the origin the request declares,
+    /// which a browser sends of its own accord, so a restricted key read out of
+    /// a page is not usable from anywhere else without deliberately stripping
+    /// that header. A key with no domain list has nothing to check.
+    ///
+    /// **Name your domains for any key used in production.** It costs nothing,
+    /// and it is the difference between a key that is merely visible and a key
+    /// that is usable. Client-side deployment makes this sharper, because
+    /// viewing source reveals the key, but a key in server configuration
+    /// reaches a log or a screen share often enough to be worth restricting
+    /// either way.
+    ///
+    /// A server-to-server call sends no origin of its own, so the caller has to
+    /// present one for a restricted key to work. The 51Degrees cloud request
+    /// engine does this through its configured cloud request origin.
     #[validate(url)]
     pub endpoint: String,
 
@@ -95,6 +131,52 @@ pub struct FiftyOneDegreesGeoConfig {
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1, max = 10_000))]
     pub timeout_ms: u32,
+
+    /// Whether to ask the service for a 51Degrees identifier as well.
+    ///
+    /// Off by default, because asking for an identifier is a different act
+    /// from asking where a request came from and should be a deployment's
+    /// decision rather than a side effect of turning geo on. Switching it on
+    /// adds two parameters to the same call and costs no extra round trip.
+    #[serde(default)]
+    pub identity: bool,
+
+    /// Whether to ask the browser to retry the first navigation carrying its
+    /// client hints, by sending `Critical-CH`.
+    ///
+    /// **On by default.** Without it the first page view of a session is served
+    /// blind, with the hints arriving only in time for the second, so the first
+    /// auction of every session is priced on a User-Agent alone. With it the
+    /// browser reissues the navigation and the first page is priced properly.
+    /// The cost is one extra origin fetch at the start of a session, paid once.
+    ///
+    /// # Why this cannot loop
+    ///
+    /// The retry is bounded by the hints, not by anything this crate does. A
+    /// browser retries only when the named hints were absent from the request,
+    /// and the retried request carries them, so the second response satisfies
+    /// the check and is rendered. A browser that does not support client hints
+    /// at all ignores the header rather than retrying forever.
+    ///
+    /// Set to `false` on a deployment that would rather serve the first page
+    /// immediately and accept a worse first auction.
+    #[serde(default = "default_critical_client_hints")]
+    pub critical_client_hints: bool,
+
+    /// Whether to verify the signature on a 51Did before accepting it.
+    ///
+    /// On by default. An identifier arrives either from the browser, at the
+    /// resolve endpoint, or in a cookie the browser sends, and both are values
+    /// anyone can produce. One taken on trust could be another visitor's, which
+    /// would key this visitor into that person's row in the identity graph.
+    ///
+    /// The cost is one outbound call per signer to fetch a public key, made
+    /// rarely and cached. Turning it off leaves only a shape check, which
+    /// answers "this looks like base64 of about the right length" and nothing
+    /// more, so it is for a deployment that has a reason rather than a default
+    /// worth taking.
+    #[serde(default = "default_verify_signatures")]
+    pub verify_signatures: bool,
 }
 
 impl trusted_server_core::settings::IntegrationConfig for FiftyOneDegreesGeoConfig {
@@ -107,6 +189,14 @@ const fn default_enabled() -> bool {
     true
 }
 
+const fn default_critical_client_hints() -> bool {
+    true
+}
+
+const fn default_verify_signatures() -> bool {
+    true
+}
+
 const fn default_timeout_ms() -> u32 {
     500
 }
@@ -116,7 +206,7 @@ const fn default_timeout_ms() -> u32 {
 /// Rejects the empty string and the service's own `Unknown` spelling, which is
 /// a present-looking value that means absent.
 #[must_use]
-fn usable(value: Option<&str>) -> Option<&str> {
+pub(crate) fn usable(value: Option<&str>) -> Option<&str> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(UNKNOWN))
@@ -160,9 +250,13 @@ pub fn geo_from_response(body: &serde_json::Value) -> Option<GeoInfo> {
             .unwrap_or_default()
             .to_owned(),
         country,
-        continent: usable(ip_string(body, "continent"))
-            .unwrap_or_default()
-            .to_owned(),
+        // Never resolved, because the service has no continent property.
+        // Established against the live service rather than assumed: asking for
+        // `ip.Continent` returns an empty `ip` element, exactly as asking for a
+        // property that does not exist does, while `ip.CountryCode` comes back
+        // with its value and its null reason. Reading a key that can never be
+        // present would be a field that looks supported and is always empty.
+        continent: String::new(),
         latitude: ip_number(body, "latitude").unwrap_or_default(),
         longitude: ip_number(body, "longitude").unwrap_or_default(),
         metro_code: 0,
@@ -174,59 +268,16 @@ pub fn geo_from_response(body: &serde_json::Value) -> Option<GeoInfo> {
 /// Geo provider backed by a 51Degrees cloud service.
 #[derive(Debug)]
 pub struct FiftyOneDegreesGeo {
-    config: FiftyOneDegreesGeoConfig,
+    enabled: bool,
+    client: Arc<CloudClient>,
 }
 
 impl FiftyOneDegreesGeo {
-    /// Creates a provider from its configuration.
+    /// Creates a provider sharing one client, and so one call, with the other
+    /// providers this crate supplies.
     #[must_use]
-    pub const fn new(config: FiftyOneDegreesGeoConfig) -> Self {
-        Self { config }
-    }
-
-    /// Builds the request URL for one client address.
-    ///
-    /// The evidence goes in as the plain `client-ip` query parameter. It is
-    /// **not** `query.client-ip`: in the 51Degrees convention `query.` names
-    /// where a piece of evidence came from, and the parameter itself carries
-    /// no prefix. Sending the prefixed form is accepted and silently ignored,
-    /// and the answer then describes whoever opened the connection, which over
-    /// loopback is this machine. That mistake is invisible in testing because
-    /// a wrong answer looks exactly like a right one.
-    fn request_url(&self, client_ip: IpAddr) -> Result<String, Report<PlatformError>> {
-        let mut url = url::Url::parse(&self.config.endpoint)
-            .change_context(PlatformError::Geo)
-            .attach_with(|| format!("endpoint is not a URL: {}", self.config.endpoint))?;
-        url.query_pairs_mut()
-            .append_pair("client-ip", &client_ip.to_string());
-        Ok(url.into())
-    }
-
-    /// Builds the backend registration for the configured endpoint.
-    ///
-    /// Core has an internal helper that does this for its own integrations,
-    /// but it is crate-private, so a vendor crate outside core builds the spec
-    /// itself. The discriminator keeps this provider's dynamic backend
-    /// distinct from any other caller that happens to target the same host.
-    fn backend_spec(&self) -> Result<PlatformBackendSpec, Report<PlatformError>> {
-        let parsed = url::Url::parse(&self.config.endpoint)
-            .change_context(PlatformError::Geo)
-            .attach_with(|| format!("endpoint is not a URL: {}", self.config.endpoint))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| Report::new(PlatformError::Geo).attach("endpoint has no host"))?
-            .to_owned();
-        let timeout = core::time::Duration::from_millis(u64::from(self.config.timeout_ms));
-        Ok(PlatformBackendSpec {
-            scheme: parsed.scheme().to_owned(),
-            host,
-            port: parsed.port(),
-            host_header_override: None,
-            certificate_check: true,
-            first_byte_timeout: timeout,
-            between_bytes_timeout: timeout,
-            discriminator: Some(GEO_PROVIDER_ID.to_owned()),
-        })
+    pub const fn new(enabled: bool, client: Arc<CloudClient>) -> Self {
+        Self { enabled, client }
     }
 }
 
@@ -237,7 +288,7 @@ impl PlatformGeo for FiftyOneDegreesGeo {
         client_ip: Option<IpAddr>,
         services: &RuntimeServices,
     ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        if !self.config.enabled {
+        if !self.enabled {
             return Ok(None);
         }
 
@@ -247,47 +298,11 @@ impl PlatformGeo for FiftyOneDegreesGeo {
             return Ok(None);
         };
 
-        let url = self.request_url(client_ip)?;
-        let request = http::Request::builder()
-            .method(http::Method::GET)
-            .uri(&url)
-            .header(http::header::ACCEPT, "application/json")
-            .body(EdgeBody::empty())
-            .change_context(PlatformError::Geo)
-            .attach("could not build the geo request")?;
-
-        let backend = services
-            .backend()
-            .ensure(&self.backend_spec()?)
-            .change_context(PlatformError::Geo)
-            .attach("could not resolve a backend for the geo endpoint")?;
-
-        let response = services
-            .http_client()
-            .send(PlatformHttpRequest::new(request, backend))
-            .await
-            .change_context(PlatformError::Geo)
-            .attach("the geo service did not answer")?;
-
-        let status = response.response.status();
-        if !status.is_success() {
-            return Err(Report::new(PlatformError::Geo)
-                .attach(format!("the geo service answered {status}")));
-        }
-
-        let bytes = response
-            .response
-            .into_body()
-            .into_bytes_bounded(MAX_RESPONSE_BYTES)
-            .await
-            .change_context(PlatformError::Geo)
-            .attach("could not read the geo response body")?;
-
-        let body: serde_json::Value = serde_json::from_slice(&bytes)
-            .change_context(PlatformError::Geo)
-            .attach("the geo service did not return JSON")?;
-
-        Ok(geo_from_response(&body))
+        // Only the `ip` element of this answer describes the address. See
+        // `CloudClient::answer_for_address`, which explains why an entry made
+        // for a different `User-Agent` is still the right answer here.
+        let answer = self.client.answer_for_address(client_ip, services).await?;
+        Ok(geo_from_response(answer.body()))
     }
 }
 
@@ -298,11 +313,36 @@ impl PlatformGeo for FiftyOneDegreesGeo {
 /// Where this module came from, reported when two modules claim one id.
 const SOURCE: &str = "trusted-server-geo-51degrees";
 
+/// Whether any selected provider actually reads client hints.
+///
+/// Only the device and identity providers do. The device answer is a statement
+/// about the hardware and the browser, which is what a hint carries, and the
+/// identifier is derived from that same evidence. Geo resolves a country from
+/// the client address, and no client hint says anything about where a request
+/// came from, so a deployment running geo alone gains nothing from the
+/// delegation and should not have a meta tag in every page for it.
+///
+/// This gates the markup. The `Accept-CH` and `Critical-CH` headers are gated
+/// separately and more narrowly, because the only seam that reaches a response
+/// header belongs to the identity provider: a deployment selecting the device
+/// provider without the identity provider gets the delegation tag and no
+/// headers. The tag is the part that matters, since delegation in the markup
+/// carries the hints on the very first request with no round trip, but the
+/// asymmetry is real and worth knowing.
+fn client_hints_are_read(settings: &Settings) -> bool {
+    let device_selects_us = settings.device.provider.as_deref() == Some(PROVIDER_ID);
+    let identity_selects_us = matches!(
+        settings.ec.provider.as_ref(),
+        Some(EcProviderSelection::Named(key)) if key == PROVIDER_ID
+    );
+    device_selects_us || identity_selects_us
+}
+
 /// Reads this provider's configuration block, when the deployment has one.
 fn read_config(
     settings: &Settings,
 ) -> Result<Option<FiftyOneDegreesGeoConfig>, Report<TrustedServerError>> {
-    settings.integration_config::<FiftyOneDegreesGeoConfig>(GEO_PROVIDER_ID)
+    settings.integration_config::<FiftyOneDegreesGeoConfig>(PROVIDER_ID)
 }
 
 /// Declares the geo provider so `[geo] provider` can select it.
@@ -317,9 +357,35 @@ pub fn register(
     let Some(config) = read_config(settings)? else {
         return Ok(None);
     };
+    // One client, so the geo and device providers of a single request share
+    // one call rather than making one each.
+    let client = Arc::new(CloudClient::new(
+        config.endpoint.clone(),
+        config.timeout_ms,
+        config.identity,
+    ));
+    let mut builder = IntegrationRegistration::builder(PROVIDER_ID);
+    if client_hints_are_read(settings) {
+        // The client hint delegation. It has to be in the served markup,
+        // because a browser ignores a Delegate-CH meta tag that JavaScript
+        // added, so no script in the page can do this and a publisher cannot
+        // do it with a tag manager either.
+        builder = builder
+            .with_head_injector(Arc::new(FiftyOneDegreesHeadInjector::new(&config.endpoint)));
+    }
+
     Ok(Some(
-        IntegrationRegistration::builder(GEO_PROVIDER_ID)
-            .with_geo_provider(Arc::new(FiftyOneDegreesGeo::new(config)))
+        builder
+            .with_geo_provider(Arc::new(FiftyOneDegreesGeo::new(
+                config.enabled,
+                Arc::clone(&client),
+            )))
+            .with_device_provider(Arc::new(FiftyOneDegreesDevice::new(Arc::clone(&client))))
+            .with_ec_provider(Arc::new(FiftyOneDegreesIdentity::new(
+                client,
+                config.critical_client_hints,
+                config.verify_signatures,
+            )))
             .build(),
     ))
 }
@@ -338,7 +404,7 @@ pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>>
 /// The builder an adapter passes to `build_state_with_registrations`.
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
-    IntegrationBuilder::new(GEO_PROVIDER_ID, SOURCE, register, validate)
+    IntegrationBuilder::new(PROVIDER_ID, SOURCE, register, validate)
 }
 
 #[cfg(test)]
@@ -366,6 +432,62 @@ mod tests {
     }
 
     #[test]
+    fn signature_verification_is_on_unless_a_deployment_turns_it_off() {
+        // The default decides what a deployment that says nothing gets, and an
+        // identifier accepted without a signature check could be another
+        // visitor's, so this is asserted rather than left to the attribute.
+        let configured: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json"
+        }))
+        .expect("should read a configuration naming only the endpoint");
+
+        assert!(configured.verify_signatures);
+
+        let switched_off: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json",
+            "verify_signatures": false
+        }))
+        .expect("should read the switch");
+
+        assert!(!switched_off.verify_signatures);
+    }
+
+    #[test]
+    fn critical_client_hints_is_on_unless_a_deployment_turns_it_off() {
+        // The default decides what every deployment that says nothing gets, so
+        // it is asserted rather than left to the serde attribute.
+        let configured: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json"
+        }))
+        .expect("should read a configuration naming only the endpoint");
+
+        assert!(
+            configured.critical_client_hints,
+            "without it the first page view of a session is priced on a User-Agent alone"
+        );
+
+        let switched_off: FiftyOneDegreesGeoConfig = serde_json::from_value(json!({
+            "endpoint": "https://cloud.example.com/api/v4/json",
+            "critical_client_hints": false
+        }))
+        .expect("should read the switch");
+
+        assert!(!switched_off.critical_client_hints);
+    }
+
+    #[test]
+    fn the_continent_is_never_claimed() {
+        let body = json!({"ip": {"countrycode": "GB", "continent": "Europe"}});
+
+        let info = geo_from_response(&body).expect("should resolve the country");
+
+        assert!(
+            info.continent.is_empty(),
+            "the service has no continent property, so a value under that name did not              come from IP intelligence and must not be presented as though it had"
+        );
+    }
+
+    #[test]
     fn a_region_name_is_never_written_into_the_iso_code_field() {
         let body = json!({"ip": {"countrycode": "GB", "region": "England"}});
 
@@ -381,13 +503,17 @@ mod tests {
         let body = json!({"ip": {
             "countrycode": "GB",
             "town": "Unknown",
-            "continent": "unknown",
         }});
 
         let geo = geo_from_response(&body).expect("a country should resolve a location");
         assert_eq!(geo.city, "", "should not report `Unknown` as a town");
+
+        // Lower case too, because the check is on the spelling and not on the
+        // exact string the service happened to send when it was written.
+        let lower = json!({"ip": {"countrycode": "GB", "town": "unknown"}});
+        let geo = geo_from_response(&lower).expect("a country should resolve a location");
         assert_eq!(
-            geo.continent, "",
+            geo.city, "",
             "should reject the unknown spelling whatever its case"
         );
     }
@@ -508,23 +634,28 @@ mod tests {
 
     #[test]
     fn the_evidence_parameter_is_unprefixed() {
-        let provider = FiftyOneDegreesGeo::new(FiftyOneDegreesGeoConfig {
-            enabled: true,
-            endpoint: "http://127.0.0.1:8080/api/v4/json".to_owned(),
-            timeout_ms: 500,
-        });
+        let client = CloudClient::new(
+            "https://cloud.example.com/api/v4/json".to_owned(),
+            500,
+            false,
+        );
 
-        let url = provider
-            .request_url("2.125.160.216".parse().expect("should parse the address"))
-            .expect("should build a URL");
+        let url = client
+            .request_url(&crate::client::Evidence {
+                client_ip: "2.125.160.216".to_owned(),
+                user_agent: "Mozilla/5.0".to_owned(),
+                usage: None,
+                browser: Vec::new(),
+            })
+            .expect("should build the request URL");
 
         assert!(
             url.contains("client-ip=2.125.160.216"),
-            "the parameter is the bare evidence name, got {url}"
+            "the bare evidence name is what the service reads, got {url}"
         );
         assert!(
             !url.contains("query.client-ip"),
-            "the prefixed form is accepted and ignored, so the answer would describe the caller"
+            "the prefixed form is accepted and ignored, and the answer then describes              this machine rather than the visitor, which looks identical to success"
         );
     }
 }

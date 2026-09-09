@@ -1933,6 +1933,18 @@ impl PrebidAuctionProvider {
                 // Clone needed: `language` is also used in the `or_else`
                 // fallback below when `request.device` is `None`.
                 language: language.clone(),
+                // Attributes a device provider resolved. Each is `None` when
+                // nothing resolved it, and an absent field is what a bidder
+                // expects for something unknown. Without these the object
+                // carries a user agent and an address, and a bidder prices
+                // the inventory on a string it has to parse itself.
+                devicetype: d.attributes.as_ref().and_then(|a| a.device_type),
+                make: d.attributes.as_ref().and_then(|a| a.make.clone()),
+                model: d.attributes.as_ref().and_then(|a| a.model.clone()),
+                os: d.attributes.as_ref().and_then(|a| a.os.clone()),
+                osv: d.attributes.as_ref().and_then(|a| a.os_version.clone()),
+                w: d.attributes.as_ref().and_then(|a| a.screen_width),
+                h: d.attributes.as_ref().and_then(|a| a.screen_height),
                 ..Default::default()
             })
             .or_else(|| {
@@ -4347,6 +4359,7 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("test-agent".to_string()),
             ip: Some("203.0.113.42".to_string()),
             geo: None,
+            attributes: None,
         });
         let settings = make_settings();
         let request = build_test_request();
@@ -4527,6 +4540,7 @@ external_bundle_sri = "sha384-AAAA"
                 region: None,
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -4621,6 +4635,7 @@ external_bundle_sri = "sha384-AAAA"
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -4660,6 +4675,7 @@ external_bundle_sri = "sha384-AAAA"
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -4957,6 +4973,7 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -4978,6 +4995,102 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn to_openrtb_carries_resolved_device_attributes_to_the_bidder() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: None,
+            attributes: Some(crate::ec::device::DeviceAttributes {
+                device_type: Some(4),
+                make: Some("Apple".to_owned()),
+                model: Some("iPhone 15".to_owned()),
+                os: Some("iOS".to_owned()),
+                os_version: Some("17.0".to_owned()),
+                screen_width: Some(640),
+                screen_height: Some(960),
+            }),
+        });
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+        let device = openrtb.device.as_ref().expect("should have device");
+
+        assert_eq!(
+            device.devicetype,
+            Some(4),
+            "a bidder prices on the device type"
+        );
+        assert_eq!(device.make.as_deref(), Some("Apple"));
+        assert_eq!(device.model.as_deref(), Some("iPhone 15"));
+        assert_eq!(device.os.as_deref(), Some("iOS"));
+        assert_eq!(device.osv.as_deref(), Some("17.0"));
+        assert_eq!(
+            device.w,
+            Some(640),
+            "screen width decides which creative fits"
+        );
+        assert_eq!(device.h, Some(960));
+    }
+
+    #[test]
+    fn to_openrtb_omits_device_attributes_nothing_resolved() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("TestAgent".to_string()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        });
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+        let device = openrtb.device.as_ref().expect("should have device");
+
+        assert_eq!(
+            device.devicetype, None,
+            "an absent field is what a bidder expects for something unknown,              and inventing a default would misprice the inventory"
+        );
+        assert_eq!(device.make, None);
+        assert_eq!(device.w, None);
+    }
+
+    #[test]
+    fn a_device_type_name_maps_only_when_it_is_recognised() {
+        use crate::ec::device::DeviceAttributes;
+
+        assert_eq!(
+            DeviceAttributes::device_type_from_name("SmartPhone"),
+            Some(4)
+        );
+        assert_eq!(DeviceAttributes::device_type_from_name("tablet"), Some(5));
+        assert_eq!(DeviceAttributes::device_type_from_name("Desktop"), Some(2));
+        assert_eq!(
+            DeviceAttributes::device_type_from_name("Nonsense"),
+            None,
+            "a wrong device type is worse for a bidder than an absent one"
+        );
+    }
+
+    #[test]
     fn to_openrtb_sets_language_from_accept_language() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
@@ -4985,6 +5098,7 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -5018,6 +5132,7 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -5094,6 +5209,7 @@ external_bundle_sri = "sha384-AAAA"
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -5899,6 +6015,7 @@ external_bundle_sri = "sha384-AAAA"
                 user_agent: Some("test-agent".to_string()),
                 ip: None,
                 geo: None,
+                attributes: None,
             }),
             site: None,
             context: HashMap::new(),

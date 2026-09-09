@@ -733,9 +733,10 @@ pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
 ) -> RuntimeServices {
-    let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
+    let socket_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
+    let client_ip = forwarded_client_ip(ctx.request().headers()).or(socket_ip);
 
     use trusted_server_core::platform::{
         PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
@@ -781,6 +782,76 @@ pub fn build_runtime_services(
         .build()
 }
 
+/// Environment variable naming how many proxies sit in front of this
+/// appliance.
+///
+/// Unset, zero, or unparseable all mean the same thing: never read a forwarded
+/// header. That default is the safe one and it is the one a deployment gets by
+/// doing nothing.
+const TRUSTED_PROXY_HOPS: &str = "TRUSTED_SERVER_TRUSTED_PROXY_HOPS";
+
+/// The number of proxies whose `X-Forwarded-For` entries this deployment
+/// trusts, read once per process.
+fn trusted_proxy_hops() -> usize {
+    static HOPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HOPS.get_or_init(|| {
+        let hops = std::env::var(TRUSTED_PROXY_HOPS)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if hops > 0 {
+            // Said once, at the level an operator will see, because trusting a
+            // header is a security posture and not a tuning knob.
+            log::warn!(
+                "{TRUSTED_PROXY_HOPS}={hops}: the client address will be read from \
+                 X-Forwarded-For. This is only safe when exactly {hops} proxy or proxies \
+                 you control sit in front of this appliance and rewrite that header. \
+                 Reachable directly, a visitor can choose their own address, and with it \
+                 their own country and their own identity evidence."
+            );
+        }
+        hops
+    })
+}
+
+/// The client address a trusted proxy forwarded, when this deployment has said
+/// it is behind one.
+///
+/// # Why this is opt-in, and counted rather than merely present
+///
+/// `X-Forwarded-For` is a header any client can send. Reading it whenever it
+/// appears lets a visitor pick their own address, and with it their own
+/// country, their own permission jurisdiction and their own identity evidence.
+/// So this reads nothing at all unless an operator has said how many proxies
+/// are in front, and then it reads exactly that far in.
+///
+/// The header is a list appended left to right, so the rightmost entry was
+/// written by the nearest proxy and is the only one that proxy vouches for.
+/// Counting in from the right by the number of hops lands on the address the
+/// outermost trusted proxy saw. Taking the leftmost entry instead, which is the
+/// common shortcut, takes whatever the client wrote.
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    forwarded_client_ip_with_hops(headers, trusted_proxy_hops())
+}
+
+/// The forwarded address for an explicit hop count.
+///
+/// Separated from [`forwarded_client_ip`] because the hop count is read from
+/// the environment once per process, and a rule about trusting client input
+/// deserves tests that do not depend on process-wide state.
+fn forwarded_client_ip_with_hops(headers: &HeaderMap, hops: usize) -> Option<IpAddr> {
+    if hops == 0 {
+        return None;
+    }
+    let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let entries: Vec<&str> = forwarded.split(',').map(str::trim).collect();
+    // One hop trusts the rightmost entry, two hops the one before it. A header
+    // with fewer entries than there are trusted proxies did not come through
+    // those proxies, so nothing in it is vouched for.
+    let index = entries.len().checked_sub(hops)?;
+    entries.get(index)?.parse::<IpAddr>().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -788,6 +859,81 @@ pub fn build_runtime_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn forwarded(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_str(value).expect("should build the test header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn no_trusted_proxy_means_the_header_is_never_read() {
+        let headers = forwarded("2.125.160.216");
+
+        assert_eq!(
+            forwarded_client_ip_with_hops(&headers, 0),
+            None,
+            "a deployment that has said nothing must not let a visitor choose their own \
+             address, and with it their own country and their own identity evidence"
+        );
+    }
+
+    #[test]
+    fn one_trusted_proxy_reads_the_entry_that_proxy_wrote() {
+        // The client claimed to be 10.0.0.1. The proxy appended what it saw.
+        let headers = forwarded("10.0.0.1, 2.125.160.216");
+
+        assert_eq!(
+            forwarded_client_ip_with_hops(&headers, 1),
+            Some("2.125.160.216".parse().expect("should parse")),
+            "the rightmost entry is the only one the nearest proxy vouches for, and \
+             taking the leftmost would take whatever the client wrote"
+        );
+    }
+
+    #[test]
+    fn two_trusted_proxies_read_one_entry_further_in() {
+        let headers = forwarded("10.0.0.1, 2.125.160.216, 203.0.113.7");
+
+        assert_eq!(
+            forwarded_client_ip_with_hops(&headers, 2),
+            Some("2.125.160.216".parse().expect("should parse")),
+            "with two proxies in front, the outermost saw this address"
+        );
+    }
+
+    #[test]
+    fn a_header_shorter_than_the_trusted_chain_is_refused() {
+        let headers = forwarded("2.125.160.216");
+
+        assert_eq!(
+            forwarded_client_ip_with_hops(&headers, 2),
+            None,
+            "a request with fewer entries than there are trusted proxies did not come \
+             through them, so nothing in the header is vouched for"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_an_address_is_refused() {
+        let headers = forwarded("10.0.0.1, not-an-address");
+
+        assert_eq!(
+            forwarded_client_ip_with_hops(&headers, 1),
+            None,
+            "the trusted position holding something that is not an address means the \
+             chain is not what the deployment described"
+        );
+    }
+
+    #[test]
+    fn an_absent_header_resolves_nothing_even_when_a_proxy_is_trusted() {
+        assert_eq!(forwarded_client_ip_with_hops(&HeaderMap::new(), 1), None);
+    }
+
     use edgezero_core::body::Body as EdgeBody;
 
     /// The services graph a provider is handed, built the same way the request

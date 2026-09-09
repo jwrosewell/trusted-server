@@ -47,6 +47,38 @@ fn settings_with(extra: &str) -> Settings {
     .expect("should parse the test settings")
 }
 
+/// Settings that write their own `[ec]` block, which `settings_with` bakes in.
+fn settings_selecting_identity(extra: &str) -> Settings {
+    Settings::from_toml(&format!(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "geo-51degrees-test-proxy-secret"
+
+            [geo]
+            provider = "fiftyone_degrees"
+
+            [ec]
+            provider = "fiftyone_degrees"
+
+            [ec.providers.fiftyone_degrees]
+
+            [integrations.fiftyone_degrees]
+            endpoint = "http://127.0.0.1:8080/api/v4/json"
+
+            {extra}
+        "#
+    ))
+    .expect("should parse the identity test settings")
+}
+
 /// The configuration block a deployment writes to use this provider.
 ///
 /// The endpoint is the self-hosted container's documented shape, which carries
@@ -112,4 +144,330 @@ endpoint = "not-a-url"
         router.is_err(),
         "a bad endpoint must stop the deployment rather than fail on the first visitor"
     );
+}
+
+/// The same module supplies the device provider, so the device selector must
+/// reach it too.
+///
+/// Worth its own test rather than folding into the one above, because the two
+/// selectors are separate code paths and a module that supplies two providers
+/// is exactly where one of them gets forgotten. The device selector is also
+/// validated in a different place from the geo selector, so a name that works
+/// for one is not evidence about the other.
+#[test]
+fn the_device_selector_resolves_the_same_vendors_provider() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "http://127.0.0.1:8080/api/v4/json"
+"#,
+    );
+
+    let router =
+        TrustedServerApp::routes_with_registrations(settings, &[geo_51degrees::builder()], &[]);
+
+    assert!(
+        router.is_ok(),
+        "a deployment asking this vendor for device detection as well as location \
+         must be able to select both from one module: {:?}",
+        router.err()
+    );
+}
+
+#[test]
+fn naming_the_module_for_devices_without_supplying_its_builder_fails_at_startup() {
+    // No geo selector here, so the device path is tested on its own. Leaving
+    // geo unset without acknowledging it is itself refused, which is why the
+    // single-jurisdiction acknowledgement is present rather than a geo
+    // provider that would drag the other selector into this test.
+    let settings = settings_with(
+        r#"
+[geo]
+assume_single_jurisdiction = true
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "http://127.0.0.1:8080/api/v4/json"
+"#,
+    );
+    assert_eq!(
+        settings.device.provider.as_deref(),
+        Some("fiftyone_degrees"),
+        "the selector must have parsed, or this test proves nothing"
+    );
+
+    let router = TrustedServerApp::routes_with_registrations(settings, &[], &[]);
+
+    assert!(
+        router.is_err(),
+        "a device selector naming a module nothing supplies must stop the deployment          rather than fall back to the User-Agent, which would look like device          detection was working"
+    );
+}
+
+/// The provider is reachable from the shipped binary, not just from a test
+/// that hands the builder over itself.
+///
+/// Every test above passes the builder explicitly, which proves the seam works
+/// and says nothing about whether the running server ever uses it. Before this
+/// was checked, it did not: `build_state` composed an empty builder list, so a
+/// deployment writing `[geo] provider = "fiftyone_degrees"` was refused at
+/// startup by a binary that contained the module.
+#[test]
+fn the_running_binary_offers_this_vendor_to_a_deployment() {
+    let offered = trusted_server_adapter_axum::app::vendor_builder_ids();
+
+    assert!(
+        offered.contains(&"fiftyone_degrees"),
+        "the adapter must hand this module to the registry for any deployment to          select it, offered: {offered:?}"
+    );
+}
+
+/// The same module supplies the Edge Cookie provider, so the identity selector
+/// must reach it, and an identifier it creates must survive core's read-back
+/// unchanged.
+///
+/// This is the acceptance gate for the seam, and it exists because this project
+/// has already shipped the failure it checks for. A vendor identifier was
+/// written to the cookie and silently dropped on read-back, because core judged
+/// and rewrote it by the built-in HMAC provider's rules. Nothing errored, and
+/// every visitor simply looked new on every request.
+///
+/// So the assertions below are on the three functions core actually uses,
+/// driven through the trait object the registry resolved rather than through
+/// the concrete type, because a wrapper that forgets to delegate one of them is
+/// how the original fault reached production.
+#[test]
+fn a_51degrees_identifier_survives_core_read_back_verbatim() {
+    // A real identifier shape from a live staging response, shortened. The
+    // mixed case, the plus and the trailing equals are the parts that break
+    // under the built-in rules.
+    // A genuine 51Did in cookie form, issued by the live service for the
+    // documentation address 2.125.160.216. It has to be real, because the
+    // provider now parses the OWID envelope before accepting anything, and a
+    // string of the right length and alphabet is not an envelope.
+    const IDENTIFIER: &str = concat!(
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
+    );
+
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let provider = registry
+        .ec_provider()
+        .expect("`[ec] provider = \"fiftyone_degrees\"` should resolve this module's provider");
+
+    let full = trusted_server_core::ec::provider::apply_provider_code(&*provider, IDENTIFIER);
+
+    assert_eq!(
+        full,
+        format!("51dd~{IDENTIFIER}"),
+        "the cookie value should be this provider's registered code and its own value"
+    );
+    assert!(
+        trusted_server_core::ec::provider::provider_owns_id(&*provider, &full),
+        "an identifier this provider created must be one core reads back, or every \
+         visitor looks new on every request and nothing reports an error"
+    );
+    // Core keeps the code prefix on the storage key and lets the provider
+    // normalize only its own value part, so the key is the whole cookie value
+    // and the part that matters is that the value half is untouched.
+    let key = trusted_server_core::ec::provider::provider_kv_key(&*provider, &full);
+    assert_eq!(
+        key, full,
+        "the identifier is base64 and case-sensitive, so the storage key must carry \
+         the value unchanged rather than lowercased into a collision"
+    );
+    assert!(
+        key.ends_with(IDENTIFIER),
+        "the value half of the key must be byte-identical to what the service issued, \
+         got {key}"
+    );
+}
+
+/// The read-back check is not vacuous: an identifier from another provider is
+/// refused.
+#[test]
+fn an_identifier_this_module_did_not_create_is_refused() {
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+    let provider = registry.ec_provider().expect("should resolve the provider");
+
+    let built_in = format!("hmac~{}.abc123", "a".repeat(64));
+
+    assert!(
+        !trusted_server_core::ec::provider::provider_owns_id(&*provider, &built_in),
+        "another provider's identifier must not be adopted, or two providers would key \
+         the same identity graph row from different evidence"
+    );
+}
+
+/// The identifier also survives the wrapper production puts in front of the
+/// provider.
+///
+/// The round-trip test above drives the provider the registry resolved. The
+/// running server does not use that directly: it hands it to core, which wraps
+/// it in an internal shared-provider type before anything calls it. A wrapper
+/// that forgets to delegate one method is how the original identifier-dropping
+/// bug reached production, so the same round trip is asked of the wrapped form.
+#[test]
+fn the_identifier_survives_the_wrapper_the_running_server_uses() {
+    // A genuine 51Did in cookie form, issued by the live service for the
+    // documentation address 2.125.160.216. It has to be real, because the
+    // provider now parses the OWID envelope before accepting anything, and a
+    // string of the right length and alphabet is not an envelope.
+    const IDENTIFIER: &str = concat!(
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
+    );
+
+    let settings = settings_selecting_identity("");
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let wrapped = trusted_server_core::ec::provider::build_shared_provider(
+        &settings.ec,
+        None,
+        registry.ec_provider(),
+    )
+    .expect("the selection should resolve")
+    .expect("a named provider should build");
+
+    let full = trusted_server_core::ec::provider::apply_provider_code(&*wrapped, IDENTIFIER);
+
+    assert_eq!(
+        full,
+        format!("51dd~{IDENTIFIER}"),
+        "the wrapper must report the module's own code, not a default"
+    );
+    assert!(
+        trusted_server_core::ec::provider::provider_owns_id(&*wrapped, &full),
+        "the wrapper must delegate the module's read-back rule, or the identifier is \
+         written and then dropped with nothing to see"
+    );
+    assert_eq!(
+        trusted_server_core::ec::provider::provider_kv_key(&*wrapped, &full),
+        full,
+        "the wrapper must delegate the module's key rule, or distinct identifiers fold \
+         onto one storage key"
+    );
+}
+
+/// The browser module reaches the page, rather than merely existing on disk.
+///
+/// A module joins the injected bundle only when a browser module serves its
+/// integration id and the integration is enabled. Both halves are easy to get
+/// wrong independently: a directory named differently from the id builds
+/// happily and is never served, and an integration that is registered but not
+/// enabled is skipped. Neither failure says anything, so it is asserted here
+/// rather than assumed from the build output.
+#[test]
+fn the_browser_module_joins_the_injected_bundle() {
+    let settings = settings_selecting_identity("");
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[geo_51degrees::builder()],
+    )
+    .expect("should build a registry with this vendor registered");
+
+    let immediate = registry.js_module_ids_immediate();
+
+    assert!(
+        immediate.contains(&"fiftyone_degrees"),
+        "the browser module must be in the bundle the appliance injects on every page, \
+         or the client evidence it gathers is never gathered, got {immediate:?}"
+    );
+}
+
+/// The client hint delegation appears only for the providers that read hints.
+///
+/// Geo resolves a country from the client address, and no client hint says
+/// anything about where a request came from. So a deployment running geo alone
+/// gains nothing from the delegation, and putting a meta tag in every one of a
+/// publisher's pages for a third party it does not consult would be a real
+/// cost for no return.
+#[test]
+fn geo_alone_puts_no_client_hint_delegation_in_the_page() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "https://cloud.51degrees.com/api/v4/json"
+"#,
+    );
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert!(
+        registration.head_injectors.is_empty(),
+        "geo does not read client hints, so nothing should be written into the page"
+    );
+}
+
+/// Device detection does read them, so selecting it brings the delegation.
+#[test]
+fn selecting_device_detection_brings_the_delegation() {
+    let settings = settings_with(
+        r#"
+[geo]
+provider = "fiftyone_degrees"
+
+[device]
+provider = "fiftyone_degrees"
+
+[integrations.fiftyone_degrees]
+endpoint = "https://cloud.51degrees.com/api/v4/json"
+"#,
+    );
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert_eq!(
+        registration.head_injectors.len(),
+        1,
+        "the device answer is a statement about the hardware and the browser, which is \
+         exactly what a client hint carries"
+    );
+}
+
+/// So does identity, because the identifier is derived from that same evidence.
+#[test]
+fn selecting_identity_brings_the_delegation() {
+    let settings = settings_selecting_identity("");
+
+    let registration = geo_51degrees::register(&settings)
+        .expect("should read the configuration")
+        .expect("the module is configured");
+
+    assert_eq!(registration.head_injectors.len(), 1);
 }

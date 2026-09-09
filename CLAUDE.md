@@ -359,6 +359,14 @@ deployment selects an implementation and the core stays neutral:
 | Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
 
+A vendor whose backend answers more than one of these lives in **one crate**
+supplying every provider it can, rather than one crate per capability. Splitting
+it would split the request too, because each crate would hold its own client and
+each would pay for its own call to the same service.
+`crates/geo/51degrees` is that shape: one module id, `fiftyone_degrees`, written
+to `[geo] provider`, `[device] provider` and `[ec] provider`, and one cloud
+answer shared between the three.
+
 Principles for adding or changing a provider:
 
 - **Core stays neutral.** The trait and the host-neutral default live in
