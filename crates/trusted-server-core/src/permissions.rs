@@ -37,12 +37,13 @@
 //! reports one.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 
 use crate::consent::jurisdiction::Jurisdiction;
+use crate::tdl::Tdl;
 
 /// A technical permission a provider may require, labeled with its IAB Privacy
 /// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
@@ -762,13 +763,17 @@ impl PermissionMaps {
 ///
 /// A provider executes only when [`all_set`](Self::all_set) of its required
 /// permissions returns `true`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionState {
     set: PermissionSet,
     /// Whether the request explicitly withdrew device storage, as opposed to
     /// storage merely not being set. See
     /// [`storage_withdrawn`](Self::storage_withdrawn).
     storage_withdrawn: bool,
+    /// The terms documents the data for this request is available under. See
+    /// [`tdls`](Self::tdls). Shared rather than owned because the state is
+    /// cloned along the request path and the list is the same list.
+    tdls: Arc<[Tdl]>,
 }
 
 impl PermissionState {
@@ -776,10 +781,11 @@ impl PermissionState {
     /// nothing is withdrawn, for tests and callers that compute the set
     /// directly.
     #[must_use]
-    pub const fn new(set: PermissionSet) -> Self {
+    pub fn new(set: PermissionSet) -> Self {
         Self {
             set,
             storage_withdrawn: false,
+            tdls: Arc::default(),
         }
     }
 
@@ -787,11 +793,31 @@ impl PermissionState {
     /// withdrawn. Set by assembly from what the signal providers answered,
     /// scoped to the jurisdiction's storage baseline.
     #[must_use]
-    pub const fn with_storage_withdrawn(self, storage_withdrawn: bool) -> Self {
+    pub fn with_storage_withdrawn(self, storage_withdrawn: bool) -> Self {
         Self {
             storage_withdrawn,
             ..self
         }
+    }
+
+    /// The same state, carrying the terms documents the data for this request
+    /// is available under. Set by assembly from what the signal providers
+    /// declared, in the order they are asked.
+    #[must_use]
+    pub fn with_tdls(self, tdls: Arc<[Tdl]>) -> Self {
+        Self { tdls, ..self }
+    }
+
+    /// The terms documents the data for this request is available under, in
+    /// the order the providers were asked.
+    ///
+    /// Whoever receives the data reads these to decide whether the terms are
+    /// ones they accept, and whether they may pass the data on. An empty list
+    /// says no terms were declared, which is not the same as terms that permit
+    /// anything, so a recipient that needs a basis and finds none has none.
+    #[must_use]
+    pub fn tdls(&self) -> &[Tdl] {
+        &self.tdls
     }
 
     /// Whether the request carries an explicit signal withdrawing device
@@ -834,9 +860,12 @@ impl PermissionState {
     ///
     /// Names are the [`Permission::as_str`] Data Use identifiers, sorted so the
     /// same state always serializes to the same bytes whatever order the set
-    /// was built in. An empty state
-    /// renders as `{"set":[]}`, which is an answer (nothing is set) rather than
-    /// a missing value, so page code never has to tell the two apart.
+    /// was built in. `tdls` carries the terms documents the data is available
+    /// under, in the order the providers were asked, so a page module reads the
+    /// terms alongside the permissions. An empty state renders as
+    /// `{"set":[],"tdls":[]}`, and both are answers (nothing is set, no terms
+    /// were declared) rather than missing values, so page code never has to
+    /// tell the two apart.
     ///
     /// This is the only place the page shape is spelled, so no caller writes
     /// the JSON by hand.
@@ -853,16 +882,20 @@ impl PermissionState {
     /// );
     /// assert_eq!(
     ///     state.page_json(),
-    ///     r#"{"set":["necessary.operations.storage"]}"#
+    ///     r#"{"set":["necessary.operations.storage"],"tdls":[]}"#
     /// );
     ///
-    /// assert_eq!(PermissionState::default().page_json(), r#"{"set":[]}"#);
+    /// assert_eq!(
+    ///     PermissionState::default().page_json(),
+    ///     r#"{"set":[],"tdls":[]}"#
+    /// );
     /// ```
     #[must_use]
     pub fn page_json(&self) -> String {
         let mut names: Vec<&'static str> = self.set.iter().map(Permission::as_str).collect();
         names.sort_unstable();
-        serde_json::json!({ "set": names }).to_string()
+        let tdls: Vec<&str> = self.tdls.iter().map(Tdl::as_str).collect();
+        serde_json::json!({ "set": names, "tdls": tdls }).to_string()
     }
 }
 
@@ -1369,10 +1402,36 @@ mod tests {
                 "set": [
                     "advertising_marketing.first_party.contextual",
                     "necessary.operations.storage",
-                ]
+                ],
+                "tdls": [],
             })
             .to_string(),
             "should list every set permission by Data Use name, sorted"
+        );
+    }
+
+    #[test]
+    fn page_json_carries_the_terms_the_data_is_available_under() {
+        // Arrange: the state a request resolves to when a terms scheme
+        // declared the document its data is offered under.
+        let state = PermissionState::new(PermissionSet::none().with(Permission::StoreOnDevice))
+            .with_tdls(Arc::from(vec![
+                Tdl::new("https://terms.example.com/marketing/2.txt")
+                    .expect("should accept the test locator"),
+            ]));
+
+        // Act
+        let json = state.page_json();
+
+        // Assert
+        assert_eq!(
+            json,
+            json!({
+                "set": ["necessary.operations.storage"],
+                "tdls": ["https://terms.example.com/marketing/2.txt"],
+            })
+            .to_string(),
+            "page code should read the terms alongside the permissions"
         );
     }
 
@@ -1387,8 +1446,8 @@ mod tests {
         // Assert
         assert_eq!(
             json,
-            json!({ "set": [] }).to_string(),
-            "an empty state should render as an empty set, not as nothing"
+            json!({ "set": [], "tdls": [] }).to_string(),
+            "an empty state should render as an empty set and no declared terms,              not as nothing"
         );
     }
 

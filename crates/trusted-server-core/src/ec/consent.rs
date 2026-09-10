@@ -99,7 +99,9 @@ pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
 /// empty slice runs none of them, which leaves every permission at its
 /// country and region baseline. The same providers answer whether storage
 /// was explicitly withdrawn, recorded on the state and read through
-/// [`PermissionState::storage_withdrawn`].
+/// [`PermissionState::storage_withdrawn`], and declare the terms documents the
+/// request's data is available under, read through
+/// [`PermissionState::tdls`].
 #[must_use]
 pub fn assemble_permissions(
     consent: &ConsentContext,
@@ -128,7 +130,9 @@ pub fn assemble_permissions(
         maps.signals(),
         storage_acquisition(geo),
     );
-    state.with_storage_withdrawn(withdrawn)
+    state
+        .with_storage_withdrawn(withdrawn)
+        .with_tdls(permission_signal::tdls(providers, consent, evidence))
 }
 
 /// The acquisition rule for Edge Cookie storage in the request's resolved
@@ -224,6 +228,32 @@ mod tests {
         }
     }
 
+    /// A provider that declares a terms document, standing in for a terms
+    /// scheme such as Model Terms for Marketing, which is the next provider
+    /// and is not one of the four that ship here.
+    struct DeclaringTerms;
+
+    impl PermissionSignalProvider for DeclaringTerms {
+        fn id(&self) -> &'static str {
+            "declaring-terms"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn tdls(
+            &self,
+            _consent: &ConsentContext,
+            _evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Vec<crate::tdl::Tdl> {
+            vec![
+                crate::tdl::Tdl::new("https://terms.example.com/marketing/2.txt")
+                    .expect("should accept the test locator"),
+            ]
+        }
+    }
+
     fn no_evidence() -> OwnedRequestInfo {
         OwnedRequestInfo::new(String::new(), HeaderMap::new())
     }
@@ -251,6 +281,31 @@ mod tests {
             region: Some("CA".to_owned()),
             asn: None,
         }
+    }
+
+    #[test]
+    fn a_provider_declaring_terms_reaches_the_assembled_state() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(DeclaringTerms)];
+        let state =
+            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &providers);
+        let addresses: Vec<&str> = state.tdls().iter().map(crate::tdl::Tdl::as_str).collect();
+        assert_eq!(
+            addresses,
+            vec!["https://terms.example.com/marketing/2.txt"],
+            "should carry the terms the provider declared through to whatever reads the state"
+        );
+    }
+
+    #[test]
+    fn a_state_assembled_from_the_shipped_kind_of_provider_declares_no_terms() {
+        let consent = ConsentContext::default();
+        let state =
+            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &granting());
+        assert!(
+            state.tdls().is_empty(),
+            "should declare nothing, because a scheme carrying no terms says nothing about them"
+        );
     }
 
     #[test]

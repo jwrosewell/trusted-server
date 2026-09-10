@@ -72,6 +72,7 @@ pub mod settings_data;
 pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
+pub mod tdl;
 pub mod test_support;
 pub mod tester_cookie;
 pub mod tsjs;

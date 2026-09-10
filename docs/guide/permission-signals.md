@@ -40,7 +40,9 @@ reads its own signal from the request, without a change to the core. The next on
 is Model Terms for Marketing (MTM), where a publisher and the parties it passes
 data to agree to be bound by a published set of terms, and what a provider
 reads is whether that agreement covers this request. MTM arrives in a following
-pull request, so the four here are a starting set and not the list.
+pull request, and it is one of many terms schemes rather than the only one,
+because a publisher, a trade body or a regulator can each publish terms and
+each set becomes a provider. The four here are a starting set and not the list.
 
 ## How a request resolves
 
@@ -116,6 +118,35 @@ Privacy Control can remove it and keep the other two. What an opt-out takes
 away, and whether a TCF record answers for the deployment at all, remain the
 policy's decisions in the `signals` section of `permissions.yaml`, so a
 deployment changes those without changing a provider.
+
+## The terms the data is available under
+
+A provider may also declare the terms documents the request's data is available
+under, and the permission state carries what every configured provider declared,
+in the order they were asked. The page reads them as `tdls` alongside `set`:
+
+```json
+{
+  "set": ["necessary.operations.storage"],
+  "tdls": ["https://terms.example.com/marketing/2.txt"]
+}
+```
+
+Whoever receives the data reads them to decide whether those are terms they
+accept, and whether they may pass the data on. An empty list says no terms were
+declared, which is not the same as terms permitting anything, so a recipient
+needing a basis and finding none has none.
+
+Each entry is the address of a published document a person can read, and the
+document must never be edited once published, which is why a version belongs in
+its address. A document that can be rewritten tomorrow means a recipient can
+never prove what it agreed to, and one edit silently rewrites the basis of every
+transaction already sent under it.
+
+None of the four schemes that ship carries terms, so the list is empty until a
+terms scheme runs. Model Terms for Marketing (MTM) is the first of many rather
+than the only one, since a publisher, a trade body or a regulator can each
+publish terms and each set becomes a provider.
 
 ## Withdrawal is a separate question
 

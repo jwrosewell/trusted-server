@@ -9,6 +9,7 @@ use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
 use crate::permissions::{Acquisition, ConsentSignal, Permission, SignalPolicy};
 use crate::settings::Settings;
+use crate::tdl::Tdl;
 
 /// What a signal provider may read about a request.
 ///
@@ -167,6 +168,25 @@ pub trait PermissionSignalProvider: Send + Sync {
     fn withdraws(&self, _permission: Permission, _input: &SignalInput<'_>) -> bool {
         false
     }
+
+    /// The terms documents this provider says the request's data is
+    /// available under, empty when it declares none.
+    ///
+    /// A locator tells whoever receives the data what terms cover it, so
+    /// they can decide whether those are terms they accept and whether they
+    /// may pass the data on. The four schemes that ship carry no terms of
+    /// their own and leave this at its default, and a provider for a terms
+    /// scheme returns the document that applies to this request. Model Terms
+    /// for Marketing (MTM) is the first such scheme and one of many rather
+    /// than the only one. Core does
+    /// not read the documents, it carries the locators, so what a document
+    /// says stays between the parties bound by it.
+    ///
+    /// A locator must point at a document that is never edited once
+    /// published, which [`Tdl`] documents and cannot enforce.
+    fn tdls(&self, _consent: &ConsentContext, _evidence: &dyn RequestInfo) -> Vec<Tdl> {
+        Vec::new()
+    }
 }
 
 /// Asks every provider in order and returns what they settle on together.
@@ -242,6 +262,29 @@ pub(crate) fn withdrawn(
         };
         provider.withdraws(permission, &input)
     })
+}
+
+/// The terms documents the configured providers declare for this request.
+///
+/// Asked in the same order the providers answer in, so the list reads the
+/// way the deployment is configured, and a document named by two providers
+/// is carried once. No provider declaring anything leaves the list empty,
+/// which says no terms were declared rather than that any terms apply.
+#[must_use]
+pub(crate) fn tdls(
+    providers: &[Arc<dyn PermissionSignalProvider>],
+    consent: &ConsentContext,
+    evidence: &dyn RequestInfo,
+) -> Arc<[Tdl]> {
+    let mut declared: Vec<Tdl> = Vec::new();
+    for provider in providers {
+        for tdl in provider.tdls(consent, evidence) {
+            if !declared.contains(&tdl) {
+                declared.push(tdl);
+            }
+        }
+    }
+    Arc::from(declared)
 }
 
 /// The providers a deployment named, in the order it named them, drawn from
@@ -402,6 +445,24 @@ mod tests {
         }
     }
 
+    /// A provider that declares a terms document, which is what a scheme like
+    /// Model Terms for Marketing does and none of the four that ship do.
+    struct Declaring(&'static str, &'static str);
+
+    impl PermissionSignalProvider for Declaring {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn tdls(&self, _consent: &ConsentContext, _evidence: &dyn RequestInfo) -> Vec<Tdl> {
+            vec![Tdl::new(self.1).expect("should accept the test locator")]
+        }
+    }
+
     /// A provider that withdraws storage, for testing the scoping rule.
     struct Withdrawing;
 
@@ -425,6 +486,79 @@ mod tests {
 
     fn fixed(id: &'static str, signal: ConsentSignal) -> Arc<dyn PermissionSignalProvider> {
         Arc::new(Fixed(id, signal))
+    }
+
+    #[test]
+    fn a_provider_declaring_no_terms_leaves_the_list_empty() {
+        let consent = ConsentContext::default();
+        let declared = tdls(
+            &[fixed("quiet", ConsentSignal::Grant)],
+            &consent,
+            &no_evidence(),
+        );
+        assert!(
+            declared.is_empty(),
+            "should declare nothing, because the four shipped schemes carry no terms"
+        );
+    }
+
+    #[test]
+    fn terms_are_collected_in_the_order_the_providers_are_asked() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+            Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
+            fixed("quiet", ConsentSignal::Neutral),
+            Arc::new(Declaring("second", "https://terms.example.com/b/1.txt")),
+        ];
+        let declared = tdls(&providers, &consent, &no_evidence());
+        let addresses: Vec<&str> = declared.iter().map(Tdl::as_str).collect();
+        assert_eq!(
+            addresses,
+            vec![
+                "https://terms.example.com/a/1.txt",
+                "https://terms.example.com/b/1.txt"
+            ],
+            "should read in the configured order, so the list matches the deployment"
+        );
+    }
+
+    #[test]
+    fn one_document_named_by_two_providers_is_carried_once() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+            Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
+            Arc::new(Declaring("second", "https://terms.example.com/a/1.txt")),
+        ];
+        let declared = tdls(&providers, &consent, &no_evidence());
+        assert_eq!(
+            declared.len(),
+            1,
+            "should carry the same document once, not once per provider naming it"
+        );
+    }
+
+    #[test]
+    fn versions_of_one_document_are_both_carried() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+            Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
+            Arc::new(Declaring("second", "https://terms.example.com/a/2.txt")),
+        ];
+        let declared = tdls(&providers, &consent, &no_evidence());
+        assert_eq!(
+            declared.len(),
+            2,
+            "should keep both, because a recipient agreed to one version and not the other"
+        );
+    }
+
+    #[test]
+    fn no_providers_declare_nothing() {
+        let consent = ConsentContext::default();
+        assert!(
+            tdls(&[], &consent, &no_evidence()).is_empty(),
+            "should declare nothing when no provider runs, rather than implying terms"
+        );
     }
 
     fn combined(providers: &[Arc<dyn PermissionSignalProvider>]) -> ConsentSignal {

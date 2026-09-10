@@ -436,7 +436,9 @@ denied or who was classified as a bot still receives the state, empty in that
 case rather than missing.
 
 Because the arrival point moves, a page module must not read `tsjs.permissions`
-directly at load. TSJS core defaults the value to `{ set: [] }` and exposes
+directly at load. TSJS core defaults the value to `{ set: [], tdls: [] }`, where
+`tdls` are the terms documents the request's data is available under as
+declared by the signal providers, and exposes
 `tsjs.whenPermissions()`, a promise that resolves when the real value arrives,
 immediately in the head-first case or at the body seam, with a
 `DOMContentLoaded` fallback. That promise is the waiting point for a vendor page
