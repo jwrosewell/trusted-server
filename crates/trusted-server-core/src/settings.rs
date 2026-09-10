@@ -2274,6 +2274,22 @@ impl EgressProxy {
             }));
         }
 
+        // A lifetime only means something when the URL carries a session
+        // token, because that token is the whole of what asks the provider
+        // for a different address. Setting one against a fixed gateway would
+        // otherwise read as rotation that is quietly not happening, and an
+        // operator would have no way to tell that from a provider ignoring
+        // the request.
+        if self.session_ttl_seconds > 0 && !self.url.expose().contains(EGRESS_SESSION_PLACEHOLDER) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "proxy.egress.session_ttl_seconds is set but \
+                          proxy.egress.url contains no {session}, so nothing \
+                          would change when the lifetime expires. Add \
+                          {session} to the URL or remove the lifetime."
+                    .to_owned(),
+            }));
+        }
+
         // Both placeholders are replaced with stand-in text first, because the
         // URL only parses once they are gone and the real values are not
         // available this early.
@@ -8320,6 +8336,25 @@ origin_host_header_overide = "www.example.com""#,
         assert!(
             egress.applies_to("www.publisher.example"),
             "the listed hosts should still take the exit"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_rejects_a_lifetime_that_could_change_nothing() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [proxy.egress]
+            url = "http://127.0.0.1:8888"
+            hosts = ["*.publisher.example"]
+            session_ttl_seconds = 600
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject a lifetime against a fixed gateway");
+        assert!(
+            format!("{err:?}").contains("session_ttl_seconds"),
+            "should name the setting that would do nothing: {err:?}"
         );
     }
 

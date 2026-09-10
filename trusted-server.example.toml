@@ -278,17 +278,35 @@ pull_sync_concurrency = 3
 # There is no fallback: when the exit cannot be prepared the fetch is refused,
 # because a quiet direct fetch would make a refusing publisher look
 # intermittently reachable.
+# There are two shapes of exit, and only the second needs more than a url.
+#
+# A FIXED exit is a proxy you run yourself, a tunnel listening on the loopback
+# address being the usual one. It has no credentials, no session and one
+# address, so url and hosts are all it needs and session_ttl_seconds,
+# secret_store and password_secret all go unused:
 # [proxy.egress]
-# In url, "{session}" is replaced with the current session token, which is how a
-# provider is asked for a different exit address, and "{secret}" with the value
-# of password_secret read from secret_store, so this file never carries the
-# password.
+# url = "http://127.0.0.1:8888"
+# hosts = ["*.publisher.example"]
+#
+# One address never changes, so if a publisher ever refuses that address too,
+# the answer is a different endpoint behind the proxy and not a fault in this
+# server. Worth saying because the symptom is identical to having no exit
+# configured at all.
+#
+# A ROTATING exit is a provider that answers from a different address per
+# session. In url, "{session}" is replaced with the current session token,
+# which is what asks for a different address, and "{secret}" with the value of
+# password_secret read from secret_store, so this file never carries the
+# password:
+# [proxy.egress]
 # url = "http://customer-acme-cc-gb-sessid-{session}:{secret}@gateway.example.com:7777"
 # hosts = ["*.publisher.example"]
 # How long one exit address is kept. 0, the default, keeps one for the life of
 # the process. There is no per-request setting: one page's assets would arrive
 # from many addresses and a publisher tying a session to an address would then
-# serve a broken page.
+# serve a broken page. Setting this above 0 with no "{session}" in the url is
+# refused at startup, because nothing would change when the lifetime expired
+# and the setting would read as rotation that is quietly not happening.
 # session_ttl_seconds = 600
 # secret_store = "ts_secrets"
 # password_secret = "egress_proxy_password"
