@@ -8292,6 +8292,37 @@ origin_host_header_overide = "www.example.com""#,
         );
     }
 
+    /// A gateway on the loopback address that needs no credentials at all,
+    /// which is what a locally run tunnel presents.
+    #[test]
+    fn proxy_egress_accepts_a_gateway_with_no_credentials() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [proxy.egress]
+            url = "http://127.0.0.1:8888"
+            hosts = ["*.publisher.example"]
+            "#;
+        let settings =
+            Settings::from_toml(&toml_str).expect("should accept a gateway with no credentials");
+        let egress = settings.proxy.egress.expect("should carry the exit");
+
+        assert!(
+            !egress.needs_secret(),
+            "a gateway with no {{secret}} in it should look up no password"
+        );
+        assert_eq!(
+            egress.resolve_url("abc123", "").expose(),
+            "http://127.0.0.1:8888",
+            "a gateway with no placeholders should be used exactly as written"
+        );
+        assert!(
+            egress.applies_to("www.publisher.example"),
+            "the listed hosts should still take the exit"
+        );
+    }
+
     #[test]
     fn proxy_egress_replaces_both_placeholders() {
         let settings = Settings::from_toml(&egress_toml(
