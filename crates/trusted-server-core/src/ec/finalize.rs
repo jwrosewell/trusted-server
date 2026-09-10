@@ -476,9 +476,11 @@ mod tests {
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
-        // A TCF record refusing storage is the withdrawal trigger. The test
-        // context resolves the storage baseline at the requires-signal floor,
-        // where refusing the signal storage depends on is destructive.
+        // A TCF record refusing storage is the withdrawal trigger, under a
+        // storage baseline at the requires-signal floor, where refusing the
+        // signal storage depends on is destructive. The TCF provider answers
+        // that at assembly, and core links no provider, so the answer is
+        // stated here and what finalization does with it is what is tested.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(refusing_tcf()),
@@ -486,7 +488,8 @@ mod tests {
             ..Default::default()
         };
         let ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", "stale");
         set_header(&mut response, "x-ts-eids", "[]");
@@ -853,7 +856,10 @@ mod tests {
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        let ec_context = canonicalizing_context(true, false, consent, false);
+        // The TCF provider answers the withdrawal at assembly, and core links
+        // no provider, so the answer is stated here.
+        let ec_context = canonicalizing_context(true, false, consent, false)
+            .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -1127,6 +1133,8 @@ mod tests {
         // created, but the deployment now runs a provider with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
+        // The TCF provider answers the withdrawal at assembly, and core links
+        // no provider, so the answer is stated here.
         let ec_context = make_context_with_consent(
             None,
             Some(CANONICAL_COOKIE_VALUE),
@@ -1135,7 +1143,8 @@ mod tests {
             consent,
             false,
         )
-        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider));
+        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider))
+        .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(

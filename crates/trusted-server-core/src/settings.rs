@@ -891,120 +891,38 @@ impl DeviceConfig {
     }
 }
 
-/// Which permission signal models run, and in what order.
+/// Which permission signal providers run, and in what order.
 ///
 /// Mapped from the `[permission_signal]` TOML section. Unlike the `[ec]`,
 /// `[geo]` and `[device]` selectors, which each name one provider, signals
 /// compose: a request can carry a TCF string and a Global Privacy Control
 /// header at once and both have something to say. So this names a list, and
-/// the order is the policy, because the last source with an opinion decides.
+/// the order is the policy, because the last provider with an opinion decides.
 ///
 /// See `crates/trusted-server-core/src/permission_signal/README.md`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionSignalConfig {
-    /// The models to run, in order, named by the identifiers in
-    /// [`SOURCE_IDS`](crate::ec::consent::SOURCE_IDS).
+    /// The providers to run, in order, named by the identifier each provider
+    /// crate declares, for example `gpc`, `gpp-sale-opt-out`, `us-privacy` and
+    /// `tcf` for the four that ship.
     ///
-    /// Absent means every model the build knows about, in the default order.
-    /// A publisher who does not want to act on one removes it from the list;
-    /// there is no separate switch, because a model that is not listed does not
-    /// run. An empty list runs none of them, leaving every permission at its
-    /// country and region baseline.
+    /// Absent means every provider the adapter offers, in the order it offers
+    /// them. A publisher who does not want to act on one removes it from the
+    /// list, and there is no separate switch, because a provider that is not
+    /// listed does not run. An empty list runs none of them, leaving every
+    /// permission at its country and region baseline.
+    ///
+    /// Which names are valid is only known where the provider crates are
+    /// linked, so the check that each name matches an available provider and
+    /// none is repeated happens at the adapter's composition root, through
+    /// [`build_permission_signal_providers`], and refuses startup rather than
+    /// silently ignoring a typo.
+    ///
+    /// [`build_permission_signal_providers`]:
+    ///     crate::permission_signal::build_permission_signal_providers
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<String>>,
-}
-
-impl PermissionSignalConfig {
-    /// The models this configuration leaves out, in the declared order.
-    ///
-    /// Empty when nothing is configured, since that runs every model.
-    #[must_use]
-    pub fn omitted_sources(&self) -> Vec<&'static str> {
-        let Some(names) = self.sources.as_deref() else {
-            return Vec::new();
-        };
-        crate::ec::consent::SOURCE_IDS
-            .iter()
-            .copied()
-            .filter(|id| !names.iter().any(|name| name.as_str() == *id))
-            .collect()
-    }
-
-    /// Records the selection at startup, so which signals a deployment acts on
-    /// can be read from its log rather than inferred from its behavior.
-    ///
-    /// Any model left out is warned about, not merely noted. Removing one is a
-    /// deliberate choice a publisher is entitled to make, so it is not a
-    /// refusal, but a signal arriving on a request and then being ignored is
-    /// worth seeing in a log when someone asks why it had no effect.
-    pub fn log_selection(&self) {
-        let Some(names) = self.sources.as_deref() else {
-            log::info!(
-                "Permission signals: acting on every model, no [permission_signal] sources \
-                 configured"
-            );
-            return;
-        };
-
-        if names.is_empty() {
-            log::info!(
-                "Permission signals: acting on no model, [permission_signal] sources is \
-                 empty, so every permission stays at its country and region baseline"
-            );
-        } else {
-            log::info!(
-                "Permission signals: acting on {}, asked in that order",
-                names.join(", ")
-            );
-        }
-
-        let omitted = self.omitted_sources();
-        if !omitted.is_empty() {
-            log::warn!(
-                "Permission signals: not acting on {}, which are not in [permission_signal] \
-                 sources. A signal this deployment does not act on is read from the request \
-                 and then ignored",
-                omitted.join(", ")
-            );
-        }
-    }
-
-    /// Checks that every named model exists in this build and none is named
-    /// twice.
-    ///
-    /// Run at startup, so a typo is a refusal to boot rather than a signal that
-    /// silently stops being honored.
-    ///
-    /// # Errors
-    ///
-    /// - [`TrustedServerError::Configuration`] if a name is unknown or repeated.
-    pub fn validate_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        let Some(names) = self.sources.as_deref() else {
-            return Ok(());
-        };
-        for (position, name) in names.iter().enumerate() {
-            if !crate::ec::consent::SOURCE_IDS.contains(&name.as_str()) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "Permission signal source `{name}` is not available in this build. \
-                         Available sources are {}",
-                        crate::ec::consent::SOURCE_IDS.join(", ")
-                    ),
-                }));
-            }
-            if names[..position].contains(name) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "Permission signal source `{name}` is named more than once in \
-                         [permission_signal] sources. Each source runs once, at one place \
-                         in the order"
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Geo / IP intelligence configuration.
@@ -3503,8 +3421,6 @@ impl Settings {
         settings.ec.validate_provider_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
-        settings.permission_signal.validate_selection()?;
-        settings.permission_signal.log_selection();
         GeoConfig::validate_permission_policy()?;
         settings
             .geo
@@ -8759,99 +8675,17 @@ formats = [{{ width = 300, height = 250 }}]
 mod permission_signal_config_tests {
     use super::*;
 
-    fn config(sources: Option<&[&str]>) -> PermissionSignalConfig {
-        PermissionSignalConfig {
-            sources: sources.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
-        }
-    }
+    // Which names are valid is only known where the scheme crates are linked,
+    // so the checks that a name matches an available provider, and that none
+    // is repeated, live with the seam in `permission_signal::select`. What is
+    // tested here is the shape of the section itself.
 
     #[test]
-    fn no_section_is_allowed_and_means_every_model() {
+    fn no_section_is_allowed_and_means_every_provider() {
         let config = PermissionSignalConfig::default();
-        config
-            .validate_selection()
-            .expect("should accept a deployment that configures nothing");
         assert!(
             config.sources.is_none(),
             "absent rather than empty, because the two mean opposite things"
-        );
-    }
-
-    #[test]
-    fn every_declared_source_is_accepted() {
-        config(Some(crate::ec::consent::SOURCE_IDS))
-            .validate_selection()
-            .expect("should accept the full list the example configuration ships");
-    }
-
-    #[test]
-    fn an_empty_list_is_accepted_as_acting_on_no_signal() {
-        config(Some(&[]))
-            .validate_selection()
-            .expect("should accept a publisher who acts on no signal at all");
-    }
-
-    #[test]
-    fn an_unknown_source_is_refused_at_startup() {
-        let error = config(Some(&["gpc", "gpq"]))
-            .validate_selection()
-            .expect_err("should refuse a name no model answers to");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("gpq"),
-            "the message should name the typo, so it can be found: {message}"
-        );
-        assert!(
-            message.contains("gpc"),
-            "and list what was available: {message}"
-        );
-    }
-
-    #[test]
-    fn naming_a_source_twice_is_refused() {
-        let error = config(Some(&["gpc", "tcf", "gpc"]))
-            .validate_selection()
-            .expect_err("should refuse a repeat, which has no meaning in an ordered list");
-        assert!(format!("{error:?}").contains("gpc"));
-    }
-
-    #[test]
-    fn only_models_a_publisher_chooses_to_act_on_are_listed() {
-        // A malformed consent record fails closed whatever is configured, so it
-        // is deliberately not among the names. It is what happens when a signal
-        // arrives unreadable, not a signal anyone elects to honor.
-        assert!(
-            !crate::ec::consent::SOURCE_IDS.contains(&"malformed-record"),
-            "error handling must not be listed as though it were a signalling model"
-        );
-    }
-
-    #[test]
-    fn configuring_nothing_omits_nothing() {
-        assert!(
-            PermissionSignalConfig::default()
-                .omitted_sources()
-                .is_empty(),
-            "no section runs every model, so nothing is left out to report"
-        );
-    }
-
-    #[test]
-    fn a_dropped_model_is_reported_as_omitted() {
-        let omitted = config(Some(&["gpc", "tcf"])).omitted_sources();
-        assert_eq!(
-            omitted,
-            vec!["gpp-sale-opt-out", "us-privacy"],
-            "what the log names has to be what was actually left out"
-        );
-    }
-
-    #[test]
-    fn an_empty_list_omits_every_model() {
-        assert_eq!(
-            config(Some(&[])).omitted_sources().len(),
-            crate::ec::consent::SOURCE_IDS.len(),
-            "acting on no signal leaves every model out, and the log says so"
         );
     }
 
@@ -8864,8 +8698,23 @@ mod permission_signal_config_tests {
             Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
             "the order written is the order read, because the order is the policy"
         );
-        parsed
-            .validate_selection()
-            .expect("should accept two known sources");
+    }
+
+    #[test]
+    fn an_empty_list_is_kept_apart_from_no_list() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str("sources = []").expect("should parse an empty list");
+        assert_eq!(
+            parsed.sources.as_deref(),
+            Some(&[][..]),
+            "a publisher acting on no signal at all writes an empty list, and it must \
+             not read back as having written nothing"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        toml::from_str::<PermissionSignalConfig>(r#"source = ["gpc"]"#)
+            .expect_err("should refuse a misspelled key rather than silently ignore it");
     }
 }

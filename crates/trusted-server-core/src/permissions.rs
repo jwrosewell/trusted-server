@@ -376,21 +376,23 @@ enum RevokeSet {
     Set(PermissionSet),
 }
 
-/// How each session signal maps onto permissions, parsed from the `signals`
-/// section of `permissions.yaml`.
+/// What a deployment decides about the shipped signal schemes, parsed from the
+/// `signals` section of `permissions.yaml`.
 ///
-/// The permission model holds this as data so the consent mapping applies it
-/// rather than encoding any signal policy in the code. It is jurisdiction-free:
-/// it says only how a decoded signal grants or revokes each Data Use, and the
+/// The permission model holds this as data so a deployment changes it without
+/// changing a provider. It is jurisdiction-free, and it carries only the
+/// decisions that are a deployment's to make: whether a TCF record answers at
+/// all, which signals count as a US-style opt-out, and what an opt-out takes
+/// away. What each scheme's own signal means, such as which TCF purpose grants
+/// which Data Use, is that scheme's provider crate's, not this policy's. The
 /// country/region baseline decides the rest.
 #[derive(Debug, Clone, Default)]
 pub struct SignalPolicy {
-    /// Whether a present TCF record's grants and revokes apply. This never
-    /// lets a TCF record override an opt-out signal: an opt-out always
-    /// suppresses the Data Uses it revokes.
+    /// Whether a present TCF record's grants and revokes apply. Whether a
+    /// consenting record then stands over an opt-out, or the opt-out over it,
+    /// is decided by the order the providers are asked in, which is
+    /// `[permission_signal] sources`, not by this flag.
     tcf_authoritative: bool,
-    /// Permission bit index to the TCF purpose number that grants it.
-    tcf_purpose: BTreeMap<u8, u8>,
     /// The signals that constitute a US-style opt-out.
     opt_out_sources: Vec<OptOutSource>,
     /// Which Data Uses a US-style opt-out revokes.
@@ -402,13 +404,6 @@ impl SignalPolicy {
     #[must_use]
     pub fn tcf_authoritative(&self) -> bool {
         self.tcf_authoritative
-    }
-
-    /// The TCF purpose number that grants `permission`, or `None` when no purpose
-    /// maps to it.
-    #[must_use]
-    pub fn tcf_purpose(&self, permission: Permission) -> Option<u8> {
-        self.tcf_purpose.get(&permission.index()).copied()
     }
 
     /// The signals that constitute a US-style opt-out.
@@ -428,37 +423,12 @@ impl SignalPolicy {
     }
 }
 
-/// Errors when a Data Use is granted by more than one TCF purpose, because the
-/// grant-and-revoke rule needs a single purpose to answer for each Data Use.
-fn ensure_none_signal_duplicate(
-    previous: Option<u8>,
-    data_use: &str,
-) -> Result<(), PermissionsError> {
-    match previous {
-        None => Ok(()),
-        Some(_) => Err(PermissionsError::DuplicateTcfDataUse {
-            name: data_use.to_owned(),
-        }),
-    }
-}
-
 /// Builds a validated [`SignalPolicy`] from the parsed `signals` section,
 /// erroring when it names an unknown Data Use or revoke rule.
 fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsError> {
     let mut policy = SignalPolicy::default();
     if let Some(tcf) = &spec.tcf {
         policy.tcf_authoritative = tcf.authoritative;
-        for (purpose, data_uses) in &tcf.purposes {
-            for data_use in data_uses.identifiers() {
-                let permission = Permission::from_identifier(data_use).ok_or_else(|| {
-                    PermissionsError::UnknownPermission {
-                        name: data_use.clone(),
-                    }
-                })?;
-                let previous = policy.tcf_purpose.insert(permission.index(), *purpose);
-                ensure_none_signal_duplicate(previous, data_use)?;
-            }
-        }
     }
     if let Some(opt_out) = &spec.us_opt_out {
         policy.opt_out_sources = opt_out.sources.clone();
@@ -528,7 +498,10 @@ impl PermissionMaps {
     /// `permissions.yaml`. The consent mapping reads this rather than encoding
     /// any signal policy in the code.
     #[must_use]
-    pub(crate) fn signals(&self) -> &SignalPolicy {
+    // Public because the permission signal provider crates live outside core
+    // and read the deployment's policy, in their tests and where a provider
+    // needs the shipped decisions rather than a policy built by hand.
+    pub fn signals(&self) -> &SignalPolicy {
         &self.signals
     }
 
@@ -752,7 +725,7 @@ impl PermissionMaps {
                 }
             })
             .collect();
-        PermissionState { set }
+        PermissionState::new(set)
     }
 
     /// The baseline permission state for a country and region with no session
@@ -792,14 +765,48 @@ impl PermissionMaps {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PermissionState {
     set: PermissionSet,
+    /// Whether the request explicitly withdrew device storage, as opposed to
+    /// storage merely not being set. See
+    /// [`storage_withdrawn`](Self::storage_withdrawn).
+    storage_withdrawn: bool,
 }
 
 impl PermissionState {
-    /// Builds a state in which exactly the permissions in `set` are set, for
-    /// tests and callers that compute the set directly.
+    /// Builds a state in which exactly the permissions in `set` are set, and
+    /// nothing is withdrawn, for tests and callers that compute the set
+    /// directly.
     #[must_use]
     pub const fn new(set: PermissionSet) -> Self {
-        Self { set }
+        Self {
+            set,
+            storage_withdrawn: false,
+        }
+    }
+
+    /// The same state, recording whether device storage was explicitly
+    /// withdrawn. Set by assembly from what the signal providers answered,
+    /// scoped to the jurisdiction's storage baseline.
+    #[must_use]
+    pub const fn with_storage_withdrawn(self, storage_withdrawn: bool) -> Self {
+        Self {
+            storage_withdrawn,
+            ..self
+        }
+    }
+
+    /// Whether the request carries an explicit signal withdrawing device
+    /// storage, rather than merely lacking the permission.
+    ///
+    /// The difference is destructive. A withdrawal expires the browser cookie
+    /// and writes the authoritative identity-graph tombstone, where a
+    /// permission that is simply not set strips the Edge Cookie response
+    /// headers and leaves an already-issued identifier alone, so a returning
+    /// visitor is not permanently withdrawn before they ever get to answer.
+    /// Which scheme can withdraw is each provider's to say, and only where the
+    /// jurisdiction's storage baseline did not grant storage outright.
+    #[must_use]
+    pub const fn storage_withdrawn(&self) -> bool {
+        self.storage_withdrawn
     }
 
     /// Whether a single permission is set.
@@ -894,35 +901,16 @@ struct SignalsSpec {
 }
 
 /// The `signals.tcf` block.
+///
+/// Only whether a TCF record answers for this deployment. Which purpose grants
+/// which Data Use is the TCF scheme's own knowledge and lives in the TCF
+/// permission signal provider crate, so this file carries no table of another
+/// scheme's numbers and a deployment running no TCF configures none.
 #[derive(Debug, Deserialize)]
 struct TcfSignalSpec {
     /// Whether a present TCF record's grants and revokes apply.
     #[serde(default = "default_true")]
     authoritative: bool,
-    /// TCF purpose number to the Data Use, or list of Data Uses, it grants
-    /// (and revokes when the record does not consent to that purpose).
-    #[serde(default)]
-    purposes: BTreeMap<u8, DataUseList>,
-}
-
-/// One Data Use, or a list of Data Uses, granted by a single TCF purpose.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DataUseList {
-    /// A single Data Use identifier.
-    One(String),
-    /// A list of Data Use identifiers.
-    Many(Vec<String>),
-}
-
-impl DataUseList {
-    /// The Data Use identifiers this value names, in written order.
-    fn identifiers(&self) -> &[String] {
-        match self {
-            DataUseList::One(one) => core::slice::from_ref(one),
-            DataUseList::Many(many) => many,
-        }
-    }
 }
 
 /// The `signals.us_opt_out` block.
@@ -1304,11 +1292,6 @@ pub enum PermissionsError {
     /// A permission flag or modification named an unknown permission.
     #[display("unknown permission `{name}`")]
     UnknownPermission { name: String },
-    /// A Data Use appeared under more than one TCF purpose in `signals.tcf`.
-    #[display(
-        "Data Use `{name}` is granted by more than one TCF purpose; map each Data Use to a single purpose"
-    )]
-    DuplicateTcfDataUse { name: String },
     /// An acquisition rule was not `granted`, `requires_signal`, or `denied`.
     #[display("unknown acquisition rule `{value}` (expected granted, requires_signal, or denied)")]
     UnknownAcquisition { value: String },
@@ -2238,9 +2221,6 @@ rules:
 signals:
   tcf:
     authoritative: true
-    purposes:
-      1: necessary.operations.storage
-      4: advertising_marketing.first_party.targeted
   us_opt_out:
     sources: [gpc]
     revokes: [advertising_marketing.first_party.targeted]
@@ -2248,21 +2228,6 @@ signals:
         let maps = PermissionMaps::from_yaml(yaml).expect("should parse the signals section");
         let signals = maps.signals();
         assert!(signals.tcf_authoritative(), "tcf should be authoritative");
-        assert_eq!(
-            signals.tcf_purpose(Permission::StoreOnDevice),
-            Some(1),
-            "Purpose 1 should map to device storage"
-        );
-        assert_eq!(
-            signals.tcf_purpose(Permission::SelectPersonalisedAds),
-            Some(4),
-            "Purpose 4 should map to targeted advertising"
-        );
-        assert_eq!(
-            signals.tcf_purpose(Permission::CreateAdsProfile),
-            None,
-            "an unmapped Data Use has no purpose"
-        );
         assert!(
             signals.opt_out_revokes(Permission::SelectPersonalisedAds),
             "a listed Data Use is revoked by the opt-out"
