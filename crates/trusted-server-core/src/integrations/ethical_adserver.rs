@@ -1538,6 +1538,7 @@ mod tests {
                 user_agent: Some("Mozilla/5.0 (fictional test agent)".to_string()),
                 ip: Some("203.0.113.7".to_string()),
                 geo: None,
+                attributes: None,
             }),
             site: None,
             context: HashMap::new(),

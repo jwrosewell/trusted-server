@@ -131,8 +131,8 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, asset_response_carries_body, handle_asset_proxy_request,
-    handle_first_party_click,
-    handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
+    handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
