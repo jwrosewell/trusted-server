@@ -263,6 +263,35 @@ pull_sync_concurrency = 3
 # enabled = true
 # region = "us_east"
 # profile_set = "default_images"
+#
+# Optional upstream proxy for fetches to named hosts. Some publishers refuse a
+# request from a data centre address and answer with a bot-check interstitial
+# instead of the page, whatever the request looks like, and an exit on a
+# residential network is what gets the page.
+#
+# Only the hosts listed here take the exit and every other fetch goes out from
+# this server's own address, which matters because such exits are metered by the
+# gigabyte and cannot reach a loopback service at all. An empty or absent hosts
+# list means the exit is never used, so a half-written config sends nothing
+# through a paid third party rather than everything.
+#
+# There is no fallback: when the exit cannot be prepared the fetch is refused,
+# because a quiet direct fetch would make a refusing publisher look
+# intermittently reachable.
+# [proxy.egress]
+# In url, "{session}" is replaced with the current session token, which is how a
+# provider is asked for a different exit address, and "{secret}" with the value
+# of password_secret read from secret_store, so this file never carries the
+# password.
+# url = "http://customer-acme-cc-gb-sessid-{session}:{secret}@gateway.example.com:7777"
+# hosts = ["*.publisher.example"]
+# How long one exit address is kept. 0, the default, keeps one for the life of
+# the process. There is no per-request setting: one page's assets would arrive
+# from many addresses and a publisher tying a session to an address would then
+# serve a broken page.
+# session_ttl_seconds = 600
+# secret_store = "ts_secrets"
+# password_secret = "egress_proxy_password"
 
 # Reusable Fastly Image Optimizer profile sets referenced by asset routes.
 # Supported IO params are a strict subset: quality, resize-filter, format,
