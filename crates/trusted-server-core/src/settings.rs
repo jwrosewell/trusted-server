@@ -2,6 +2,7 @@
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use glob::{MatchOptions, Pattern};
+use rand::Rng as _;
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
@@ -2104,6 +2105,204 @@ impl ProxyAssetRoute {
     }
 }
 
+/// The literal text in [`EgressProxy::url`] replaced with the session token.
+const EGRESS_SESSION_PLACEHOLDER: &str = "{session}";
+
+/// The literal text in [`EgressProxy::url`] replaced with the gateway password.
+const EGRESS_SECRET_PLACEHOLDER: &str = "{secret}";
+
+/// An upstream proxy that outbound fetches to named hosts are sent through.
+///
+/// Some publishers refuse a request from a data centre address and answer with
+/// an interstitial rather than the page, whatever the request itself looks
+/// like. Retrying from the same address never succeeds. Sending only those
+/// publishers' fetches out through an exit on a residential network is what
+/// gets the page.
+///
+/// Only the hosts in [`hosts`](Self::hosts) take the exit and everything else
+/// goes out directly, which matters twice over, because such exits are sold by
+/// the gigabyte and because a service on the loopback address cannot be
+/// reached through one at all.
+///
+/// There is no fallback. When the exit cannot be reached the fetch fails and
+/// the reader is told the site refused the request. Falling back to a direct
+/// fetch would make a refusing publisher look intermittently fixed, depending
+/// on whether the exit happened to be up, and nobody could then trust a
+/// measurement of it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressProxy {
+    /// The provider's gateway, as `http://user:password@host:port`.
+    ///
+    /// Two pieces of literal text in it are replaced before use. `{session}`
+    /// becomes the current session token, which is how a provider is asked for
+    /// a different exit address. Providers spell that part differently and
+    /// carry it in the user name, so a placeholder keeps this setting free of
+    /// any one provider's naming. `{secret}` becomes the password read from
+    /// [`secret_store`](Self::secret_store), so configuration can name the
+    /// exit without carrying the password.
+    ///
+    /// A URL with no `{session}` in it is a fixed exit that never rotates.
+    ///
+    /// Redacted in logs and error messages, because an operator may still
+    /// write the password inline.
+    pub url: Redacted<String>,
+    /// The destination hosts that take the exit.
+    ///
+    /// Matched exactly (`"example.com"`) or by subdomain wildcard
+    /// (`"*.example.com"`, which also matches the apex), case-insensitively,
+    /// the same way [`Proxy::allowed_domains`] is matched.
+    ///
+    /// Empty, which is the default, means the exit is never used. A half
+    /// written configuration therefore sends nothing at all through a paid
+    /// third party, rather than everything.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub hosts: Vec<String>,
+    /// How long one exit address is kept, in seconds.
+    ///
+    /// Zero, the default, keeps one exit for the life of the process. Above
+    /// zero, a new session token is issued once that many seconds have passed
+    /// and the provider answers from a different address.
+    ///
+    /// There is deliberately no per-request rotation. One page's assets would
+    /// then arrive from many addresses, and a publisher that ties a session to
+    /// an address breaks the page in a way that reads as our fault.
+    #[serde(default)]
+    pub session_ttl_seconds: u64,
+    /// The secret store holding the gateway password.
+    #[serde(default = "default_egress_secret_store")]
+    pub secret_store: String,
+    /// The key in [`secret_store`](Self::secret_store) whose value replaces
+    /// `{secret}` in [`url`](Self::url).
+    ///
+    /// Empty, the default, means no password is looked up, and a URL still
+    /// containing `{secret}` is then refused at startup rather than sent to
+    /// the provider with the placeholder still in it.
+    #[serde(default)]
+    pub password_secret: String,
+}
+
+fn default_egress_secret_store() -> String {
+    "ts_secrets".to_owned()
+}
+
+impl EgressProxy {
+    /// Whether a fetch to `host` is sent through the exit.
+    #[must_use]
+    pub fn applies_to(&self, host: &str) -> bool {
+        self.hosts
+            .iter()
+            .any(|pattern| crate::proxy::is_host_allowed(host, pattern))
+    }
+
+    /// Whether [`url`](Self::url) needs a password from the secret store.
+    #[must_use]
+    pub fn needs_secret(&self) -> bool {
+        self.url.expose().contains(EGRESS_SECRET_PLACEHOLDER)
+    }
+
+    /// The gateway URL to use, with both placeholders replaced.
+    ///
+    /// The result carries the password, so callers must never log it.
+    #[must_use]
+    pub fn resolve_url(&self, session: &str, secret: &str) -> Redacted<String> {
+        Redacted::new(
+            self.url
+                .expose()
+                .replace(EGRESS_SESSION_PLACEHOLDER, session)
+                .replace(EGRESS_SECRET_PLACEHOLDER, secret),
+        )
+    }
+
+    /// A fresh session token, which is what asks the provider for a different
+    /// exit address.
+    ///
+    /// The token picks an exit rather than proving anything, so it needs to be
+    /// distinct rather than unguessable, and a provider scopes sessions to the
+    /// account they were opened under.
+    #[must_use]
+    pub fn new_session_token() -> String {
+        let mut rng = rand::thread_rng();
+        (0..16)
+            .map(|_| {
+                let digit: u32 = rng.gen_range(0..16);
+                char::from_digit(digit, 16).unwrap_or('0')
+            })
+            .collect()
+    }
+
+    fn normalize(&mut self) {
+        self.url = Redacted::new(self.url.expose().trim().to_owned());
+        self.secret_store = self.secret_store.trim().to_owned();
+        self.password_secret = self.password_secret.trim().to_owned();
+        self.hosts = self
+            .hosts
+            .iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+
+        if self.hosts.is_empty() {
+            log::warn!(
+                "proxy.egress.hosts is empty, so no fetch will be sent through \
+                 the configured exit"
+            );
+        }
+    }
+
+    /// Check that the configured exit can actually be used.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the URL is empty, is not an `http`
+    /// or `https` URL with a host, or asks for a password that no secret has
+    /// been named for. Each of those would otherwise surface much later as a
+    /// publisher that cannot be fetched, which reads as the publisher's fault.
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.url.expose().is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "proxy.egress.url must not be empty".to_owned(),
+            }));
+        }
+
+        if self.needs_secret() && self.password_secret.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "proxy.egress.url contains {secret} but \
+                          proxy.egress.password_secret names no secret to \
+                          resolve it from"
+                    .to_owned(),
+            }));
+        }
+
+        // Both placeholders are replaced with stand-in text first, because the
+        // URL only parses once they are gone and the real values are not
+        // available this early.
+        let candidate = self.resolve_url("session", "secret");
+        let parsed = Url::parse(candidate.expose()).map_err(|_| {
+            Report::new(TrustedServerError::Configuration {
+                message: "proxy.egress.url is not a valid URL".to_owned(),
+            })
+        })?;
+
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.egress.url must be an http or https URL, not {}",
+                    parsed.scheme()
+                ),
+            }));
+        }
+
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "proxy.egress.url must name a host".to_owned(),
+            }));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
@@ -2145,6 +2344,12 @@ pub struct Proxy {
     /// Defaults to `false`, so an existing deployment is unchanged.
     #[serde(default)]
     pub rewrite_asset_urls: bool,
+    /// An upstream proxy that fetches to named hosts are sent out through.
+    ///
+    /// Absent by default, which sends every fetch out from this server's own
+    /// address, as it always has.
+    #[serde(default)]
+    pub egress: Option<EgressProxy>,
 }
 
 fn default_certificate_check() -> bool {
@@ -2166,6 +2371,7 @@ impl Default for Proxy {
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
             rewrite_asset_urls: false,
+            egress: None,
         }
     }
 }
@@ -2205,6 +2411,10 @@ impl Proxy {
             route.normalize();
         }
 
+        if let Some(egress) = self.egress.as_mut() {
+            egress.normalize();
+        }
+
         let mut seen_prefixes = HashSet::new();
         for route in &self.asset_routes {
             if !route.prefix.is_empty() && !seen_prefixes.insert(route.prefix.clone()) {
@@ -2235,6 +2445,10 @@ impl Proxy {
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         for route in &self.asset_routes {
             route.prepare_runtime()?;
+        }
+
+        if let Some(egress) = self.egress.as_ref() {
+            egress.prepare_runtime()?;
         }
 
         Ok(())
@@ -7224,6 +7438,7 @@ origin_host_header_overide = "www.example.com""#,
             ],
             asset_routes: vec![],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert_eq!(
@@ -7245,6 +7460,7 @@ origin_host_header_overide = "www.example.com""#,
             ],
             asset_routes: vec![],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert_eq!(
@@ -7261,6 +7477,7 @@ origin_host_header_overide = "www.example.com""#,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert_eq!(
@@ -7277,6 +7494,7 @@ origin_host_header_overide = "www.example.com""#,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert!(
@@ -7292,6 +7510,7 @@ origin_host_header_overide = "www.example.com""#,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert!(
@@ -7311,6 +7530,7 @@ origin_host_header_overide = "www.example.com""#,
                 ..Default::default()
             }],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
         assert_eq!(
@@ -7336,6 +7556,7 @@ origin_host_header_overide = "www.example.com""#,
                 ..Default::default()
             }],
             rewrite_asset_urls: false,
+            egress: None,
         };
         proxy.normalize();
 
@@ -7816,6 +8037,7 @@ origin_host_header_overide = "www.example.com""#,
                 },
             ],
             rewrite_asset_urls: false,
+            egress: None,
         };
 
         let route = proxy
@@ -7845,6 +8067,7 @@ origin_host_header_overide = "www.example.com""#,
                 },
             ],
             rewrite_asset_urls: false,
+            egress: None,
         };
 
         let route = proxy
@@ -7997,6 +8220,154 @@ origin_host_header_overide = "www.example.com""#,
         assert_eq!(
             settings.proxy.asset_routes[0].origin_url, "https://assets.example.com:8443",
             "should preserve valid origin URL with non-standard port"
+        );
+    }
+
+    /// An exit configured the way an operator would write one.
+    fn egress_toml(url: &str) -> String {
+        crate_test_settings_str()
+            + &format!(
+                r#"
+            [proxy]
+
+            [proxy.egress]
+            url = "{url}"
+            hosts = ["*.Publisher.Example"]
+            password_secret = "gateway_password"
+            "#
+            )
+    }
+
+    #[test]
+    fn proxy_egress_is_absent_unless_configured() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should accept settings with no exit");
+        assert!(
+            settings.proxy.egress.is_none(),
+            "a deployment that configured no exit should have none"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_accepts_a_gateway_and_lowercases_its_hosts() {
+        let settings = Settings::from_toml(&egress_toml(
+            "http://user-{session}:{secret}@gate.example:7777",
+        ))
+        .expect("should accept a valid exit");
+        let egress = settings.proxy.egress.expect("should carry the exit");
+        assert_eq!(
+            egress.hosts,
+            vec!["*.publisher.example".to_owned()],
+            "should lowercase the exit's hosts so matching is case-insensitive"
+        );
+        assert_eq!(
+            egress.session_ttl_seconds, 0,
+            "should keep one exit for the life of the process by default"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_matches_hosts_the_way_allowed_domains_does() {
+        let settings = Settings::from_toml(&egress_toml(
+            "http://user-{session}:{secret}@gate.example:7777",
+        ))
+        .expect("should accept a valid exit");
+        let egress = settings.proxy.egress.expect("should carry the exit");
+
+        assert!(
+            egress.applies_to("www.publisher.example"),
+            "a subdomain should take the exit"
+        );
+        assert!(
+            egress.applies_to("PUBLISHER.EXAMPLE"),
+            "the apex should take the exit whatever its case"
+        );
+        assert!(
+            !egress.applies_to("evil-publisher.example"),
+            "a name that merely ends the same way must not take the exit"
+        );
+        assert!(
+            !egress.applies_to("cloud.51degrees.com"),
+            "a host nobody listed must not take the exit"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_replaces_both_placeholders() {
+        let settings = Settings::from_toml(&egress_toml(
+            "http://user-{session}:{secret}@gate.example:7777",
+        ))
+        .expect("should accept a valid exit");
+        let egress = settings.proxy.egress.expect("should carry the exit");
+
+        assert!(egress.needs_secret(), "should know it needs a password");
+        assert_eq!(
+            egress.resolve_url("abc123", "hunter2").expose(),
+            "http://user-abc123:hunter2@gate.example:7777",
+            "should replace the session token and the password"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_url_is_redacted_in_debug_output() {
+        let settings = Settings::from_toml(&egress_toml(
+            "http://user-{session}:written-inline@gate.example:7777",
+        ))
+        .expect("should accept a valid exit");
+        let egress = settings.proxy.egress.expect("should carry the exit");
+
+        assert!(
+            !format!("{egress:?}").contains("written-inline"),
+            "a password written inline must never reach a log or an error"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_rejects_a_password_placeholder_with_no_secret_named() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [proxy.egress]
+            url = "http://user-{session}:{secret}@gate.example:7777"
+            hosts = ["*.publisher.example"]
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject {secret} with no secret named");
+        assert!(
+            format!("{err:?}").contains("password_secret"),
+            "should say which setting is missing: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_rejects_a_gateway_that_is_not_http() {
+        let err = Settings::from_toml(&egress_toml(
+            "socks5://user-{session}:{secret}@gate.example",
+        ))
+        .expect_err("should reject a non-http gateway");
+        assert!(
+            format!("{err:?}").contains("http or https"),
+            "should say the gateway must be http or https: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_rejects_a_gateway_that_is_not_a_url() {
+        let err = Settings::from_toml(&egress_toml("gate.example:7777"))
+            .expect_err("should reject a gateway that is not a URL");
+        assert!(
+            format!("{err:?}").contains("proxy.egress.url"),
+            "should name the setting at fault: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_session_tokens_differ() {
+        assert_ne!(
+            EgressProxy::new_session_token(),
+            EgressProxy::new_session_token(),
+            "each token should ask the provider for a different address"
         );
     }
 

@@ -18,6 +18,8 @@ use trusted_server_core::platform::{
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
+use trusted_server_core::redacted::Redacted;
+use trusted_server_core::settings::EgressProxy;
 
 // ---------------------------------------------------------------------------
 // Env-var naming helpers
@@ -346,10 +348,31 @@ impl Future for AxumPendingHandle {
 /// the first completing handle, preserving fan-out semantics.
 pub struct AxumPlatformHttpClient {
     client: reqwest::Client,
+    /// The exit that could not be prepared, and why, so a fetch to one of its
+    /// hosts is refused rather than quietly sent directly.
+    unavailable_egress: Option<(EgressProxy, String)>,
+}
+
+/// How one request-scoped client reaches the network.
+pub enum EgressExit {
+    /// Every fetch leaves from this server's own address.
+    None,
+    /// Fetches to the exit's hosts go through `url`, and everything else
+    /// leaves from this server's own address.
+    Ready {
+        egress: EgressProxy,
+        /// The gateway with its placeholders already replaced. Carries the
+        /// password, so it must never be logged.
+        url: Redacted<String>,
+    },
+    /// An exit is configured but could not be prepared, so fetches to its
+    /// hosts are refused.
+    Unavailable { egress: EgressProxy, reason: String },
 }
 
 impl AxumPlatformHttpClient {
-    /// Create a new client with sensible dev-server timeouts.
+    /// Create a new client with sensible dev-server timeouts, sending every
+    /// request out from this server's own address.
     ///
     /// # Panics
     ///
@@ -357,17 +380,66 @@ impl AxumPlatformHttpClient {
     /// happen with the default TLS configuration on any supported platform).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(30))
-                // Disable automatic redirects: core proxy code enforces redirect
-                // limits and allowed_domains checks itself. Without this, reqwest
-                // would follow Location headers internally and bypass those checks.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("should build reqwest client"),
+        Self::with_egress(EgressExit::None)
+    }
+
+    /// Create a new client that sends fetches to the exit's hosts through it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `reqwest::Client` cannot be built (should not
+    /// happen with the default TLS configuration on any supported platform).
+    #[must_use]
+    pub fn with_egress(exit: EgressExit) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            // Disable automatic redirects: core proxy code enforces redirect
+            // limits and allowed_domains checks itself. Without this, reqwest
+            // would follow Location headers internally and bypass those checks.
+            .redirect(reqwest::redirect::Policy::none());
+
+        let mut unavailable_egress = None;
+
+        match exit {
+            EgressExit::None => {}
+            EgressExit::Ready { egress, url } => {
+                // Note for whoever comes next: setting HTTPS_PROXY in this
+                // process's environment does nothing, and does it silently.
+                // The workspace builds reqwest with default features off, and
+                // `system-proxy`, which reads the environment and the Windows
+                // registry, is one of the defaults dropped. An explicit proxy
+                // is the only one this client will use, which is also what
+                // lets the gateway credentials change between requests, since
+                // the closure runs on every one.
+                let gateway = url.expose().clone();
+                builder = builder.proxy(reqwest::Proxy::custom(move |destination| {
+                    let host = destination.host_str()?;
+                    egress.applies_to(host).then(|| gateway.clone())
+                }));
+            }
+            EgressExit::Unavailable { egress, reason } => {
+                unavailable_egress = Some((egress, reason));
+            }
         }
+
+        Self {
+            client: builder.build().expect("should build reqwest client"),
+            unavailable_egress,
+        }
+    }
+
+    /// Whether `uri` names a host whose exit could not be prepared.
+    ///
+    /// A fetch to such a host is refused rather than sent directly. A quiet
+    /// direct fetch would make a publisher that only answers the exit look
+    /// intermittently reachable, depending on whether the exit happened to be
+    /// configured, and no measurement of it could then be trusted.
+    fn egress_unavailable_for(&self, uri: &str) -> Option<&str> {
+        let (egress, reason) = self.unavailable_egress.as_ref()?;
+        let parsed = reqwest::Url::parse(uri).ok()?;
+        let host = parsed.host_str()?;
+        egress.applies_to(host).then_some(reason.as_str())
     }
 
     /// Drain `body` to a `Vec<u8>`.
@@ -401,6 +473,13 @@ impl AxumPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let uri = request.request.uri().to_string();
+        if let Some(reason) = self.egress_unavailable_for(&uri) {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "refusing to fetch {uri} directly: it is configured to leave \
+                 through an exit that could not be prepared ({reason})"
+            )));
+        }
+
         let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
             .change_context(PlatformError::HttpClient)?;
 
@@ -467,6 +546,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 
         // Extract all Send-compatible parts before spawning.
         let uri = request.request.uri().to_string();
+        if let Some(reason) = self.egress_unavailable_for(&uri) {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "refusing to fetch {uri} directly: it is configured to leave \
+                 through an exit that could not be prepared ({reason})"
+            )));
+        }
+
         let method_bytes = request.request.method().as_str().as_bytes().to_vec();
         let headers: Vec<(String, Vec<u8>)> = request
             .request
@@ -716,6 +802,93 @@ fn kv_store() -> Arc<dyn PlatformKvStore> {
 }
 
 // ---------------------------------------------------------------------------
+// Egress proxy
+// ---------------------------------------------------------------------------
+
+/// The session token in use, and when it was issued.
+///
+/// Process-wide, because one appliance serves one publisher and the token is
+/// what decides which address that publisher's fetches arrive from. Holding it
+/// per request would give every asset on a page a different address.
+static EGRESS_SESSION: OnceLock<std::sync::Mutex<(String, std::time::Instant)>> = OnceLock::new();
+
+/// The session token to use now, issuing a new one when the configured
+/// lifetime has passed.
+///
+/// A `ttl_seconds` of zero keeps one token for the life of the process.
+fn egress_session_token(ttl_seconds: u64) -> String {
+    let cell = EGRESS_SESSION.get_or_init(|| {
+        std::sync::Mutex::new((EgressProxy::new_session_token(), std::time::Instant::now()))
+    });
+
+    // A poisoned lock means another request panicked while holding it. The
+    // token behind it is still a usable token, so recover it rather than
+    // failing this fetch.
+    let mut guard = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if ttl_seconds > 0 && guard.1.elapsed() >= Duration::from_secs(ttl_seconds) {
+        *guard = (EgressProxy::new_session_token(), std::time::Instant::now());
+        log::info!(
+            "egress proxy: issued a new session token after {ttl_seconds}s, so \
+             fetches now leave from a different address"
+        );
+    }
+
+    guard.0.clone()
+}
+
+/// Work out how this request reaches the network.
+///
+/// Returns [`EgressExit::Unavailable`] rather than [`EgressExit::None`] when an
+/// exit is configured but its password cannot be read, so the fetch is refused
+/// instead of quietly leaving from this server's own address.
+fn resolve_egress_exit(
+    settings: &trusted_server_core::settings::Settings,
+    secrets: &dyn PlatformSecretStore,
+) -> EgressExit {
+    let Some(egress) = settings.proxy.egress.as_ref() else {
+        return EgressExit::None;
+    };
+
+    let secret = if egress.needs_secret() {
+        let store = StoreName::from(egress.secret_store.clone());
+        match secrets.get_bytes(&store, &egress.password_secret) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(secret) => secret,
+                Err(_) => {
+                    return EgressExit::Unavailable {
+                        egress: egress.clone(),
+                        reason: format!(
+                            "the secret `{}` in store `{}` is not text",
+                            egress.password_secret, egress.secret_store
+                        ),
+                    };
+                }
+            },
+            Err(_) => {
+                return EgressExit::Unavailable {
+                    egress: egress.clone(),
+                    reason: format!(
+                        "the secret `{}` could not be read from store `{}`",
+                        egress.password_secret, egress.secret_store
+                    ),
+                };
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let session = egress_session_token(egress.session_ttl_seconds);
+    EgressExit::Ready {
+        url: egress.resolve_url(&session, &secret),
+        egress: egress.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
@@ -766,7 +939,9 @@ pub fn build_runtime_services(
         // client across requests previously regressed the Next.js server-action →
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
-        .http_client(Arc::new(AxumPlatformHttpClient::new()))
+        .http_client(Arc::new(AxumPlatformHttpClient::with_egress(
+            resolve_egress_exit(settings, &AxumPlatformSecretStore),
+        )))
         // Route through the [geo] provider selector like the Fastly adapter,
         // so the selector behaves the same on every adapter.
         .geo(trusted_server_core::platform::build_geo_provider(
@@ -859,6 +1034,8 @@ fn forwarded_client_ip_with_hops(headers: &HeaderMap, hops: usize) -> Option<IpA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
     fn forwarded(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1176,6 +1353,193 @@ mod tests {
         });
 
         format!("http://{addr}/")
+    }
+
+    // -----------------------------------------------------------------------
+    // Egress proxy
+    // -----------------------------------------------------------------------
+
+    /// A stand-in gateway that answers one request and reports what it was
+    /// sent, which is the only way to show a fetch really left through it.
+    async fn spawn_gateway() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind stand-in gateway");
+        let addr = listener.local_addr().expect("should read local address");
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("should accept request");
+            let mut received = [0; 2048];
+            let read = stream
+                .read(&mut received)
+                .await
+                .expect("should read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("should write response");
+            String::from_utf8_lossy(&received[..read]).into_owned()
+        });
+
+        (format!("{addr}"), handle)
+    }
+
+    /// An exit configured for `publisher.example` only, pointed at `gateway`.
+    fn test_egress(gateway: &str) -> EgressProxy {
+        EgressProxy {
+            url: Redacted::new(format!("http://user-{{session}}:{{secret}}@{gateway}")),
+            hosts: vec!["publisher.example".to_owned()],
+            session_ttl_seconds: 0,
+            secret_store: "ts_secrets".to_owned(),
+            password_secret: "gateway_password".to_owned(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn egress_proxy_carries_a_matching_fetch_with_its_credentials() {
+        // Arrange.
+        let (gateway, received) = spawn_gateway().await;
+        let egress = test_egress(&gateway);
+        let client = AxumPlatformHttpClient::with_egress(EgressExit::Ready {
+            url: egress.resolve_url("abc123", "s3cret"),
+            egress,
+        });
+        let request = edgezero_core::http::request_builder()
+            .uri("http://publisher.example/page")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        // Act.
+        let response = client
+            .send(PlatformHttpRequest::new(request, "test"))
+            .await
+            .expect("should reach the stand-in gateway");
+        let sent = received.await.expect("gateway task should finish");
+
+        // Assert. The absolute-form request line is what a proxy is sent, so
+        // its presence is the proof the fetch did not go direct.
+        assert_eq!(
+            response.response.status().as_u16(),
+            200,
+            "should return the gateway's answer"
+        );
+        assert!(
+            sent.starts_with("GET http://publisher.example/page HTTP/1.1"),
+            "the gateway should be sent the absolute-form request line, got: {sent}"
+        );
+
+        // Both placeholders must have been replaced before the credentials
+        // went on the wire, so the session token really does select the exit.
+        let expected = BASE64_STANDARD.encode("user-abc123:s3cret");
+        assert!(
+            sent.to_ascii_lowercase()
+                .contains(&format!("proxy-authorization: basic {expected}").to_ascii_lowercase()),
+            "the gateway should be sent the resolved credentials, got: {sent}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn egress_proxy_leaves_an_unlisted_host_alone() {
+        // Arrange. The gateway address is bound and dropped, so the port is
+        // closed: a fetch wrongly sent through it cannot succeed.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind probe listener");
+        let gateway = format!("{}", closed.local_addr().expect("should read address"));
+        drop(closed);
+
+        let origin = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let egress = test_egress(&gateway);
+        let client = AxumPlatformHttpClient::with_egress(EgressExit::Ready {
+            url: egress.resolve_url("abc123", "s3cret"),
+            egress,
+        });
+        let request = edgezero_core::http::request_builder()
+            .uri(origin)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        // Act.
+        let response = client.send(PlatformHttpRequest::new(request, "test")).await;
+
+        // Assert.
+        assert_eq!(
+            response
+                .expect("a host outside the exit's list should go direct")
+                .response
+                .status()
+                .as_u16(),
+            200,
+            "should return the origin's answer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exit_that_could_not_be_prepared_refuses_rather_than_going_direct() {
+        // Arrange. The host is served locally, so a direct fetch would work
+        // and the refusal is the behavior under test rather than a side
+        // effect of the host being unreachable.
+        let origin = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let host = reqwest::Url::parse(&origin)
+            .expect("should parse origin url")
+            .host_str()
+            .expect("origin should have a host")
+            .to_owned();
+        let mut egress = test_egress("127.0.0.1:1");
+        egress.hosts = vec![host];
+        let client = AxumPlatformHttpClient::with_egress(EgressExit::Unavailable {
+            egress,
+            reason: "the secret could not be read".to_owned(),
+        });
+        let request = edgezero_core::http::request_builder()
+            .uri(origin)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        // Act.
+        let result = client.send(PlatformHttpRequest::new(request, "test")).await;
+
+        // Assert.
+        assert!(
+            result.is_err(),
+            "a host whose exit is unavailable must be refused, not fetched directly"
+        );
+    }
+
+    #[test]
+    fn a_session_token_is_kept_when_no_lifetime_is_set() {
+        assert_eq!(
+            egress_session_token(0),
+            egress_session_token(0),
+            "one exit should be kept for the life of the process"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_exit_is_none() {
+        let settings = trusted_server_core::settings::Settings::default();
+        assert!(
+            matches!(
+                resolve_egress_exit(&settings, &AxumPlatformSecretStore),
+                EgressExit::None
+            ),
+            "a deployment that configured no exit should send every fetch direct"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_password_makes_the_exit_unavailable() {
+        let mut settings = trusted_server_core::settings::Settings::default();
+        settings.proxy.egress = Some(test_egress("gateway.example:7777"));
+
+        // No environment variable backs the secret, so it cannot be read.
+        assert!(
+            matches!(
+                resolve_egress_exit(&settings, &AxumPlatformSecretStore),
+                EgressExit::Unavailable { .. }
+            ),
+            "an exit whose password cannot be read must not fall back to a direct fetch"
+        );
     }
 
     // -----------------------------------------------------------------------
