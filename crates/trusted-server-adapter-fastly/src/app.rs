@@ -1736,9 +1736,11 @@ mod tests {
 
                 [auction]
                 enabled = true
-                [auction.providers.prebid]
-                protocol = "openrtb-2.6"
-                profile = "prebid-server"
+                [demand]
+                provider = ["prebid"]
+
+                [demand.prebid]
+                implementation = "prebid_server"
                 endpoint = "https://test-prebid.com/openrtb2/auction"
                 timeout_ms = 2000
             "#,
@@ -1809,9 +1811,11 @@ mod tests {
 
             [auction]
             enabled = true
-            [auction.providers.prebid]
-            protocol = "openrtb-2.6"
-            profile = "prebid-server"
+            [demand]
+            provider = ["prebid"]
+
+            [demand.prebid]
+            implementation = "prebid_server"
             endpoint = "https://test-prebid.com/openrtb2/auction"
             timeout_ms = 2000
             "#,
@@ -3234,7 +3238,6 @@ mod tests {
 
                     [auction]
                     enabled = true
-                    providers = {}
 
                     [creative_opportunities]
                     gam_network_id = "99999"
