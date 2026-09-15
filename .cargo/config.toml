@@ -32,10 +32,10 @@ clippy-fastly = "clippy -p trusted-server-core -p trusted-server-adapter-fastly 
 test-fastly = "test -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-device-fastly -p trusted-server-geo-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
 
 # --- Axum adapter (native dev server) ---
-build-axum = "build -p trusted-server-adapter-axum"
-check-axum = "check -p trusted-server-adapter-axum"
-clippy-axum = "clippy -p trusted-server-adapter-axum --all-targets --all-features -- -D warnings"
-test-axum = "test -p trusted-server-adapter-axum"
+build-axum = "build -p trusted-server-adapter-axum -p trusted-server-geo-51degrees"
+check-axum = "check -p trusted-server-adapter-axum -p trusted-server-geo-51degrees"
+clippy-axum = "clippy -p trusted-server-adapter-axum -p trusted-server-geo-51degrees --all-targets --all-features -- -D warnings"
+test-axum = "test -p trusted-server-adapter-axum -p trusted-server-geo-51degrees"
 
 # --- Cloudflare adapter (native host + wasm32-unknown-unknown) ---
 # Build/check target the WASM runtime (requires the `cloudflare` feature);

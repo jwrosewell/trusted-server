@@ -379,6 +379,14 @@ to read before changing any provider configuration.
 only. They are not page integrations and cannot be named in
 `[integration] provider`.
 
+A vendor whose backend answers more than one of these lives in **one crate**
+supplying every provider it can, rather than one crate per capability. Splitting
+it would split the request too, because each crate would hold its own client and
+each would pay for its own call to the same service.
+`crates/geo/51degrees` is that shape, with one module id, `fiftyone_degrees`,
+written to `[geo] provider`, `[device] provider` and `[ec] provider`, and one
+cloud answer shared between the three.
+
 Principles for adding or changing a provider:
 
 - **Core stays neutral.** The trait and the host-neutral default live in

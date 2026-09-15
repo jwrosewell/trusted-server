@@ -1,0 +1,727 @@
+//! Edge Cookie identity from the 51Did in the same 51Degrees cloud answer.
+//!
+//! The identifier is created by the service, not by this crate, and arrives as
+//! the `fodid` element of the response the geo and device providers already
+//! paid for. So selecting this provider alongside the other two costs no extra
+//! call.
+//!
+//! # The identifier is transported, not altered
+//!
+//! The service issues standard base64, which uses `+`, `/` and `=`. Core's Edge
+//! Cookie alphabet is `[A-Za-z0-9._~-]` and refuses all three, and its cap is
+//! 256 characters against a measured identifier length of 184. So the raw form
+//! cannot be a cookie value, and writing it produces a cookie that is silently
+//! refused on the next request with nothing logged anywhere.
+//!
+//! This provider therefore writes the URL-safe alphabet, a pure substitution of
+//! `-` for `+` and `_` for `/` with the padding dropped. It is exactly
+//! reversible by [`from_cookie_form`], which exists so anything handing the
+//! identifier back to 51Degrees can recover the spelling the service issued.
+//! The identifier is carried, not changed.
+//!
+//! # Why [`accepts_id`](EdgeCookieProvider::accepts_id) and
+//! [`normalize_id_for_kv`](EdgeCookieProvider::normalize_id_for_kv) are both
+//! overridden
+//!
+//! Because not overriding them is a bug this project has already shipped once.
+//! The defaults describe the built-in HMAC identifier, which is `<64 hex>.<6
+//! alphanumeric>` and is judged case-insensitively. A 51Did is base64, which is
+//! longer, carries `+`, `/` and `=`, and **is case-sensitive**. Left on the
+//! defaults, a perfectly good identifier is written to the cookie and then
+//! silently refused on read-back, so every visitor looks new on every request
+//! and nothing anywhere reports an error. That is the same failure the alphabet
+//! causes, reached by a different route.
+//!
+//! The round-trip test at the bottom of this file is the one that would have
+//! caught it.
+//!
+//! # What this provider does not do
+//!
+//! It does not create an identifier when the service returned none. A key
+//! without the identity entitlement, or a request with no `User-Agent`, yields
+//! no `fodid`, and this returns no identifier rather than falling back to
+//! something derived here. An Edge Cookie that claims to be a 51Did and is not
+//! would be worse than no Edge Cookie, because everything downstream treats the
+//! provider code as a statement of where the identifier came from.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use error_stack::Report;
+use trusted_server_core::ec::provider::{
+    ClientResolveInput, EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput, ProviderCode,
+};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::permissions::{Permission, PermissionSet, PermissionState};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::provider_code;
+
+use crate::PROVIDER_ID;
+use crate::client::{CloudAnswer, CloudClient};
+use crate::device::evidence_for_usage;
+use crate::verify::{self, KeyCache};
+
+/// This provider's registered code, the `51dd~` namespace of every identifier
+/// it creates.
+///
+/// Allocated in the provider-code registry so no other provider can create a
+/// colliding identifier. Core applies it at creation and checks it at
+/// read-back, and this provider only ever sees its own value part.
+pub const IDENTITY_PROVIDER_CODE: ProviderCode = provider_code!("51dd");
+
+/// How the identifier may be used, written into the identifier the service
+/// signs.
+///
+/// This is not a hint that selects an engine. Measured against the live service
+/// on 6 September 2026: two calls asking for the same usage share 96 characters
+/// of 184, and changing the usage collapses that to 22. So the value is part of
+/// the identifier, and an identifier created under one usage is not usable as
+/// another.
+///
+/// `marketing` is deliberately absent. The service returned no identifier at
+/// all for it on the key measured, so offering it would be offering a value
+/// that silently yields nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    /// The visitor permits personalized advertising.
+    Personalized,
+    /// The visitor permits storage but not personalized advertising.
+    Standard,
+    /// Everything else, including a visitor who has not been asked yet.
+    NonMarketing,
+}
+
+impl Usage {
+    /// The spelling the service expects.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Personalized => "personalized",
+            Self::Standard => "standard",
+            Self::NonMarketing => "non-marketing",
+        }
+    }
+
+    /// The usage the resolved permissions imply.
+    ///
+    /// # The mapping, and why it is the permissions rather than a setting
+    ///
+    /// The usage has to be the visitor's own answer. A configured constant
+    /// would stamp every identifier the same whatever anyone chose, which is
+    /// how this provider behaved until now and is the defect this replaces.
+    /// The permission state is the resolved answer for this request, by
+    /// whatever route it was established, so it is the honest source.
+    ///
+    /// Selecting personalized advertising is the permission that distinguishes
+    /// personalized from standard. Storing on the device is the floor for
+    /// having an identifier at all. Neither, or no permission state supplied,
+    /// falls to non-marketing, which is the last resort rather than the
+    /// default.
+    ///
+    /// # What this does not fix
+    ///
+    /// Timing. On a first page view, before the visitor has answered, the
+    /// permissions are the policy baseline and not a choice, so the identifier
+    /// can still be created too early carrying non-marketing. Correcting that
+    /// means replacing an identifier when the choice arrives, which the
+    /// client-cycle specification currently refuses.
+    #[must_use]
+    pub fn from_permissions(permissions: Option<&PermissionState>) -> Self {
+        let Some(permissions) = permissions else {
+            return Self::NonMarketing;
+        };
+        if permissions.is_set(Permission::SelectPersonalisedAds) {
+            return Self::Personalized;
+        }
+        if permissions.is_set(Permission::StoreOnDevice) {
+            return Self::Standard;
+        }
+        Self::NonMarketing
+    }
+}
+
+/// The longest identifier this provider will accept.
+///
+/// Core caps a whole Edge Cookie value at 256 characters. This provider's code
+/// prefix, `51dd~`, takes five of them, so 250 leaves the full value inside
+/// core's cap whether core measures the value part or the whole cookie. A real
+/// identifier measured against the live service is 184 characters, so this is
+/// headroom rather than a squeeze.
+const MAX_ID_BYTES: usize = 250;
+
+/// Edge Cookie provider backed by the 51Did in a 51Degrees cloud answer.
+#[derive(Debug)]
+pub struct FiftyOneDegreesIdentity {
+    client: Arc<CloudClient>,
+    critical_client_hints: bool,
+    /// Whether a 51Did's signature is checked before it is accepted.
+    verify_signatures: bool,
+    /// The signers whose public keys this process has fetched.
+    ///
+    /// Shared by the two paths an identifier arrives on, so a key fetched
+    /// while accepting a client-posted value is the one read-back uses a
+    /// moment later.
+    keys: KeyCache,
+}
+
+impl FiftyOneDegreesIdentity {
+    /// Creates a provider sharing one client, and so one call, with the other
+    /// providers this crate supplies.
+    #[must_use]
+    pub fn new(
+        client: Arc<CloudClient>,
+        critical_client_hints: bool,
+        verify_signatures: bool,
+    ) -> Self {
+        Self {
+            client,
+            critical_client_hints,
+            verify_signatures,
+            keys: KeyCache::new(),
+        }
+    }
+
+    /// The client hint headers to set alongside the identifier.
+    ///
+    /// # Why these ride on the identity response
+    ///
+    /// `Accept-CH` and `Critical-CH` are response headers, so a meta tag cannot
+    /// carry them and the head injector cannot help. The only seam that reaches
+    /// a response header is the Edge Cookie provider's, and it fires when an
+    /// identifier is being created: no cookie yet, a provider selected, and the
+    /// permissions set.
+    ///
+    /// That firing condition happens to be the right one. A visitor with no
+    /// Edge Cookie is a visitor the browser has not yet been asked for hints,
+    /// and one who has both has already been asked. So the headers go out
+    /// exactly once per visitor rather than on every page.
+    fn client_hint_headers(
+        &self,
+        answer: &CloudAnswer,
+    ) -> Vec<(http::HeaderName, http::HeaderValue)> {
+        let Some(accept_ch) = crate::head::accept_ch_from_answer(answer) else {
+            return Vec::new();
+        };
+        let Ok(value) = http::HeaderValue::from_str(&accept_ch) else {
+            return Vec::new();
+        };
+        let mut headers = vec![(http::HeaderName::from_static("accept-ch"), value.clone())];
+        if self.critical_client_hints {
+            headers.push((http::HeaderName::from_static("critical-ch"), value));
+        }
+        headers
+    }
+}
+
+/// Reads the identifier out of a cloud answer and puts it in cookie form.
+///
+/// Returns `None` when the service produced none, which is the ordinary case
+/// for a key without the identity entitlement rather than a failure.
+#[must_use]
+pub fn identifier_from_answer(answer: &CloudAnswer) -> Option<String> {
+    let raw = answer
+        .element("fodid")?
+        .get("idprobglobal")?
+        .as_str()?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value = to_cookie_form(raw);
+    if !is_well_formed(&value) {
+        log::warn!(
+            "51Degrees returned an identifier that cannot be carried in a cookie,              {} characters, issuing none",
+            value.len()
+        );
+        return None;
+    }
+    Some(value)
+}
+
+/// Converts the service's identifier into the form a cookie can carry.
+///
+/// The service returns standard base64, which uses `+`, `/` and `=`. Core's
+/// Edge Cookie alphabet is `[A-Za-z0-9._~-]` and refuses all three, so a raw
+/// identifier is written and then dropped on read-back, with nothing to see.
+/// This is the URL-safe alphabet, which is a pure substitution and exactly
+/// reversible by [`from_cookie_form`], so the identifier is transported rather
+/// than altered.
+#[must_use]
+pub fn to_cookie_form(raw: &str) -> String {
+    raw.replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_owned()
+}
+
+/// Converts a cookie-form identifier back to the form the service issued.
+///
+/// Provided because anything that hands the identifier onward to 51Degrees
+/// needs the original spelling, and the substitution above is only safe if the
+/// way back exists and is tested.
+#[must_use]
+pub fn from_cookie_form(value: &str) -> String {
+    let mut raw = value.replace('-', "+").replace('_', "/");
+    // Base64 is padded to a multiple of four characters, and a remainder of one
+    // is a length base64 cannot have. Restoring three padding characters there
+    // would build a string that looks valid and decodes to nothing, so a value
+    // that was never an identifier is returned untouched instead.
+    let padding = match raw.len() % 4 {
+        0 => 0,
+        2 => 2,
+        3 => 1,
+        _ => return raw,
+    };
+    raw.push_str(&"=".repeat(padding));
+    raw
+}
+
+/// Whether `value` has the shape of an identifier this provider issues.
+///
+/// Deliberately a shape check and not a signature check. Core asks this to
+/// decide whether an incoming cookie is worth reading back, and the answer must
+/// not depend on reaching a service, because that would put a network call in
+/// front of every request that carries a cookie.
+#[must_use]
+fn is_well_formed(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[async_trait(?Send)]
+impl EdgeCookieProvider for FiftyOneDegreesIdentity {
+    fn id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
+    fn code(&self) -> ProviderCode {
+        IDENTITY_PROVIDER_CODE
+    }
+
+    async fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        input: &IdentityInput<'_>,
+        services: &RuntimeServices,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // The visitor's own answer, not a constant. See `Usage`.
+        let usage = Usage::from_permissions(input.permissions);
+        let evidence = evidence_for_usage(request_info, Some(usage.as_str()));
+        // A failure here is not an error the request should carry. The caller
+        // logs a failed generation and serves the response with no Edge Cookie,
+        // which is what a service outage should cost: no identity, not a broken
+        // page.
+        let answer = match self.client.answer(&evidence, services).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                log::warn!("51Degrees identity unavailable, issuing no Edge Cookie: {error:?}");
+                return Ok(GeneratedEdgeCookie::default());
+            }
+        };
+
+        Ok(GeneratedEdgeCookie {
+            id: identifier_from_answer(&answer),
+            response_headers: self.client_hint_headers(&answer),
+        })
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        // Not the default. The default describes the built-in HMAC shape and
+        // would refuse every identifier this provider creates.
+        if !is_well_formed(value) {
+            return false;
+        }
+
+        // An incoming cookie is a value the browser sent, so the shape check
+        // alone answers only "it looks like base64 of about the right length",
+        // which anyone can produce. Verify the signature when the signer's key
+        // is already known.
+        //
+        // This method cannot await, so it cannot fetch a key it does not have.
+        // Before the first fetch, a well-formed value is accepted, which is
+        // the behavior every version of this provider had until now. That
+        // window closes on the first request that reaches the client or
+        // generation path, both of which fetch. Narrowing it further means
+        // core asking this question somewhere it can await.
+        let Some(identifier) = verify::parse(value) else {
+            return false;
+        };
+        if !self.verify_signatures {
+            // Still required to be a real envelope, because a value that is not
+            // one was never issued by this provider whatever the setting says.
+            return true;
+        }
+        let (signer, _) = verify::signer_of(&identifier);
+        match self.keys.cached(&signer) {
+            Some(pem) => verify::signature_is_valid(&identifier, &pem),
+            None => true,
+        }
+    }
+
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        // Not the default either. The default lowercases the leading segment,
+        // and base64 is case-sensitive, so lowercasing would fold distinct
+        // identifiers onto one storage key.
+        value.to_owned()
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // Writes the Edge Cookie to the device, so it requires permission to
+        // store on the device. Whether that needs a signal is decided by the
+        // country rules, not here.
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+
+    async fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+        services: &RuntimeServices,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // The page has obtained a 51Did itself, which is the deployment where
+        // the identifier binds to the visitor's own connection rather than to
+        // this appliance's. The value arrives from the browser, so it is
+        // proved before it is believed.
+        let posted = core::str::from_utf8(input.payload)
+            .unwrap_or_default()
+            .trim();
+        if posted.is_empty() {
+            return Ok(GeneratedEdgeCookie::default());
+        }
+
+        // Core strips the provider code before this point, so what arrives is
+        // this provider's own value part.
+        let Some(identifier) = verify::parse(posted) else {
+            log::warn!("51Degrees resolve refused: the posted value is not an OWID envelope");
+            return Ok(GeneratedEdgeCookie::default());
+        };
+
+        if !self.verify_signatures {
+            log::warn!(
+                "51Degrees resolve accepted a client-created identifier without checking \
+                 its signature, because verify_signatures is off"
+            );
+            let value = to_cookie_form(posted);
+            return Ok(GeneratedEdgeCookie {
+                id: is_well_formed(&value).then_some(value),
+                response_headers: Vec::new(),
+            });
+        }
+
+        // The envelope names its own signer. A forged claim simply names a
+        // signer whose key will not verify it, so the claim is safe to follow.
+        let (signer, version) = verify::signer_of(&identifier);
+        let pem = match self.keys.fetch(&signer, version, services).await {
+            Ok(pem) => pem,
+            Err(error) => {
+                // Unverifiable is refused, not accepted. An identifier taken on
+                // trust could be another visitor's, which would key this
+                // visitor into that person's identity graph row.
+                log::warn!(
+                    "51Degrees resolve refused: could not obtain the public key for `{signer}`: {error:?}"
+                );
+                return Ok(GeneratedEdgeCookie::default());
+            }
+        };
+
+        if !verify::signature_is_valid(&identifier, &pem) {
+            log::warn!("51Degrees resolve refused: the signature from `{signer}` did not verify");
+            return Ok(GeneratedEdgeCookie::default());
+        }
+
+        let value = to_cookie_form(posted);
+        if !is_well_formed(&value) {
+            return Ok(GeneratedEdgeCookie::default());
+        }
+        log::info!("51Degrees resolve accepted a client-created identifier signed by `{signer}`");
+        Ok(GeneratedEdgeCookie {
+            id: Some(value),
+            response_headers: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A genuine 51Did, in cookie form, issued by the live service on
+    /// 6 September 2026 for the documentation address `2.125.160.216` and a
+    /// public User-Agent, with usage `standard`.
+    ///
+    /// A real one rather than a constructed one, because verification parses
+    /// the OWID envelope and a synthetic string of the right length and
+    /// alphabet is not an envelope. That is the point of the check, so the
+    /// fixture has to be able to pass it.
+    ///
+    /// It is an identifier and not a credential: it names no person, it is
+    /// derived from a documentation address, and it grants nothing to whoever
+    /// holds it.
+    ///
+    /// The envelope carries an issue date. If a signature check ever becomes
+    /// time sensitive this fixture will start failing, and the fix is to
+    /// re-issue it rather than to weaken the test.
+    const RAW: &str = concat!(
+        "AzUxZC5lcwAAnTUAOAAAAAO0QCeyssTdisT2z2p0qZDZm4XUXOcsDv-l72JjWeuXhOutUrsA0S",
+        "UdRWs6FIAQBJAXCty5wQvRfmtnnZKWGsjYukBZWM_NfTQq1ANXdmOQIjtXLK1s6cl0XOZtnOUm",
+        "4PQrwiQi76ebHEBu7Q1IHp45faEO56P1Zw",
+    );
+
+    fn provider() -> FiftyOneDegreesIdentity {
+        FiftyOneDegreesIdentity::new(
+            Arc::new(CloudClient::new(
+                "https://cloud.example.com/api/v4/json".to_owned(),
+                500,
+                true,
+            )),
+            false,
+            true,
+        )
+    }
+
+    fn answer_with(identifier: &str) -> CloudAnswer {
+        CloudAnswer::new(json!({ "fodid": { "idprobglobal": identifier } }))
+    }
+
+    #[test]
+    fn a_real_identifier_becomes_a_cookie_core_will_carry() {
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
+
+        assert!(
+            created
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~')),
+            "core refuses any other character, and refuses it silently, got {created}"
+        );
+        assert!(
+            created.len() + "51dd~".len() <= 256,
+            "core caps the whole cookie value and the code prefix counts, got {}",
+            created.len()
+        );
+    }
+
+    #[test]
+    fn the_fixture_is_the_shape_the_service_returns() {
+        // A fixture that drifts from the real shape tests nothing, and this
+        // file exists because the exact length and alphabet are what break.
+        assert_eq!(
+            RAW.len(),
+            182,
+            "a measured identifier is 182 in cookie form"
+        );
+        assert!(
+            RAW.contains('-') || RAW.contains('_'),
+            "the cookie form uses the URL-safe alphabet"
+        );
+        assert!(
+            crate::verify::parse(RAW).is_some(),
+            "the fixture has to be a real envelope, because verification parses it"
+        );
+    }
+
+    #[test]
+    fn a_value_base64_could_never_be_is_returned_untouched() {
+        // A length with remainder one cannot come from base64. Inventing three
+        // padding characters would produce a string that looks valid and
+        // decodes to nothing.
+        let impossible = "abcde";
+
+        assert_eq!(
+            from_cookie_form(impossible),
+            impossible,
+            "a value that was never an identifier must not be dressed up as one"
+        );
+    }
+
+    #[test]
+    fn the_cookie_form_returns_the_service_spelling_exactly() {
+        // RAW is already the cookie form, so the round trip is checked from
+        // the service's own spelling, which is what from_cookie_form produces.
+        let service_spelling = from_cookie_form(RAW);
+
+        assert!(
+            service_spelling.contains('+') || service_spelling.contains('/'),
+            "the service uses the standard alphabet, so the way back has to restore it"
+        );
+        assert_eq!(
+            to_cookie_form(&service_spelling),
+            RAW,
+            "the substitution is only safe because the way back is exact, and anything \
+             handing this identifier to 51Degrees needs the spelling it issued"
+        );
+    }
+
+    #[test]
+    fn an_identifier_survives_the_round_trip_verbatim() {
+        let provider = provider();
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
+
+        assert!(
+            provider.accepts_id(&created),
+            "an identifier this provider created must be one it accepts, or every visitor \
+             looks new on every request and nothing reports an error"
+        );
+        assert_eq!(
+            provider.normalize_id_for_kv(&created),
+            created,
+            "the identifier is case-sensitive, so the storage key must be it unchanged"
+        );
+    }
+
+    #[test]
+    fn the_built_in_defaults_would_have_dropped_it() {
+        // The point of the two overrides, stated as a test rather than as a
+        // comment. If these defaults ever start accepting this shape the
+        // overrides can go; until then removing them silently breaks identity.
+        let created = identifier_from_answer(&answer_with(&from_cookie_form(RAW)))
+            .expect("the service returned one");
+
+        assert!(
+            !trusted_server_core::ec::generation::is_valid_ec_id(&created),
+            "the built-in shape check refuses this identifier, which is why accepts_id is \
+             overridden"
+        );
+        assert_ne!(
+            trusted_server_core::ec::generation::normalize_ec_id_for_kv(&created),
+            created,
+            "the built-in key normalization alters this identifier, which is why \
+             normalize_id_for_kv is overridden"
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_identifier_creates_none() {
+        let empty = CloudAnswer::new(json!({ "device": { "ismobile": true } }));
+
+        assert!(
+            identifier_from_answer(&empty).is_none(),
+            "a key without the identity entitlement returns no fodid, and inventing one \
+             would put a provider code on an identifier that did not come from that provider"
+        );
+    }
+
+    #[test]
+    fn a_null_identifier_creates_none() {
+        let null = CloudAnswer::new(json!({ "fodid": { "idprobglobal": null } }));
+
+        assert!(identifier_from_answer(&null).is_none());
+    }
+
+    #[test]
+    fn an_identifier_too_long_for_a_cookie_creates_none() {
+        let huge = answer_with(&"A".repeat(MAX_ID_BYTES + 1));
+
+        assert!(
+            identifier_from_answer(&huge).is_none(),
+            "writing a cookie core will refuse is worse than writing none, because the \
+             refusal is silent"
+        );
+    }
+
+    #[test]
+    fn an_identifier_with_characters_it_could_not_contain_is_refused() {
+        let provider = provider();
+
+        assert!(
+            !provider.accepts_id("has a space"),
+            "a cookie value is not a place to be generous about what is accepted"
+        );
+        assert!(
+            !provider.accepts_id(""),
+            "an empty cookie is not an identity"
+        );
+        assert!(
+            !provider.accepts_id(&"A".repeat(MAX_ID_BYTES + 1)),
+            "an unbounded cookie must not reach a storage key"
+        );
+        assert!(
+            !provider.accepts_id("AzUx+l72"),
+            "the raw alphabet is not the cookie alphabet, so a raw identifier arriving in \
+             a cookie did not come from this provider"
+        );
+    }
+
+    fn answer_naming_hints() -> CloudAnswer {
+        CloudAnswer::new(json!({"device": {
+            "setheaderbrowseraccept-ch": "Sec-CH-UA,Sec-CH-UA-Platform",
+            "setheaderhardwareaccept-ch": "Sec-CH-UA-Model",
+        }}))
+    }
+
+    fn provider_with(critical: bool) -> FiftyOneDegreesIdentity {
+        FiftyOneDegreesIdentity::new(
+            Arc::new(CloudClient::new(
+                "https://cloud.example.com/api/v4/json".to_owned(),
+                500,
+                true,
+            )),
+            critical,
+            true,
+        )
+    }
+
+    #[test]
+    fn the_accept_ch_header_rides_out_with_the_identifier() {
+        let headers = provider_with(false).client_hint_headers(&answer_naming_hints());
+
+        assert_eq!(headers.len(), 1, "Accept-CH only, got {headers:?}");
+        assert_eq!(headers[0].0.as_str(), "accept-ch");
+        assert_eq!(
+            headers[0].1.to_str().expect("should be text"),
+            "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Model"
+        );
+    }
+
+    #[test]
+    fn a_deployment_can_turn_critical_ch_off() {
+        // On by default, because without it the first page view of a session is
+        // priced on a User-Agent alone. A deployment that would rather serve
+        // that page immediately can switch it off, and this is that switch.
+        let headers = provider_with(false).client_hint_headers(&answer_naming_hints());
+
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.as_str() == "critical-ch"),
+            "got {headers:?}"
+        );
+    }
+
+    #[test]
+    fn critical_ch_is_sent_when_a_deployment_does_ask() {
+        let headers = provider_with(true).client_hint_headers(&answer_naming_hints());
+
+        let critical = headers
+            .iter()
+            .find(|(name, _)| name.as_str() == "critical-ch")
+            .expect("should be present when asked for");
+        assert_eq!(
+            critical.1.to_str().expect("should be text"),
+            "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Model",
+            "a browser retries only for the hints it was told are critical, so the two              headers have to name the same set"
+        );
+    }
+
+    #[test]
+    fn an_answer_naming_no_hints_sets_no_headers() {
+        let headers = provider_with(true).client_hint_headers(&CloudAnswer::new(json!({})));
+
+        assert!(headers.is_empty(), "got {headers:?}");
+    }
+
+    #[test]
+    fn the_provider_code_is_the_registered_one() {
+        assert_eq!(
+            provider().code().to_string(),
+            "51dd",
+            "the code is allocated in the registry, so changing it here would create \
+             identifiers that collide with another provider's"
+        );
+    }
+}
