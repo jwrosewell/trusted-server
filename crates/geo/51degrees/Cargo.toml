@@ -21,6 +21,11 @@ trusted-server-core = { workspace = true }
 # person's identity graph row. Pure parsing and signature checking, no HTTP of
 # its own, so the caller supplies both the key and the transport.
 fodid = "4.5.3"
+# The server side of 51Did verification from the same SDK: the signing key
+# schedule, the key in force when an identifier was created, and the cache
+# rules, over a transport this crate supplies from the platform client. No
+# built-in transport, because the platform owns every outbound call.
+fodid-client = { version = "4.5", default-features = false }
 async-trait = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }

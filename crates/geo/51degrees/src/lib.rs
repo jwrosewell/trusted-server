@@ -58,6 +58,7 @@ use crate::client::CloudClient;
 use crate::device::FiftyOneDegreesDevice;
 use crate::head::FiftyOneDegreesHeadInjector;
 use crate::identity::FiftyOneDegreesIdentity;
+use crate::verify::{KeySchedule, KeySource};
 
 /// Identifier for this vendor's module.
 ///
@@ -174,6 +175,17 @@ pub struct FiftyOneDegreesGeoConfig {
     /// worth taking.
     #[serde(default = "default_verify_signatures")]
     pub verify_signatures: bool,
+
+    /// The resource key the signing key schedule is fetched under, for
+    /// verifying signatures.
+    ///
+    /// Not needed when the endpoint is the cloud's own JSON endpoint,
+    /// `<base>/<resource key>.json`, because the key is read out of that path.
+    /// A self-hosted container's endpoint carries no key, so a deployment
+    /// verifying signatures against one names the key here. The schedule is
+    /// public under the key, so this is not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_key: Option<String>,
 }
 
 impl trusted_server_core::settings::IntegrationConfig for FiftyOneDegreesGeoConfig {}
@@ -366,9 +378,39 @@ pub fn register(
                 client,
                 config.critical_client_hints,
                 config.verify_signatures,
+                key_schedule(&config)?,
             )))
             .build(),
     ))
+}
+
+/// The signing key schedule a configuration verifies against, or none when
+/// it verifies nothing.
+///
+/// # Errors
+///
+/// Returns a configuration error when signatures are to be verified and
+/// neither the endpoint nor `resource_key` names a resource key, because a
+/// provider that cannot fetch keys would refuse every posted identifier and
+/// say so only at request time.
+fn key_schedule(
+    config: &FiftyOneDegreesGeoConfig,
+) -> Result<Option<KeySchedule>, Report<TrustedServerError>> {
+    if !config.verify_signatures {
+        return Ok(None);
+    }
+    KeySource::from_endpoint(&config.endpoint, config.resource_key.as_deref())
+        .map(|source| Some(KeySchedule::new(source)))
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[integration.{PROVIDER_ID}] verifies signatures but names no resource key: the \
+                     endpoint `{}` does not end in `<resource key>.json`, so set `resource_key` or \
+                     set `verify_signatures = false`",
+                    config.endpoint
+                ),
+            })
+        })
 }
 
 /// Validates the configuration for deployment and reports whether
@@ -379,7 +421,13 @@ pub fn register(
 /// Returns an error when the configuration block cannot be parsed or fails
 /// validation.
 pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    Ok(read_config(settings)?.is_some())
+    match read_config(settings)? {
+        Some(config) => {
+            key_schedule(&config)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// The builder an adapter passes to `build_state_with_registrations`.
@@ -551,7 +599,10 @@ mod tests {
 
     #[test]
     fn the_module_declares_a_geo_provider_the_selector_can_reach() {
-        let settings = settings_with(r#"endpoint = "http://127.0.0.1:8080/api/v4/json""#);
+        let settings = settings_with(
+            r#"endpoint = "http://127.0.0.1:8080/api/v4/json"
+            resource_key = "test-resource-key""#,
+        );
 
         let registration = register(&settings)
             .expect("should read the configuration")

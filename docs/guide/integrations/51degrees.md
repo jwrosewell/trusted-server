@@ -50,8 +50,9 @@ and pay for its own call to the same service.
   identity. It is transported in the URL-safe base64 alphabet, because the
   Edge Cookie alphabet refuses `+`, `/` and `=`, and converted back
   exactly whenever it is handed to 51Degrees. A value posted by the browser
-  or carried in a cookie is verified against the signer's published key
-  before it is trusted, because an identifier taken on trust could be
+  or carried in a cookie is verified, through the 51Degrees SDK, against
+  the signing key in force when it was created, so a rotated key does not
+  refuse older identifiers, because an identifier taken on trust could be
   anyone's.
 
 ## Configuration
@@ -72,6 +73,8 @@ provider = ["fiftyone_degrees"]
 # multi-tenant service keys the path instead, for example
 # "https://cloud.51degrees.com/api/v4/<resource key>.json".
 endpoint = "http://127.0.0.1:8080/api/v4/json"
+# Only needed to verify 51Did signatures when the endpoint carries no key.
+resource_key = "<resource key>"
 timeout_ms = 500
 identity = true
 
@@ -87,13 +90,14 @@ provider = "fiftyone_degrees"
 
 ### Configuration Options
 
-| Field                   | Type    | Required | Description                                                                                                                                                                                   |
-| ----------------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `endpoint`              | string  | Yes      | The full URL of the JSON endpoint, including any resource key the deployment requires in the path.                                                                                            |
-| `timeout_ms`            | number  | No       | How long to wait for the service (default: `500`, range: `1`-`10000`). The lookup sits in front of the permission decision, so the default is short.                                          |
-| `identity`              | boolean | No       | Whether to ask the service for a 51Did as well (default: `false`). Asking for an identifier is a separate decision from asking where a request came from, and adds no extra round trip.       |
-| `critical_client_hints` | boolean | No       | Whether to send `Critical-CH` so the browser retries the first navigation carrying its client hints (default: `true`). Without it the first page view of a session is priced on a User-Agent. |
-| `verify_signatures`     | boolean | No       | Whether to verify the signature on a 51Did before accepting it (default: `true`). Off leaves only a shape check, so turn it off with a reason rather than as a default.                       |
+| Field                   | Type    | Required | Description                                                                                                                                                                                                                     |
+| ----------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`              | string  | Yes      | The full URL of the JSON endpoint, including any resource key the deployment requires in the path.                                                                                                                              |
+| `timeout_ms`            | number  | No       | How long to wait for the service (default: `500`, range: `1`-`10000`). The lookup sits in front of the permission decision, so the default is short.                                                                            |
+| `identity`              | boolean | No       | Whether to ask the service for a 51Did as well (default: `false`). Asking for an identifier is a separate decision from asking where a request came from, and adds no extra round trip.                                         |
+| `critical_client_hints` | boolean | No       | Whether to send `Critical-CH` so the browser retries the first navigation carrying its client hints (default: `true`). Without it the first page view of a session is priced on a User-Agent.                                   |
+| `verify_signatures`     | boolean | No       | Whether to verify the signature on a 51Did before accepting it (default: `true`). Off leaves only a shape check, so turn it off with a reason rather than as a default.                                                         |
+| `resource_key`          | string  | No       | The resource key the signing key schedule is fetched under when signatures are verified. Read from the endpoint path when the endpoint is the cloud form `<base>/<resource key>.json`, so only a self-hosted endpoint needs it. |
 
 ### Restrict the key to your domains
 
