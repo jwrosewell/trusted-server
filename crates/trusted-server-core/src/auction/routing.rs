@@ -622,6 +622,7 @@ mod tests {
                 user_agent: None,
                 ip: None,
                 geo: None,
+                attributes: None,
             }),
             site: Some(SiteInfo {
                 domain: "publisher.example.test".to_string(),
