@@ -147,6 +147,12 @@ export default withMermaid(
               items: [{ text: 'Lockr', link: '/guide/integrations/lockr' }],
             },
             {
+              text: 'Location, Device and Identity',
+              items: [
+                { text: '51Degrees', link: '/guide/integrations/51degrees' },
+              ],
+            },
+            {
               text: 'CMP',
               items: [
                 { text: 'Didomi', link: '/guide/integrations/didomi' },
