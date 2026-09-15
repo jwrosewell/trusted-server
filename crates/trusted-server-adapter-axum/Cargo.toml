@@ -33,6 +33,15 @@ trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-tcf = { workspace = true }
 trusted-server-permission-signal-us-privacy = { workspace = true }
+# The vendor geo and device provider. A real dependency, not a dev one: this
+# adapter is the composition root, so a module it does not hand to the registry
+# is one no deployment can select, and the selector then fails at startup
+# naming a module that is compiled into the binary. Core stays neutral, which
+# is the rule, and the adapter composing a vendor is how that rule is kept.
+#
+# Linking it does not turn it on. Its builder runs only when
+# `[integration] provider` names `fiftyone_degrees`.
+trusted-server-geo-51degrees = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
