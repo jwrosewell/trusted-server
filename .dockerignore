@@ -1,0 +1,47 @@
+# What the image build never needs. Everything else is copied into the
+# builder stage, so a missing entry here costs build context size and a
+# wrong entry breaks the build.
+
+# Build output. The builder stage uses its own cache mount.
+/target
+**/target/
+**/node_modules/
+
+# Repository metadata and tooling.
+.git
+.gitignore
+.github/
+.claude/
+.specstory/
+.vscode/
+.idea/
+.edgezero/
+
+# Local configuration and secrets, which reach the container as environment
+# variables rather than as files.
+.env
+.env.*
+trusted-server.toml
+js-assets.toml
+*.pem
+*.key
+
+# Local results and artifacts.
+/benchmark-results/
+/guest-profiles/
+**/test-results/
+**/playwright-report/
+**/.browser-test-state.json
+/spin
+/spin.sig
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+
+# Documentation, which the binary does not embed.
+docs/
+CHANGELOG.md
+CONTRIBUTING.md
+FAQ_POC.md
+ProjectGovernance.md
+TESTING.md

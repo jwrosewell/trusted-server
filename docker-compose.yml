@@ -1,0 +1,41 @@
+# Trusted Server appliance, published on the host as port 3010.
+#
+#   docker compose up --build
+#
+# Configuration reaches the process as environment variables, the way the
+# Axum adapter documents them in docs/guide/getting-started.md. Write them in
+# a `.env` file beside this one, which compose reads through `env_file` and
+# which git ignores. The three the adapter cannot start without are the
+# config store value carrying the TOML, and the secret store values for the
+# publisher proxy secret and the Edge Cookie passphrase:
+#
+#   TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=<toml>
+#   TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET=<secret>
+#   TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE=<secret>
+#
+# The origin is whatever `[publisher] origin_url` in that TOML names, and it
+# has to be reachable from inside the container, so a name that resolves on
+# the host but not on the compose network needs an entry in `extra_hosts`.
+#
+# The identity graph lives in the named volume below, so it survives a
+# container replacement. Remove the volume to start the appliance with no
+# remembered visitors.
+name: trusted-server
+
+services:
+  appliance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trusted-server-appliance:dev
+    ports:
+      - "3010:8787"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - identity:/var/lib/trusted-server
+    restart: unless-stopped
+
+volumes:
+  identity:
