@@ -60,7 +60,7 @@ use trusted_server_core::provider_code;
 use crate::PROVIDER_ID;
 use crate::client::{CloudAnswer, CloudClient};
 use crate::device::evidence_for_usage;
-use crate::verify::{self, KeyCache};
+use crate::verify::{self, KeySchedule};
 
 /// This provider's registered code, the `51dd~` namespace of every identifier
 /// it creates.
@@ -162,7 +162,10 @@ pub struct FiftyOneDegreesIdentity {
     /// Shared by the two paths an identifier arrives on, so a key fetched
     /// while accepting a client-posted value is the one read-back uses a
     /// moment later.
-    keys: KeyCache,
+    /// The signing key schedule, held when signatures are verified. Absent
+    /// only when `verify_signatures` is off, because a source is required to
+    /// build the provider with verification on.
+    keys: Option<KeySchedule>,
 }
 
 impl FiftyOneDegreesIdentity {
@@ -173,12 +176,13 @@ impl FiftyOneDegreesIdentity {
         client: Arc<CloudClient>,
         critical_client_hints: bool,
         verify_signatures: bool,
+        keys: Option<KeySchedule>,
     ) -> Self {
         Self {
             client,
             critical_client_hints,
             verify_signatures,
-            keys: KeyCache::new(),
+            keys,
         }
     }
 
@@ -355,9 +359,12 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
             // one was never issued by this provider whatever the setting says.
             return true;
         }
-        let (signer, _) = verify::signer_of(&identifier);
-        match self.keys.cached(&signer) {
-            Some(pem) => verify::signature_is_valid(&identifier, &pem),
+        match self
+            .keys
+            .as_ref()
+            .and_then(|keys| keys.cached_for(&identifier))
+        {
+            Some(key) => verify::signature_is_valid(&identifier, &key),
             None => true,
         }
     }
@@ -413,21 +420,35 @@ impl EdgeCookieProvider for FiftyOneDegreesIdentity {
 
         // The envelope names its own signer. A forged claim simply names a
         // signer whose key will not verify it, so the claim is safe to follow.
-        let (signer, version) = verify::signer_of(&identifier);
-        let pem = match self.keys.fetch(&signer, version, services).await {
-            Ok(pem) => pem,
-            Err(error) => {
-                // Unverifiable is refused, not accepted. An identifier taken on
-                // trust could be another visitor's, which would key this
-                // visitor into that person's identity graph row.
+        let signer = verify::signer_of(&identifier);
+        let Some(keys) = self.keys.as_ref() else {
+            // Registration refuses verification with no key source, so this
+            // is unreachable in a built provider and refused rather than
+            // trusted if it ever is reached.
+            log::warn!("51Degrees resolve refused: verification is on with no key source");
+            return Ok(GeneratedEdgeCookie::default());
+        };
+        // Unverifiable is refused, not accepted. An identifier taken on trust
+        // could be another visitor's, which would key this visitor into that
+        // person's identity graph row.
+        let key = match keys.key_for(&identifier, services).await {
+            Ok(Some(key)) => key,
+            Ok(None) => {
                 log::warn!(
-                    "51Degrees resolve refused: could not obtain the public key for `{signer}`: {error:?}"
+                    "51Degrees resolve refused: no signing key was in force at the date the \
+                     identifier claiming `{signer}` was created"
+                );
+                return Ok(GeneratedEdgeCookie::default());
+            }
+            Err(error) => {
+                log::warn!(
+                    "51Degrees resolve refused: could not obtain the signing keys: {error:?}"
                 );
                 return Ok(GeneratedEdgeCookie::default());
             }
         };
 
-        if !verify::signature_is_valid(&identifier, &pem) {
+        if !verify::signature_is_valid(&identifier, &key) {
             log::warn!("51Degrees resolve refused: the signature from `{signer}` did not verify");
             return Ok(GeneratedEdgeCookie::default());
         }
@@ -480,6 +501,7 @@ mod tests {
             )),
             false,
             true,
+            None,
         )
     }
 
@@ -663,6 +685,7 @@ mod tests {
             )),
             critical,
             true,
+            None,
         )
     }
 

@@ -85,6 +85,7 @@ fn settings_selecting_identity(extra: &str) -> Settings {
 
             [integration.fiftyone_degrees]
             endpoint = "http://127.0.0.1:8080/api/v4/json"
+            resource_key = "test-resource-key"
 
             {extra}
         "#
@@ -106,6 +107,7 @@ provider = ["fiftyone_degrees"]
 
 [integration.fiftyone_degrees]
 endpoint = "http://127.0.0.1:8080/api/v4/json"
+resource_key = "test-resource-key"
 "#;
 
 #[test]
@@ -186,6 +188,7 @@ provider = ["fiftyone_degrees"]
 
 [integration.fiftyone_degrees]
 endpoint = "http://127.0.0.1:8080/api/v4/json"
+resource_key = "test-resource-key"
 "#,
     );
 
@@ -218,6 +221,7 @@ provider = ["fiftyone_degrees"]
 
 [integration.fiftyone_degrees]
 endpoint = "http://127.0.0.1:8080/api/v4/json"
+resource_key = "test-resource-key"
 "#,
     );
     assert_eq!(
@@ -453,7 +457,7 @@ provider = "fiftyone_degrees"
 provider = ["fiftyone_degrees"]
 
 [integration.fiftyone_degrees]
-endpoint = "https://cloud.51degrees.com/api/v4/json"
+endpoint = "https://cloud.51degrees.com/api/v4/test-resource-key.json"
 "#,
     );
 
@@ -482,7 +486,7 @@ provider = "fiftyone_degrees"
 provider = ["fiftyone_degrees"]
 
 [integration.fiftyone_degrees]
-endpoint = "https://cloud.51degrees.com/api/v4/json"
+endpoint = "https://cloud.51degrees.com/api/v4/test-resource-key.json"
 "#,
     );
 

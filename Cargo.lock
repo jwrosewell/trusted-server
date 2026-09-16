@@ -1955,6 +1955,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fodid-client"
+version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d355993da4fb3f2d7848cfc6ba7136fce8c7d34ecbd1967606b1b0e001c3cc"
+dependencies = [
+ "chrono",
+ "fodid",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5665,6 +5677,7 @@ dependencies = [
  "edgezero-core",
  "error-stack",
  "fodid",
+ "fodid-client",
  "http",
  "log",
  "serde",
