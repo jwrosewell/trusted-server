@@ -27,6 +27,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::config::{CONFIG_PATHS, handle_config};
 use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permissions};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
@@ -936,6 +937,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         });
         for path in PERMISSIONS_PATHS {
             router = router.route(path, Method::GET, permissions.clone());
+        }
+
+        // The settings the deployment is running, masked, shown to anyone as
+        // a page and as data.
+        let config = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            Ok(handle_config(&s.settings, &req))
+        });
+        for path in CONFIG_PATHS {
+            router = router.route(path, Method::GET, config.clone());
         }
 
         let cache_purge_unsupported =

@@ -21,6 +21,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
 use trusted_server_core::inspect::permissions::{
     PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
 };
@@ -451,6 +452,7 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     Permissions,
+    Config,
     AdminNotSupported,
     CachePurgeNotSupported,
     AdminEcNotSupported,
@@ -482,7 +484,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
+fn named_routes() -> [NamedRoute; 21] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -504,6 +506,17 @@ fn named_routes() -> [NamedRoute; 19] {
             path: PERMISSIONS_JSON_PATH,
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::Permissions,
+        },
+        // The settings the deployment is running, masked, shown to anyone.
+        NamedRoute {
+            path: CONFIG_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Config,
+        },
+        NamedRoute {
+            path: CONFIG_JSON_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Config,
         },
         // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
         // and the production basic-auth handler regex (`^/_ts/admin`), so they
@@ -629,6 +642,7 @@ fn named_route_handler(
                     NamedRouteHandler::Permissions => {
                         handle_permissions(&state.settings, &services, &req).await
                     }
+                    NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather
                         // than a fallthrough 404, so a CMS webhook can tell "not supported

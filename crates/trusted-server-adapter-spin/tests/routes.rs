@@ -942,6 +942,41 @@ async fn permissions_endpoint_answers_anyone_as_data_and_as_a_page() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_endpoint_answers_anyone_and_masks_secrets() {
+    for (path, content_type) in [
+        ("/_ts/config.json", "application/json"),
+        ("/_ts/config", "text/html; charset=utf-8"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        let body = resp.into_body().into_bytes().unwrap_or_default();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("XXXX"),
+            "{path} should mask what it does not show"
+        );
+        assert!(
+            !text.contains("admin-pass"),
+            "{path} should not carry the admin password"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_does_not_require_auth() {
     let router = test_router();
     let req = request_builder()

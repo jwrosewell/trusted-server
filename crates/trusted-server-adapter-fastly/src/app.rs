@@ -30,6 +30,7 @@
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | GET | `/_ts/permissions` and `/_ts/permissions.json` | [`handle_permissions`] |
+//! | GET | `/_ts/config` and `/_ts/config.json` | [`handle_config`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
@@ -124,6 +125,7 @@ use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
+use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
 use trusted_server_core::inspect::permissions::{
     PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
 };
@@ -758,6 +760,12 @@ async fn execute_named(
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
+    // Read only, and it says nothing about the request, so it is answered
+    // ahead of everything a request passes through.
+    if matches!(handler, NamedRouteHandler::Config) {
+        return Ok(handle_config(&state.settings, &ctx.into_request()));
+    }
+
     let services = build_per_request_services(&state, &ctx);
     let mut req = ctx.into_request();
 
@@ -904,6 +912,9 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Permissions => {
             unreachable!("the permissions are answered before EC setup")
+        }
+        NamedRouteHandler::Config => {
+            unreachable!("the configuration is answered before EC setup")
         }
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
@@ -1346,6 +1357,7 @@ enum NamedRouteHandler {
     SetTester,
     ClearTester,
     Permissions,
+    Config,
     EcResolve,
     Auction,
     PageBids,
@@ -1471,6 +1483,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: PERMISSIONS_JSON_PATH,
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::Permissions,
+    },
+    // The settings the deployment is running, masked, shown to anyone.
+    NamedRoute {
+        path: CONFIG_PAGE_PATH,
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::Config,
+    },
+    NamedRoute {
+        path: CONFIG_JSON_PATH,
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::Config,
     },
     NamedRoute {
         path: "/_ts/api/v1/ec/resolve",
@@ -2581,6 +2604,42 @@ mod tests {
         }
 
         let page = route(&router, empty_request(Method::GET, "/_ts/permissions"));
+        assert_eq!(page.status(), StatusCode::OK, "the page should answer");
+        assert_eq!(
+            page.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn dispatch_config_answers_the_masked_settings_as_data_and_as_a_page() {
+        let router = test_router();
+
+        let data = route(&router, empty_request(Method::GET, "/_ts/config.json"));
+        assert_eq!(data.status(), StatusCode::OK, "the data form should answer");
+        assert_eq!(data.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(data.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            data.extensions().get::<super::EcFinalizeState>().is_none(),
+            "should not run the Edge Cookie lifecycle for a read"
+        );
+        let body = data.into_body().into_bytes().unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("the data form should be JSON");
+        assert_eq!(
+            payload["settings"]["publisher"]["domain"], "test-publisher.com",
+            "should show an ordinary setting"
+        );
+        assert_eq!(
+            payload["settings"]["publisher"]["proxy_secret"], "XXXX",
+            "should mask a secret"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("unit-test-proxy-secret"),
+            "should not carry the secret anywhere"
+        );
+
+        let page = route(&router, empty_request(Method::GET, "/_ts/config"));
         assert_eq!(page.status(), StatusCode::OK, "the page should answer");
         assert_eq!(
             page.headers()[header::CONTENT_TYPE],

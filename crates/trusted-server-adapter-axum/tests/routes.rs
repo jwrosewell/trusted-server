@@ -124,6 +124,8 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("GET", "/_ts/permissions"),
         ("GET", "/_ts/permissions.json"),
+        ("GET", "/_ts/config"),
+        ("GET", "/_ts/config.json"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
         ("GET", "/_ts/admin/ec"),
@@ -700,6 +702,50 @@ async fn permissions_endpoint_answers_anyone_as_data_and_as_a_page() {
             resp.headers()["cache-control"],
             "no-store",
             "{path} is one request's own answer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_endpoint_answers_anyone_and_masks_secrets() {
+    for (path, content_type) in [
+        ("/_ts/config.json", "application/json"),
+        ("/_ts/config", "text/html; charset=utf-8"),
+    ] {
+        let mut svc = make_service();
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("should read the body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("XXXX"),
+            "{path} should mask what it does not show"
+        );
+        assert!(
+            !text.contains("admin-pass"),
+            "{path} should not carry the admin password"
         );
     }
 }

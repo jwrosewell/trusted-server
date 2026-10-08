@@ -46,6 +46,8 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/config.json`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/config`                          | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
@@ -97,6 +99,63 @@ endpoint as authoritative.
 What a deployment shows to anyone who asks, with no credential. A publisher
 can point a reader, a regulator or an auditor at these addresses, and each
 sees what the deployment decided for their own request.
+
+### GET /\_ts/config and GET /\_ts/config.json
+
+Shows the settings the deployment is running, after defaults are applied.
+Anyone can read the scripts a page runs, and this lets anyone read the
+configuration that runs at the edge too. Every secret is masked, whatever the
+publisher's document says, and every value that is sensitive by default is
+masked unless the publisher shows it. The publisher decides what else is shown
+or hidden in [`[inspect]`](/guide/configuration#inspect), and `config = false`
+there answers `404 Not Found`. The first address answers a page, and the
+second answers the same information as JSON.
+
+**Contract:** Auth: none. Request body: not applicable. Rate limit: none.
+Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
+
+**Response:**
+
+- **Status:** `200 OK`
+- **Headers:** `Cache-Control: no-store`
+
+```json
+{
+  "masked": [
+    "handlers[0].password",
+    "handlers[0].path",
+    "handlers[0].username",
+    "publisher.origin_url",
+    "publisher.proxy_secret"
+  ],
+  "settings": {
+    "handlers": [{ "password": "XXXX", "path": "XXXX", "username": "XXXX" }],
+    "publisher": {
+      "cookie_domain": ".example.com",
+      "domain": "example.com",
+      "origin_url": "XXXX",
+      "proxy_secret": "XXXX"
+    }
+  },
+  "version": "0.1.0"
+}
+```
+
+| Field      | Meaning                                                                                                                                         |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `settings` | The running settings, with each masked value replaced by `XXXX` and every object's keys sorted, so the same settings always give the same bytes |
+| `masked`   | Every masked path, sorted, so a reader can see what was withheld                                                                                |
+| `version`  | The version of the core crate that answered                                                                                                     |
+
+A secret is masked twice over. The settings loader records each value it fills
+from the secret store, and those paths are masked. Then any string that still
+contains one of those values is masked wherever it sits, a key included.
+
+**Example:**
+
+```bash
+curl -s "https://edge.example.com/_ts/config.json"
+```
 
 ### GET /\_ts/permissions and GET /\_ts/permissions.json
 
@@ -1357,7 +1416,9 @@ universal numeric limits.
 CORS is endpoint-specific. `/_ts/api/v1/identify` implements a closed,
 publisher-domain policy and an explicit `OPTIONS` handler. Page-bids explicitly
 denies preflight. `/_ts/permissions` and `/_ts/permissions.json` answer any
-origin, because they show nothing but the asking request's own resolution. Several integration proxies preserve or synthesize only the
+origin, because they show nothing but the asking request's own resolution,
+and `/_ts/config` and `/_ts/config.json` answer any origin, because what they
+show is the same for every request. Several integration proxies preserve or synthesize only the
 headers described in their contract. `response_headers` is standard response
 finalization, not a substitute for registering and validating an `OPTIONS`
 route; do not infer cross-origin support from a configured header alone.
