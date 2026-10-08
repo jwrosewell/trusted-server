@@ -264,6 +264,8 @@ fn all_explicit_routes_are_registered() {
     let expected: &[(&str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json"),
         ("POST", "/verify-signature"),
+        ("GET", "/_ts/permissions"),
+        ("GET", "/_ts/permissions.json"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
         ("GET", "/_ts/admin/ec"),
@@ -567,6 +569,36 @@ async fn discovery_endpoint_does_not_require_auth() {
         401,
         "/.well-known/trusted-server.json must not require auth"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permissions_endpoint_answers_anyone_as_data_and_as_a_page() {
+    for (path, content_type) in [
+        ("/_ts/permissions.json", "application/json"),
+        ("/_ts/permissions", "text/html; charset=utf-8"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "no-store",
+            "{path} is one request's own answer"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

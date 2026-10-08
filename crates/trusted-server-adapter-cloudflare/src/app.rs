@@ -27,6 +27,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permissions};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -925,6 +926,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
             router = router.route(path, Method::GET, page_bids.clone());
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
+        }
+
+        // What the deployment decided for the asking request, shown to anyone
+        // as a page and as data. Read only, so nothing is written for the
+        // reader.
+        let permissions = make_handler(Arc::clone(&state), |s, services, req| async move {
+            handle_permissions(&s.settings, &services, &req).await
+        });
+        for path in PERMISSIONS_PATHS {
+            router = router.route(path, Method::GET, permissions.clone());
         }
 
         let cache_purge_unsupported =

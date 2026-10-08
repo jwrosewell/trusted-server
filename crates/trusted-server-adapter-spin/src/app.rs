@@ -28,6 +28,9 @@ use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
+use trusted_server_core::inspect::permissions::{
+    PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
+};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -375,10 +378,12 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
+        (PERMISSIONS_PAGE_PATH, &[Method::GET]),
+        (PERMISSIONS_JSON_PATH, &[Method::GET]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
         ("/_ts/admin/ec", &[Method::GET]),
@@ -804,6 +809,23 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
+        // /_ts/permissions and /_ts/permissions.json, what the deployment
+        // decided for the asking request, shown to anyone. Read only, so
+        // nothing is written for the reader.
+        let s = Arc::clone(&state);
+        let permissions_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let services = s.services_for_request(&ctx);
+                let req = ctx.into_request();
+                Ok::<Response, EdgeError>(
+                    handle_permissions(&s.settings, &services, &req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+
         // /verify-signature
         let s = Arc::clone(&state);
         let verify_handler = move |ctx: RequestContext| {
@@ -1097,6 +1119,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             })
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
+            .get(PERMISSIONS_PAGE_PATH, permissions_handler.clone())
+            .get(PERMISSIONS_JSON_PATH, permissions_handler)
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.

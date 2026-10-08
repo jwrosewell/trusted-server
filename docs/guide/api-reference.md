@@ -8,6 +8,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
 - [Admin Diagnostics](#admin-diagnostic-endpoints) - Protected EC troubleshooting
+- [Inspection Endpoints](#inspection-endpoints) - What a deployment shows to anyone who asks
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Utility Endpoints](#utility-endpoints) - Optional operational helpers
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -48,6 +49,8 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/_ts/permissions.json`                | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/permissions`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
 | normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
@@ -88,6 +91,66 @@ There is no repository-wide error body schema. Some handlers return structured
 JSON, some return an empty body, and shared adapter errors are plain text with
 safe client-facing messages. Treat the status and body documented for each
 endpoint as authoritative.
+
+## Inspection Endpoints
+
+What a deployment shows to anyone who asks, with no credential. A publisher
+can point a reader, a regulator or an auditor at these addresses, and each
+sees what the deployment decided for their own request.
+
+### GET /\_ts/permissions and GET /\_ts/permissions.json
+
+Shows the permissions resolved for the request that asks, the signals that
+produced them and the terms the data is held under. It is the evaluation a
+page receives as `window.tsjs.permissions`, resolved from the request's own
+signals and location. The first address answers a page, and the second
+answers the same information as JSON.
+
+**Contract:** Auth: none. Request body: not applicable. Rate limit: none.
+Endpoint-specific CORS: `Access-Control-Allow-Origin: *`, so a page on another
+site can render the data. A request from another origin carries no cookies, so
+that page reads the resolution of a request with no stored signal.
+
+**Response:**
+
+- **Status:** `200 OK`
+- **Headers:** `Cache-Control: no-store`, because each answer is the asking
+  request's own.
+
+```json
+{
+  "awaiting": [],
+  "modules": { "configured": ["gpc", "tcf"], "contributed": ["tcf"] },
+  "set": ["necessary.operations.storage"],
+  "signals": [{ "module": "tcf", "scheme": "tcf", "value": "CP..." }],
+  "storageWithdrawn": false,
+  "tdls": [],
+  "version": "0.1.0"
+}
+```
+
+| Field                 | Meaning                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------- |
+| `set`                 | The Data Use identifiers that are set for this request                                                    |
+| `awaiting`            | The ones still waiting for a signal that a configured module could give                                   |
+| `signals`             | Each signal a module read and found valid, as it was received, with the module that read it               |
+| `tdls`                | The terms documents the data is available under                                                           |
+| `storageWithdrawn`    | Whether the request explicitly withdrew device storage, as distinct from not setting it                   |
+| `modules.contributed` | The signal modules that produced a signal used in this resolution                                         |
+| `modules.configured`  | The signal modules the publisher configured, or `null` when it named none and the adapter's own list runs |
+| `version`             | The version of the core crate that answered                                                               |
+
+A module in `configured` and not in `contributed` ran and found nothing to
+work with, which is a different fact from a module that was never configured.
+
+Nothing is created or written for the reader. The Edge Cookie lifecycle does
+not run for this request, so no cookie is set and no identity row is written.
+
+**Example:**
+
+```bash
+curl -s "https://edge.example.com/_ts/permissions.json" -H "Sec-GPC: 1"
+```
 
 ## Utility Endpoints
 
@@ -1293,7 +1356,8 @@ universal numeric limits.
 
 CORS is endpoint-specific. `/_ts/api/v1/identify` implements a closed,
 publisher-domain policy and an explicit `OPTIONS` handler. Page-bids explicitly
-denies preflight. Several integration proxies preserve or synthesize only the
+denies preflight. `/_ts/permissions` and `/_ts/permissions.json` answer any
+origin, because they show nothing but the asking request's own resolution. Several integration proxies preserve or synthesize only the
 headers described in their contract. `response_headers` is standard response
 finalization, not a substitute for registering and validating an `OPTIONS`
 route; do not infer cross-origin support from a configured header alone.

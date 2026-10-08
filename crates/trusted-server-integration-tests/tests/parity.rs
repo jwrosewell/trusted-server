@@ -440,6 +440,65 @@ async fn discovery_route_body_is_json_parity() {
     }
 }
 
+/// The permissions a request resolves to are core's decision, so the
+/// endpoint that shows them answers the same on every adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permissions_endpoint_parity() {
+    use http_body_util::BodyExt as _;
+    use serde_json::Value;
+
+    const PATH: &str = "/_ts/permissions.json";
+
+    let (axum_status, axum_body) = {
+        let mut svc = EdgeZeroAxumService::new(axum_router());
+        let req = AxumRequest::builder()
+            .method("GET")
+            .uri(PATH)
+            .body(AxumBody::empty())
+            .expect("should build GET request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        let status = resp.status().as_u16();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body")
+            .to_bytes();
+        (status, body)
+    };
+    let (cf_status, cf_body) = {
+        let req = request_builder()
+            .method("GET")
+            .uri(PATH)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build GET request");
+        let resp = cf_router().oneshot(req).await.expect("should respond");
+        let status = resp.status().as_u16();
+        (status, resp.into_body().into_bytes().unwrap_or_default())
+    };
+    let (spin_status, _, spin_body) = spin_get_body(PATH).await;
+
+    assert_eq!(axum_status, 200, "Axum should answer {PATH}");
+    assert_eq!(cf_status, 200, "Cloudflare should answer {PATH}");
+    assert_eq!(spin_status, 200, "Spin should answer {PATH}");
+
+    let axum: Value = serde_json::from_slice(&axum_body).expect("Axum should answer JSON");
+    let cf: Value = serde_json::from_slice(&cf_body).expect("Cloudflare should answer JSON");
+    let spin: Value = serde_json::from_slice(&spin_body).expect("Spin should answer JSON");
+    assert_eq!(axum, cf, "{PATH} must match across adapters (axum, cf)");
+    assert_eq!(cf, spin, "{PATH} must match across adapters (cf, spin)");
+    assert!(
+        axum["set"].is_array() && axum["awaiting"].is_array(),
+        "the resolution should say what is set and what is awaited"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_route_parity() {
     // known divergence: without real signing-key configuration the handler may

@@ -21,6 +21,9 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::permissions::{
+    PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
+};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -447,6 +450,7 @@ fn fallback_handler(
 enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
+    Permissions,
     AdminNotSupported,
     CachePurgeNotSupported,
     AdminEcNotSupported,
@@ -478,7 +482,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 19] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -489,6 +493,17 @@ fn named_routes() -> [NamedRoute; 17] {
             path: "/verify-signature",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::VerifySignature,
+        },
+        // What the deployment decided for the asking request, shown to anyone.
+        NamedRoute {
+            path: PERMISSIONS_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Permissions,
+        },
+        NamedRoute {
+            path: PERMISSIONS_JSON_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Permissions,
         },
         // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
         // and the production basic-auth handler regex (`^/_ts/admin`), so they
@@ -610,6 +625,9 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::Permissions => {
+                        handle_permissions(&state.settings, &services, &req).await
                     }
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather

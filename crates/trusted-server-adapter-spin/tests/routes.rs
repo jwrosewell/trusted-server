@@ -912,6 +912,36 @@ async fn admin_route_with_wrong_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permissions_endpoint_answers_anyone_as_data_and_as_a_page() {
+    for (path, content_type) in [
+        ("/_ts/permissions.json", "application/json"),
+        ("/_ts/permissions", "text/html; charset=utf-8"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "no-store",
+            "{path} is one request's own answer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_does_not_require_auth() {
     let router = test_router();
     let req = request_builder()

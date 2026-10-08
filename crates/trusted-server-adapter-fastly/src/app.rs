@@ -29,6 +29,7 @@
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
+//! | GET | `/_ts/permissions` and `/_ts/permissions.json` | [`handle_permissions`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
@@ -123,6 +124,9 @@ use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
+use trusted_server_core::inspect::permissions::{
+    PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
+};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome,
@@ -807,6 +811,16 @@ async fn execute_named(
         return Ok(response);
     }
 
+    // Read only. The permissions are resolved for this request as a page's
+    // would be, then shown, and the Edge Cookie lifecycle never runs, so
+    // nothing is written for the reader.
+    if matches!(handler, NamedRouteHandler::Permissions) {
+        let response = handle_permissions(&state.settings, &services, &req)
+            .await
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     if let Err(report) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&report));
     }
@@ -888,6 +902,9 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::Permissions => {
+            unreachable!("the permissions are answered before EC setup")
+        }
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
             // creating, so it takes the same bot-gated graph as generation: an
@@ -1328,6 +1345,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    Permissions,
     EcResolve,
     Auction,
     PageBids,
@@ -1442,6 +1460,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+    },
+    // What the deployment decided for the asking request, shown to anyone.
+    NamedRoute {
+        path: PERMISSIONS_PAGE_PATH,
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::Permissions,
+    },
+    NamedRoute {
+        path: PERMISSIONS_JSON_PATH,
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::Permissions,
     },
     NamedRoute {
         path: "/_ts/api/v1/ec/resolve",
@@ -2522,6 +2551,40 @@ mod tests {
         assert_eq!(
             set_cookie, "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax",
             "tester cookie should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_permissions_answers_as_data_and_as_a_page_and_writes_nothing() {
+        let router = test_router();
+
+        let data = route(&router, empty_request(Method::GET, "/_ts/permissions.json"));
+        assert_eq!(data.status(), StatusCode::OK, "the data form should answer");
+        assert_eq!(data.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(data.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            data.headers().get(header::SET_COOKIE).is_none(),
+            "should write nothing for the reader"
+        );
+        assert!(
+            data.extensions().get::<super::EcFinalizeState>().is_none(),
+            "should not run the Edge Cookie lifecycle for a read"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&data.into_body().into_bytes().unwrap_or_default())
+                .expect("the data form should be JSON");
+        for key in ["set", "awaiting", "signals", "tdls", "modules"] {
+            assert!(
+                payload.get(key).is_some(),
+                "the resolution should carry `{key}`"
+            );
+        }
+
+        let page = route(&router, empty_request(Method::GET, "/_ts/permissions"));
+        assert_eq!(page.status(), StatusCode::OK, "the page should answer");
+        assert_eq!(
+            page.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
     }
 
