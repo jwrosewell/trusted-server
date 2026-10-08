@@ -342,6 +342,92 @@ startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
 module of that type.
 
+### What a module is handed
+
+Core builds one module context for a request and hands each module it calls
+a `ModuleCall`, which is that context together with the permissions the
+module declares. The module hands a function of its own to `call.inject`,
+and that function names what it needs as parameters. Each is passed in from
+the context, which borrows what the request already holds.
+
+```rust
+impl ExampleProxy {
+    /// Answers with the country the request came from, when the location
+    /// may be passed to this route.
+    async fn route(
+        &self,
+        _req: Request<EdgeBody>,
+        settings: &Settings,
+        geo: Option<&GeoInfo>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let country = geo.map_or("unknown", |geo| geo.country.as_str());
+        let body = format!("{} {country}", settings.publisher.domain);
+        Ok(Response::new(EdgeBody::from(body)))
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for ExampleProxy {
+    fn integration_name(&self) -> &'static str {
+        "example"
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get("/country")]
+    }
+
+    async fn handle(
+        &self,
+        call: ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
+    }
+}
+```
+
+| Parameter          | What it is                                                 |
+| ------------------ | ---------------------------------------------------------- |
+| `ModuleRequest`    | The method, path, query, host and scheme of the request    |
+| `&dyn RequestInfo` | The reader's evidence, being the headers and the client IP |
+| `&ClientInfo`      | The reader's connection                                    |
+| `&PermissionState` | The permissions resolved for the request                   |
+| `&ConsentContext`  | The decoded consent signals                                |
+| `&Settings`        | The deployment's settings                                  |
+| `&RuntimeServices` | Stores, caches, backends and the HTTP client               |
+| `&GeoInfo`         | The reader's location                                      |
+| `&DeviceSignals`   | The device classification                                  |
+| `EdgeCookie`       | The request's Edge Cookie identifier                       |
+
+A parameter may be an `Option` of one of these, which is `None` where the
+value is absent or withheld, or a tuple of several. A function that names a
+value itself is not called when the value cannot be passed, and the reason
+goes to the debug log. The module decides what that means. A device module
+answers the unknown device, an Edge Cookie module creates no identifier, and
+a route's `?` answers `403`. `call.inject_with` passes one argument of the
+caller's own after the module, which is how a route takes its request and
+how an Edge Cookie module takes the value a page posted.
+
+The location, the device signals and the Edge Cookie identifier each carry
+the permissions that the module which produced them declares. One of them is
+passed only to a module that declares every one of those permissions in its
+`required_permissions` and is granted them on this request. A value whose
+producer declares no permission is passed to every module.
+
+What a context carries depends on where the module is called.
+
+| Module            | Called through                                         | What its context carries                                                                                                                                                            |
+| ----------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Device            | `DeviceModule::detect`                                 | The request, the evidence, the settings and the services. No permission is resolved yet, so nothing whose use needs one                                                             |
+| Permission signal | `SignalInput::call`, `valid_signal` and `tdls`         | The request, the evidence, the connection, the consent, the settings and the services, and the location when its use needs no permission. The permissions are what the run produces |
+| Edge Cookie       | `EdgeCookieModule::generate` and `resolve_from_client` | Every row of the table above                                                                                                                                                        |
+| Route             | `IntegrationProxy::handle`                             | Every row of the table above except the evidence, because the route holds the request itself                                                                                        |
+
+A request preparer and a response finalizer are plain functions on the
+builder and are not handed the context. A preparer changes the request before
+anything about it is resolved, and a finalizer is handed only what its own
+module left for the request.
+
 ### Acting on one request
 
 A module that decides something about one request and acts on it later
