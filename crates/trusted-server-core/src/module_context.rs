@@ -78,7 +78,7 @@ pub struct ModuleRequest<'r> {
 impl<'r> ModuleRequest<'r> {
     /// A request for `path` on `host` over `scheme`, with no query.
     #[must_use]
-    pub fn new(method: &'r Method, host: &'r str, scheme: &'r str, path: &'r str) -> Self {
+    pub const fn new(method: &'r Method, host: &'r str, scheme: &'r str, path: &'r str) -> Self {
         Self {
             method,
             path,
@@ -86,6 +86,19 @@ impl<'r> ModuleRequest<'r> {
             host,
             scheme,
         }
+    }
+
+    /// What `request` resolved to, borrowed from it, the host and scheme read
+    /// as the publisher path reads them.
+    #[must_use]
+    pub fn of(request: &'r http::Request<EdgeBody>, client: &ClientInfo) -> Self {
+        Self::new(
+            request.method(),
+            crate::http_util::request_host(request),
+            crate::http_util::request_scheme(request, client),
+            request.uri().path(),
+        )
+        .with_query(request.uri().query().unwrap_or_default())
     }
 
     /// The same request with the query string, without its leading `?`.
@@ -144,13 +157,13 @@ impl ResolvedRequest {
     /// scheme read as the publisher path reads them.
     #[must_use]
     pub fn of(request: &http::Request<EdgeBody>, client: &ClientInfo) -> Self {
-        let resolved = crate::http_util::RequestInfo::from_request(request, client);
+        let view = ModuleRequest::of(request, client);
         Self {
-            method: request.method().clone(),
-            path: request.uri().path().to_owned(),
-            query: request.uri().query().unwrap_or_default().to_owned(),
-            host: resolved.host,
-            scheme: resolved.scheme,
+            method: view.method.clone(),
+            path: view.path.to_owned(),
+            query: view.query.to_owned(),
+            host: view.host.to_owned(),
+            scheme: view.scheme.to_owned(),
         }
     }
 
@@ -290,6 +303,9 @@ impl<T: ?Sized> Copy for Gated<'_, T> {}
 /// holds, and borrowed by every module called there. A module never sees it
 /// directly. It is handed a [`ModuleCall`] and names what it needs, see
 /// [`ModuleCall::inject`].
+///
+/// It holds only borrows, so a copy is a copy of those borrows.
+#[derive(Clone, Copy)]
 pub struct ModuleContext<'r> {
     request: ModuleRequest<'r>,
     evidence: Option<&'r dyn RequestInfo>,
@@ -312,7 +328,7 @@ impl<'r> ModuleContext<'r> {
     /// This is the context of work shared by every reader, such as a stored
     /// page's fetch plan, until the builder methods add to it.
     #[must_use]
-    pub fn new(request: ModuleRequest<'r>) -> Self {
+    pub const fn new(request: ModuleRequest<'r>) -> Self {
         Self {
             request,
             evidence: None,
@@ -487,6 +503,16 @@ impl<'r> ModuleContext<'r> {
         self.request
     }
 
+    /// The request's decoded consent signals, when the context carries them.
+    pub(crate) fn consent(&self) -> Option<&'r ConsentContext> {
+        self.consent
+    }
+
+    /// The reader's evidence, when the context carries it.
+    pub(crate) fn evidence(&self) -> Option<&'r dyn RequestInfo> {
+        self.evidence
+    }
+
     /// The call to one module, named `module`, which declares the permissions
     /// in `declared`.
     #[must_use]
@@ -496,6 +522,26 @@ impl<'r> ModuleContext<'r> {
             module,
             declared,
         }
+    }
+}
+
+/// The method of the empty context.
+static EMPTY_METHOD: Method = Method::GET;
+
+/// A context carrying nothing but a request for `/` on no host, for a module
+/// asked outside any request.
+static EMPTY: ModuleContext<'static> =
+    ModuleContext::new(ModuleRequest::new(&EMPTY_METHOD, "", "", "/"));
+
+impl ModuleContext<'static> {
+    /// The context of a module asked outside any request, which carries
+    /// nothing a module could name but an empty request.
+    ///
+    /// A caller with no request to resolve, such as a tool that evaluates
+    /// signals on their own, builds on a copy of it with the builder methods.
+    #[must_use]
+    pub fn empty() -> &'static Self {
+        &EMPTY
     }
 }
 

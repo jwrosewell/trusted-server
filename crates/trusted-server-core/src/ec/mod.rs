@@ -89,7 +89,7 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::evidence::BorrowedRequestInfo;
 use crate::geo::GeoInfo;
-use crate::module_context::{ModuleContext, ResolvedRequest};
+use crate::module_context::{ModuleContext, ModuleRequest, ResolvedRequest};
 use crate::permissions::{Permission, PermissionState};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -480,9 +480,17 @@ impl EcContext {
             Some(req.headers()),
         )
         .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
+        let mut module_context = ModuleContext::new(ModuleRequest::of(req, services.client_info()))
+            .with_evidence(&evidence)
+            .with_consent(&consent)
+            .with_settings(settings)
+            .with_services(services)
+            .with_client(services.client_info());
+        if let Some(geo) = geo_info {
+            module_context = module_context.with_geo(geo, services.geo().required_permissions());
+        }
         let permissions = consent::assemble_permissions(
-            &consent,
-            &evidence,
+            &module_context,
             geo_status,
             services.permission_signal_modules(),
         );
