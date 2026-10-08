@@ -442,25 +442,13 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for DidomiIntegration {
-    fn integration_name(&self) -> &'static str {
-        DIDOMI_INTEGRATION_ID
-    }
-
-    fn proxy_prefix(&self) -> String {
-        self.resolved_prefix()
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get("/*"), self.post("/*")]
-    }
-
-    async fn handle(
+impl DidomiIntegration {
+    /// Answers the request, with the services the route names in its module
+    /// call.
+    async fn route(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
         req: http::Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
@@ -553,6 +541,29 @@ impl IntegrationProxy for DidomiIntegration {
         }
 
         Ok(response.response)
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for DidomiIntegration {
+    fn integration_name(&self) -> &'static str {
+        DIDOMI_INTEGRATION_ID
+    }
+
+    fn proxy_prefix(&self) -> String {
+        self.resolved_prefix()
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get("/*"), self.post("/*")]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -838,7 +849,6 @@ mod tests {
             Arc::clone(&stub),
             GeoResult::Value(Some(geo_info("us", Some("ca")))),
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -846,9 +856,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should return redirect");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should return redirect");
 
         assert_eq!(
             response.status(),
@@ -894,7 +903,6 @@ mod tests {
             Arc::clone(&stub),
             GeoResult::Value(Some(geo_info("us", Some("ca")))),
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(DidomiIntegrationConfig {
             proxy_path: Some("publisher/privacy".to_string()),
             ..config_with_geo_query_parameters()
@@ -905,9 +913,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should return redirect");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should return redirect");
 
         assert_eq!(response.status(), http::StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
@@ -932,7 +939,6 @@ mod tests {
             Arc::clone(&stub),
             GeoResult::Value(Some(geo_info("us", Some("us-ca")))),
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -942,9 +948,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should proxy canonical loader");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should proxy canonical loader");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -975,7 +980,6 @@ mod tests {
             Arc::clone(&stub),
             GeoResult::Value(Some(geo_info("US", Some("CA")))),
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -983,9 +987,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should proxy loader");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should proxy loader");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -1000,7 +1003,6 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"sdk".to_vec());
         let services = services_with_geo(Arc::clone(&stub), GeoResult::Failure);
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -1008,9 +1010,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should proxy unrelated SDK asset");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should proxy unrelated SDK asset");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -1030,7 +1031,6 @@ mod tests {
         ] {
             let stub = Arc::new(StubHttpClient::new());
             let services = services_with_geo(Arc::clone(&stub), geo_result);
-            let settings = create_test_settings();
             let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
             let request = http::Request::builder()
                 .method(Method::GET)
@@ -1038,9 +1038,8 @@ mod tests {
                 .body(EdgeBody::empty())
                 .expect("should build request");
 
-            let response =
-                futures::executor::block_on(integration.handle(&settings, &services, request))
-                    .expect("should return controlled geo failure");
+            let response = futures::executor::block_on(integration.route(request, &services))
+                .expect("should return controlled geo failure");
 
             assert_eq!(
                 response.status(),
@@ -1087,7 +1086,6 @@ mod tests {
             ],
         );
         let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -1095,9 +1093,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should proxy API request");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should proxy API request");
 
         assert_eq!(
             stub.recorded_cache_intents(),
@@ -1146,7 +1143,6 @@ mod tests {
             Arc::clone(&stub),
             GeoResult::Value(Some(geo_info("US", Some("CA")))),
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config_with_geo_query_parameters()));
         let request = http::Request::builder()
             .method(Method::GET)
@@ -1154,9 +1150,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should proxy SDK request");
+        let response = futures::executor::block_on(integration.route(request, &services))
+            .expect("should proxy SDK request");
 
         assert_eq!(
             stub.recorded_cache_intents(),
@@ -1418,7 +1413,6 @@ mod tests {
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
-        let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config()));
         let req = http::Request::builder()
             .method(http::Method::GET)
@@ -1426,7 +1420,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+        let response = futures::executor::block_on(integration.route(req, &services))
             .expect("should proxy request");
 
         assert_eq!(

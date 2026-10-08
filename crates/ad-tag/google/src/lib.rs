@@ -440,6 +440,32 @@ pub fn register(
     ))
 }
 
+impl GptIntegration {
+    /// Answers the request, with the settings and the services the route
+    /// names in its module call.
+    async fn route(
+        &self,
+        req: http::Request<EdgeBody>,
+        settings: &Settings,
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+
+        if path == "/integrations/gpt/script" {
+            self.handle_script_serving(settings, services, req).await
+        } else if path.starts_with("/integrations/gpt/pagead/")
+            || path.starts_with("/integrations/gpt/tag/")
+        {
+            self.handle_pagead_proxy(settings, services, req).await
+        } else {
+            Err(Report::new(Self::error(format!(
+                "Unknown GPT route: {}",
+                path
+            ))))
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl IntegrationProxy for GptIntegration {
     fn integration_name(&self) -> &'static str {
@@ -456,24 +482,10 @@ impl IntegrationProxy for GptIntegration {
 
     async fn handle(
         &self,
-        settings: &Settings,
-        services: &RuntimeServices,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        let path = req.uri().path().to_string();
-
-        if path == "/integrations/gpt/script" {
-            self.handle_script_serving(settings, services, req).await
-        } else if path.starts_with("/integrations/gpt/pagead/")
-            || path.starts_with("/integrations/gpt/tag/")
-        {
-            self.handle_pagead_proxy(settings, services, req).await
-        } else {
-            Err(Report::new(Self::error(format!(
-                "Unknown GPT route: {}",
-                path
-            ))))
-        }
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
