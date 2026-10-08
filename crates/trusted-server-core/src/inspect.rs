@@ -8,6 +8,7 @@
 //! | Address | What it shows |
 //! | --- | --- |
 //! | [`permissions::PERMISSIONS_PAGE_PATH`] | The permissions resolved for the request, the signals that produced them and the terms the data is held under |
+//! | [`config::CONFIG_PAGE_PATH`] | The settings the deployment is running, with every secret and every value sensitive by default masked |
 //!
 //! An address answers as a page, and as data with `.json` added.
 //!
@@ -17,6 +18,7 @@
 
 use serde_json::Value;
 
+pub mod config;
 pub mod permissions;
 
 /// Renders `payload` as a page titled `title`.
