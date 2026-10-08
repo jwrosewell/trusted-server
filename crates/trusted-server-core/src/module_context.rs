@@ -16,18 +16,19 @@
 //! | Parameter | What it is | Absent where |
 //! | --- | --- | --- |
 //! | [`ModuleRequest`] | method, path, query, host and scheme | never |
-//! | `&dyn RequestInfo` | the reader's evidence, headers and client IP | the work is shared by every reader, and in a route, which holds the request itself |
-//! | `&ClientInfo` | the reader's connection | the work is shared by every reader |
-//! | [`ModuleResponse`] | status and headers | no response exists yet |
-//! | `&PermissionState` | the permissions resolved for the request | before they are resolved, and where the work is shared |
-//! | `&ConsentContext` | the decoded consent signals | as above |
-//! | `&Settings` | the deployment's settings | a stored page's fetch plan |
-//! | `&RuntimeServices` | stores, caches, backends and the HTTP client | as above |
+//! | `&dyn RequestInfo` | the reader's evidence, headers and client IP | in a route, which holds the request itself |
+//! | `&ClientInfo` | the reader's connection | where the device is classified |
+//! | `&PermissionState` | the permissions resolved for the request | before they are resolved, which is where the device is classified and where the signal modules run |
+//! | `&ConsentContext` | the decoded consent signals | where the device is classified |
+//! | `&Settings` | the deployment's settings | outside any request |
+//! | `&RuntimeServices` | stores, caches, backends and the HTTP client | outside any request |
 //! | `&GeoInfo` | the reader's location | no location resolved, or withheld |
 //! | `&DeviceSignals` | the device classification | not classified, or withheld |
 //! | [`EdgeCookie`] | the request's Edge Cookie identifier | none, or withheld |
-//! | `&IntegrationDocumentState` | state shared by middleware on one document | outside a document |
-//! | [`ModuleExtensions`] | the request's typed extension map | outside a page request |
+//!
+//! A module asked outside any request, such as a signal module asked on its
+//! own, is called in [`ModuleContext::empty`], which carries the request line
+//! of the table and nothing else.
 //!
 //! # Permissions
 //!
@@ -41,10 +42,9 @@
 //! the debug log.
 
 use core::fmt;
-use std::sync::Mutex;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{HeaderMap, Method, StatusCode};
+use http::Method;
 
 use crate::consent::ConsentContext;
 use crate::ec::EcContext;
@@ -52,7 +52,6 @@ use crate::ec::device::DeviceSignals;
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
 use crate::geo::GeoInfo;
-use crate::integrations::IntegrationDocumentState;
 use crate::permissions::{PermissionSet, PermissionState};
 use crate::platform::{ClientInfo, RuntimeServices};
 use crate::settings::Settings;
@@ -64,8 +63,7 @@ pub use inject::{Process, ProcessWith};
 /// What a request resolved to: its method and address, and the host and
 /// scheme it was made for.
 ///
-/// Carries nothing about who asked, so it is in every context, including those
-/// whose work is shared by every reader.
+/// Carries nothing about who asked, so it is in every context.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleRequest<'r> {
     method: &'r Method,
@@ -175,33 +173,6 @@ impl ResolvedRequest {
     }
 }
 
-/// The response a module runs on.
-#[derive(Debug, Clone, Copy)]
-pub struct ModuleResponse<'r> {
-    status: StatusCode,
-    headers: &'r HeaderMap,
-}
-
-impl<'r> ModuleResponse<'r> {
-    /// A response with `status` and `headers`.
-    #[must_use]
-    pub fn new(status: StatusCode, headers: &'r HeaderMap) -> Self {
-        Self { status, headers }
-    }
-
-    /// The response status.
-    #[must_use]
-    pub fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    /// The response headers.
-    #[must_use]
-    pub fn headers(&self) -> &'r HeaderMap {
-        self.headers
-    }
-}
-
 /// The request's Edge Cookie identifier, as the module that created it wrote
 /// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,74 +183,6 @@ impl<'r> EdgeCookie<'r> {
     #[must_use]
     pub fn as_str(&self) -> &'r str {
         self.0
-    }
-}
-
-/// The request's typed extension map, where a module leaves a value for a
-/// later one on the same request.
-///
-/// A page request's preparers are handed it writable, and the serve
-/// middleware read what they left. Everywhere else it is read only.
-#[derive(Clone, Copy)]
-pub struct ModuleExtensions<'r>(ExtensionsSource<'r>);
-
-#[derive(Clone, Copy)]
-enum ExtensionsSource<'r> {
-    ReadOnly(&'r http::Extensions),
-    Writable(&'r Mutex<http::Extensions>),
-}
-
-impl<'r> ModuleExtensions<'r> {
-    /// The map, read only.
-    #[must_use]
-    pub fn read_only(extensions: &'r http::Extensions) -> Self {
-        Self(ExtensionsSource::ReadOnly(extensions))
-    }
-
-    /// The map, which a module may add to.
-    #[must_use]
-    pub fn writable(extensions: &'r Mutex<http::Extensions>) -> Self {
-        Self(ExtensionsSource::Writable(extensions))
-    }
-
-    /// A copy of the value of type `T`, when the map holds one.
-    #[must_use]
-    pub fn get<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
-        match self.0 {
-            ExtensionsSource::ReadOnly(extensions) => extensions.get::<T>().cloned(),
-            ExtensionsSource::Writable(extensions) => extensions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get::<T>()
-                .cloned(),
-        }
-    }
-
-    /// Puts `value` in the map, in place of any value of its type.
-    ///
-    /// # Errors
-    ///
-    /// Gives `value` back when the map is read only here.
-    pub fn insert<T: Clone + Send + Sync + 'static>(&self, value: T) -> Result<(), T> {
-        match self.0 {
-            ExtensionsSource::ReadOnly(_) => Err(value),
-            ExtensionsSource::Writable(extensions) => {
-                extensions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(value);
-                Ok(())
-            }
-        }
-    }
-}
-
-impl fmt::Debug for ModuleExtensions<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let writable = matches!(self.0, ExtensionsSource::Writable(_));
-        f.debug_struct("ModuleExtensions")
-            .field("writable", &writable)
-            .finish_non_exhaustive()
     }
 }
 
@@ -310,7 +213,6 @@ pub struct ModuleContext<'r> {
     request: ModuleRequest<'r>,
     evidence: Option<&'r dyn RequestInfo>,
     client: Option<&'r ClientInfo>,
-    response: Option<ModuleResponse<'r>>,
     permissions: Option<&'r PermissionState>,
     consent: Option<&'r ConsentContext>,
     settings: Option<&'r Settings>,
@@ -318,22 +220,19 @@ pub struct ModuleContext<'r> {
     geo: Option<Gated<'r, GeoInfo>>,
     device: Option<Gated<'r, DeviceSignals>>,
     edge_cookie: Option<Gated<'r, str>>,
-    document_state: Option<&'r IntegrationDocumentState>,
-    extensions: Option<ModuleExtensions<'r>>,
 }
 
 impl<'r> ModuleContext<'r> {
     /// A context carrying `request` and nothing else.
     ///
-    /// This is the context of work shared by every reader, such as a stored
-    /// page's fetch plan, until the builder methods add to it.
+    /// This is the context of a module asked outside any request, until the
+    /// builder methods add to it.
     #[must_use]
     pub const fn new(request: ModuleRequest<'r>) -> Self {
         Self {
             request,
             evidence: None,
             client: None,
-            response: None,
             permissions: None,
             consent: None,
             settings: None,
@@ -341,8 +240,6 @@ impl<'r> ModuleContext<'r> {
             geo: None,
             device: None,
             edge_cookie: None,
-            document_state: None,
-            extensions: None,
         }
     }
 
@@ -360,15 +257,6 @@ impl<'r> ModuleContext<'r> {
     pub fn with_client(self, client: &'r ClientInfo) -> Self {
         Self {
             client: Some(client),
-            ..self
-        }
-    }
-
-    /// The same context carrying the response a module runs on.
-    #[must_use]
-    pub fn with_response(self, response: ModuleResponse<'r>) -> Self {
-        Self {
-            response: Some(response),
             ..self
         }
     }
@@ -444,25 +332,6 @@ impl<'r> ModuleContext<'r> {
                 value: id,
                 requires,
             }),
-            ..self
-        }
-    }
-
-    /// The same context carrying the state shared by the middleware working
-    /// on one document.
-    #[must_use]
-    pub fn with_document_state(self, document_state: &'r IntegrationDocumentState) -> Self {
-        Self {
-            document_state: Some(document_state),
-            ..self
-        }
-    }
-
-    /// The same context carrying the request's typed extension map.
-    #[must_use]
-    pub fn with_extensions(self, extensions: ModuleExtensions<'r>) -> Self {
-        Self {
-            extensions: Some(extensions),
             ..self
         }
     }
@@ -559,7 +428,6 @@ impl fmt::Debug for ModuleContext<'_> {
         f.debug_struct("ModuleContext")
             .field("request", &self.request)
             .field("evidence", &self.evidence.is_some())
-            .field("response", &self.response.map(|response| response.status))
             .field("permissions", &self.permissions.is_some())
             .field("settings", &self.settings.is_some())
             .field("services", &self.services.is_some())
@@ -742,12 +610,6 @@ impl<'c> FromModuleContext<'c> for &'c ClientInfo {
     }
 }
 
-impl<'c> FromModuleContext<'c> for ModuleResponse<'c> {
-    fn from_module_context(call: &ModuleCall<'c>) -> Result<Self, Withheld> {
-        call.context.response.ok_or(Withheld::absent("response"))
-    }
-}
-
 impl<'c> FromModuleContext<'c> for &'c PermissionState {
     fn from_module_context(call: &ModuleCall<'c>) -> Result<Self, Withheld> {
         call.context
@@ -790,22 +652,6 @@ impl<'c> FromModuleContext<'c> for EdgeCookie<'c> {
     fn from_module_context(call: &ModuleCall<'c>) -> Result<Self, Withheld> {
         call.gated(call.context.edge_cookie, "the Edge Cookie")
             .map(EdgeCookie)
-    }
-}
-
-impl<'c> FromModuleContext<'c> for &'c IntegrationDocumentState {
-    fn from_module_context(call: &ModuleCall<'c>) -> Result<Self, Withheld> {
-        call.context
-            .document_state
-            .ok_or(Withheld::absent("document state"))
-    }
-}
-
-impl<'c> FromModuleContext<'c> for ModuleExtensions<'c> {
-    fn from_module_context(call: &ModuleCall<'c>) -> Result<Self, Withheld> {
-        call.context
-            .extensions
-            .ok_or(Withheld::absent("request extensions"))
     }
 }
 

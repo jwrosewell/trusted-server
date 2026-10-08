@@ -1,7 +1,7 @@
 use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, header};
 
 use super::*;
 use crate::ec::module::HmacModule;
@@ -84,28 +84,19 @@ fn each_value_the_context_carries_reaches_a_function_that_names_it() {
         tls_protocol: Some("TLSv1.3".to_owned()),
         ..ClientInfo::default()
     };
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert("x-origin", HeaderValue::from_static("yes"));
     let permissions = PermissionState::new(storage());
     let consent = ConsentContext::default();
     let mut settings = Settings::default();
     settings.publisher.domain = "publisher.example".to_owned();
     let services_ip: std::net::IpAddr = "203.0.113.9".parse().expect("should parse an IP");
     let services = noop_services_with_client_ip(services_ip);
-    let document_state = IntegrationDocumentState::default();
-    document_state.get_or_insert_with("module", || 7_u32);
-    let mut extensions = http::Extensions::new();
-    extensions.insert(11_u64);
     let context = ModuleContext::new(ModuleRequest::new(&method, "h", "https", "/"))
         .with_evidence(&evidence)
         .with_client(&client)
-        .with_response(ModuleResponse::new(StatusCode::CREATED, &response_headers))
         .with_permissions(&permissions)
         .with_consent(&consent)
         .with_settings(&settings)
-        .with_services(&services)
-        .with_document_state(&document_state)
-        .with_extensions(ModuleExtensions::read_only(&extensions));
+        .with_services(&services);
     let call = context.call("module", PermissionSet::none());
 
     let first = call
@@ -114,15 +105,12 @@ fn each_value_the_context_carries_reaches_a_function_that_names_it() {
             |_: &Module,
              evidence: &dyn RequestInfo,
              client: &ClientInfo,
-             response: ModuleResponse<'_>,
              permissions: &PermissionState,
              consent: &ConsentContext| {
                 (
                     evidence.user_agent().to_owned(),
                     evidence.client_ip().to_owned(),
                     client.tls_protocol.clone(),
-                    response.status(),
-                    response.headers().contains_key("x-origin"),
                     permissions.is_set(Permission::StoreOnDevice),
                     consent.jurisdiction.clone(),
                 )
@@ -135,8 +123,6 @@ fn each_value_the_context_carries_reaches_a_function_that_names_it() {
             "ExampleAgent/1.0".to_owned(),
             "203.0.113.7".to_owned(),
             Some("TLSv1.3".to_owned()),
-            StatusCode::CREATED,
-            true,
             true,
             ConsentContext::default().jurisdiction,
         )
@@ -145,29 +131,15 @@ fn each_value_the_context_carries_reaches_a_function_that_names_it() {
     let second = call
         .inject(
             &Module,
-            |_: &Module,
-             settings: &Settings,
-             services: &RuntimeServices,
-             document: &IntegrationDocumentState,
-             extensions: ModuleExtensions<'_>| {
+            |_: &Module, settings: &Settings, services: &RuntimeServices| {
                 (
                     settings.publisher.domain.clone(),
                     services.client_info().client_ip,
-                    document.get::<u32>("module").map(|value| *value),
-                    extensions.get::<u64>(),
                 )
             },
         )
         .expect("every value named is carried");
-    assert_eq!(
-        second,
-        (
-            "publisher.example".to_owned(),
-            Some(services_ip),
-            Some(7),
-            Some(11),
-        )
-    );
+    assert_eq!(second, ("publisher.example".to_owned(), Some(services_ip)));
 }
 
 #[test]
@@ -404,25 +376,6 @@ fn a_function_may_name_eight_values_and_a_tuple_groups_more() {
         (true, true),
         "the tuple holds the context's own values"
     );
-}
-
-#[test]
-fn a_writable_extension_map_keeps_what_a_module_puts_in_it() {
-    let map = Mutex::new(http::Extensions::new());
-    let writable = ModuleExtensions::writable(&map);
-    let read_only_map = http::Extensions::new();
-    let read_only = ModuleExtensions::read_only(&read_only_map);
-
-    writable
-        .insert(String::from("hint"))
-        .expect("a writable map takes a value");
-    assert_eq!(writable.get::<String>().as_deref(), Some("hint"));
-    assert_eq!(
-        read_only.insert(String::from("hint")),
-        Err(String::from("hint")),
-        "a read-only map gives the value back"
-    );
-    assert_eq!(read_only.get::<String>(), None);
 }
 
 #[test]
