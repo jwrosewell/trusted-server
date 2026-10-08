@@ -415,21 +415,13 @@ impl AuctionProvider for SeamProbeAdServer {
 /// Proxy that reports what the seam delivered to this request.
 pub struct SeamProbeProxy;
 
-#[async_trait(?Send)]
-impl IntegrationProxy for SeamProbeProxy {
-    fn integration_name(&self) -> &'static str {
-        SEAM_PROBE_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get(REPORT_ROUTE_SUFFIX)]
-    }
-
-    async fn handle(
+impl SeamProbeProxy {
+    /// Answers the request, with the services the route names in its module
+    /// call.
+    async fn route(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
         req: Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let country = match services
             .geo()
@@ -457,6 +449,25 @@ impl IntegrationProxy for SeamProbeProxy {
             HeaderValue::from_static("application/json"),
         );
         Ok(response)
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for SeamProbeProxy {
+    fn integration_name(&self) -> &'static str {
+        SEAM_PROBE_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get(REPORT_ROUTE_SUFFIX)]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 

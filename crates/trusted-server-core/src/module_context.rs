@@ -16,8 +16,8 @@
 //! | Parameter | What it is | Absent where |
 //! | --- | --- | --- |
 //! | [`ModuleRequest`] | method, path, query, host and scheme | never |
-//! | `&dyn RequestInfo` | the reader's evidence, headers and client IP | the work is shared by every reader |
-//! | `&ClientInfo` | the reader's connection | as above |
+//! | `&dyn RequestInfo` | the reader's evidence, headers and client IP | the work is shared by every reader, and in a route, which holds the request itself |
+//! | `&ClientInfo` | the reader's connection | the work is shared by every reader |
 //! | [`ModuleResponse`] | status and headers | no response exists yet |
 //! | `&PermissionState` | the permissions resolved for the request | before they are resolved, and where the work is shared |
 //! | `&ConsentContext` | the decoded consent signals | as above |
@@ -542,6 +542,15 @@ impl ModuleContext<'static> {
     #[must_use]
     pub fn empty() -> &'static Self {
         &EMPTY
+    }
+}
+
+impl ModuleCall<'static> {
+    /// A call into [`ModuleContext::empty`], by no name and declaring
+    /// nothing, for a module asked outside any request, such as by a test.
+    #[must_use]
+    pub fn empty() -> Self {
+        ModuleContext::empty().call("", PermissionSet::none())
     }
 }
 

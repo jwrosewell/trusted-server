@@ -7,8 +7,10 @@ Axum, or Spin SDK types.
 
 ## Choose the narrowest hook
 
-- `IntegrationProxy` owns explicit method/path endpoints and receives
-  `Settings`, `RuntimeServices`, and an EdgeZero-neutral request.
+- `IntegrationProxy` owns explicit method/path endpoints and receives an
+  EdgeZero-neutral request and its call into the request's module context,
+  from which it names the `Settings`, the `RuntimeServices` and whatever
+  else it needs.
 - `IntegrationAttributeRewriter` inspects selected HTML attributes.
 - `IntegrationScriptRewriter` handles one declared selector.
 - `IntegrationHeadInjector` inserts deterministic head markup.
@@ -193,12 +195,21 @@ is omitted, so adapter startup must construct the complete service graph.
 
 ## Proxy implementation rules
 
-An `IntegrationProxy::handle` implementation receives the complete runtime
-service graph. Register or predict backends through `services.backend()`,
-send through `services.http_client()`, bound request and response bodies, and
-return `Report<TrustedServerError>` with integration context. The registry
-strips internal identity headers before dispatch; an integration must opt into
-any explicit forwarding behavior.
+An `IntegrationProxy::handle` implementation receives the request and its
+`ModuleCall`. It hands a function of its own to `call.inject_with`, with the
+request as that function's own argument, and names what else it needs as
+parameters, such as `&Settings` and `&RuntimeServices`, which is the complete
+runtime service graph. Register or predict backends through
+`services.backend()`, send through `services.http_client()`, bound request and
+response bodies, and return `Report<TrustedServerError>` with integration
+context. The registry strips internal identity headers before dispatch; an
+integration must opt into any explicit forwarding behavior.
+
+A route that names a value whose use needs a permission, such as the Edge
+Cookie identifier, declares that permission in `required_permissions` and is
+passed the value only on a request that grants it. Nothing gates the route
+itself, so a route that must not run without a permission reads the
+`&PermissionState` and refuses.
 
 Streaming support is an adapter capability. Request
 `PlatformHttpRequest::with_stream_response()` only when the caller has

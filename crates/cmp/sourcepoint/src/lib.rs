@@ -808,27 +808,13 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for SourcepointIntegration {
-    fn integration_name(&self) -> &'static str {
-        SOURCEPOINT_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        let endpoint_path = format!("/integrations/{SOURCEPOINT_INTEGRATION_ID}/cdn/*");
-        vec![
-            self.get("/cdn/*"),
-            self.post("/cdn/*"),
-            IntegrationEndpoint::new(Method::HEAD, endpoint_path.clone()),
-            IntegrationEndpoint::new(Method::OPTIONS, endpoint_path),
-        ]
-    }
-
-    async fn handle(
+impl SourcepointIntegration {
+    /// Answers the request, with the services the route names in its module
+    /// call.
+    async fn route(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
         req: Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
@@ -1017,6 +1003,31 @@ impl IntegrationProxy for SourcepointIntegration {
 
         self.apply_cache_headers(&mut response, forwarded_cookies);
         Ok(response)
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for SourcepointIntegration {
+    fn integration_name(&self) -> &'static str {
+        SOURCEPOINT_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        let endpoint_path = format!("/integrations/{SOURCEPOINT_INTEGRATION_ID}/cdn/*");
+        vec![
+            self.get("/cdn/*"),
+            self.post("/cdn/*"),
+            IntegrationEndpoint::new(Method::HEAD, endpoint_path.clone()),
+            IntegrationEndpoint::new(Method::OPTIONS, endpoint_path),
+        ]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
