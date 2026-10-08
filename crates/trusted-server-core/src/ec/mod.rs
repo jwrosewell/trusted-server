@@ -1004,6 +1004,14 @@ impl EcContext {
     }
 
     /// Sets pull-sync marker state in focused unit tests.
+    /// The same test-only context with a resolved location.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_geo_for_test(mut self, geo: GeoInfo) -> Self {
+        self.geo_info = Some(geo);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
         self.pull_sync_marker = state;
