@@ -36,7 +36,7 @@ use crate::error::TrustedServerError;
 use crate::redacted::{SENSITIVE_MARKER, to_marked_value};
 use crate::settings::Settings;
 
-use super::render_page;
+use super::{MASK, render_page};
 
 /// The page form of the configuration.
 pub const CONFIG_PAGE_PATH: &str = "/_ts/config";
@@ -46,9 +46,6 @@ pub const CONFIG_JSON_PATH: &str = "/_ts/config.json";
 
 /// Both addresses, the page first.
 pub const CONFIG_PATHS: [&str; 2] = [CONFIG_PAGE_PATH, CONFIG_JSON_PATH];
-
-/// What a masked value shows as.
-pub const MASK: &str = "XXXX";
 
 const NOT_PUBLISHED: &str = "This publisher does not publish its configuration.";
 
