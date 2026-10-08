@@ -45,6 +45,7 @@ use trusted_server_core::integrations::{
     CarriedJsModule, IntegrationBuilder, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration,
 };
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::platform::{
     GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
 };
@@ -247,11 +248,7 @@ impl DeviceModule for SeamProbeDevice {
         module_name()
     }
 
-    async fn detect(
-        &self,
-        _request_info: &dyn RequestInfo,
-        _services: &trusted_server_core::platform::RuntimeServices,
-    ) -> DeviceSignals {
+    async fn detect(&self, _call: ModuleCall<'_>) -> DeviceSignals {
         DeviceSignals {
             is_mobile: 1,
             platform_class: Some("seam-probe".to_owned()),

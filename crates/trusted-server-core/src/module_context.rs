@@ -771,5 +771,21 @@ tuple_from_module_context!(A1, A2, A3, A4, A5, A6);
 tuple_from_module_context!(A1, A2, A3, A4, A5, A6, A7);
 tuple_from_module_context!(A1, A2, A3, A4, A5, A6, A7, A8);
 
+/// Requests for a module's own tests, which have no request to resolve.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use http::Method;
+
+    use super::ModuleRequest;
+
+    static GET: Method = Method::GET;
+
+    /// A `GET` of `path` on `publisher.example` over `https`, with no query.
+    #[must_use]
+    pub fn request(path: &'static str) -> ModuleRequest<'static> {
+        ModuleRequest::new(&GET, "publisher.example", "https", path)
+    }
+}
+
 #[cfg(test)]
 mod tests;

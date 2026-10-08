@@ -5184,8 +5184,7 @@ mod tests {
 
         async fn detect(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> crate::ec::device::DeviceSignals {
             crate::ec::device::DeviceSignals {
                 is_mobile: 2,
@@ -5507,8 +5506,7 @@ mod tests {
 
         async fn detect(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> crate::ec::device::DeviceSignals {
             crate::ec::device::DeviceSignals {
                 is_mobile: 1,
