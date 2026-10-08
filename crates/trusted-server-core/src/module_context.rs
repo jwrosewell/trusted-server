@@ -127,7 +127,10 @@ impl<'r> ModuleRequest<'r> {
 
 /// A [`ModuleRequest`] that owns its parts, for a caller that must keep them
 /// past the borrow of the request, such as one that hands the request on.
-#[derive(Debug, Clone)]
+///
+/// The default is a `GET` of nothing, which a caller holds where it captured
+/// no request.
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedRequest {
     method: Method,
     path: String,

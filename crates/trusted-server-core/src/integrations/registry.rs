@@ -5535,9 +5535,7 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::module::IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> Result<crate::ec::module::GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(crate::ec::module::GeneratedEdgeCookie::default())
         }

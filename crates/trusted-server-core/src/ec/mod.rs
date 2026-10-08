@@ -89,11 +89,12 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::evidence::BorrowedRequestInfo;
 use crate::geo::GeoInfo;
+use crate::module_context::{ModuleContext, ResolvedRequest};
 use crate::permissions::{Permission, PermissionState};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
-use module::{EdgeCookieModule, GeneratedEdgeCookie, IdentityInput};
+use module::{EdgeCookieModule, GeneratedEdgeCookie};
 
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
@@ -277,18 +278,17 @@ pub struct EcContext {
     /// instead of being dropped by the built-in shape check. `None` when no
     /// module is configured.
     selected_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>>,
-    /// A snapshot of the request evidence a module reads when it creates an
-    /// identifier, at generation or in orphan recovery: the request headers (so
-    /// a module can read cookies and client hints), and the URL path and query
-    /// string (so it can read request parameters). Captured once at
-    /// construction, when a module is configured and the request either
-    /// carries no usable identifier or is a document navigation, the only
-    /// request that can recover an orphaned one. So a no-module deployment
-    /// and a returning visitor's subresource requests clone nothing. A module
-    /// reads these through [`RequestInfo`](crate::evidence::RequestInfo).
+    /// A snapshot of the request a module is handed when it creates an
+    /// identifier, at generation or in orphan recovery, being the request
+    /// headers (so a module can read cookies and client hints) and what the
+    /// request resolved to (its method, address, host and scheme). Captured
+    /// once at construction, when a module is configured and the request
+    /// either carries no usable identifier or is a document navigation, the
+    /// only request that can recover an orphaned one. So a no-module
+    /// deployment and a returning visitor's subresource requests clone
+    /// nothing. A module reads them through its module call.
     request_headers: http::HeaderMap,
-    request_path: String,
-    request_query: String,
+    request: ResolvedRequest,
     /// Response headers a module asked to set, captured when it creates an
     /// identifier (in [`EcContext::generate_if_needed`], or during orphan
     /// recovery in EC finalization) and applied to the response by EC
@@ -428,24 +428,23 @@ impl EcContext {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
-        // Snapshot the request evidence a module reads when it creates an
+        // Snapshot the request a module is handed when it creates an
         // identifier (the headers, so it can read cookies and client hints, and
-        // the URL path and query, so it can read request parameters). Capture
-        // only when a module is configured and either no identifier exists or
-        // the request is a document navigation, which orphan recovery may need,
-        // so a no-module deployment and a returning visitor's subresource
-        // requests clone nothing. Creation runs after the request body may be
-        // consumed, so the snapshot is owned.
-        let (request_headers, request_path, request_query) = if selected_module.is_some()
+        // what the request resolved to, with the address, so it can read
+        // request parameters). Capture only when a module is configured and
+        // either no identifier exists or the request is a document navigation,
+        // which orphan recovery may need, so a no-module deployment and a
+        // returning visitor's subresource requests clone nothing. Creation runs
+        // after the request body may be consumed, so the snapshot is owned.
+        let (request_headers, request) = if selected_module.is_some()
             && (ec_value.is_none() || crate::http_util::is_navigation_request(req))
         {
             (
                 req.headers().clone(),
-                req.uri().path().to_owned(),
-                req.uri().query().unwrap_or_default().to_owned(),
+                ResolvedRequest::of(req, services.client_info()),
             )
         } else {
-            (http::HeaderMap::new(), String::new(), String::new())
+            (http::HeaderMap::new(), ResolvedRequest::default())
         };
 
         // Capture the client IP from platform services (normalized).
@@ -519,8 +518,7 @@ impl EcContext {
             device_signals: None,
             selected_module,
             request_headers,
-            request_path,
-            request_query,
+            request,
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
@@ -605,10 +603,11 @@ impl EcContext {
     /// identifier, and the finished identifier, with its module code applied,
     /// is checked against the global bounds. Generation and orphan recovery both
     /// use this, so a rotated identifier comes from the same module
-    /// and passes the same checks as a new one. The request evidence captured at
-    /// read time (client IP, headers, and the URL path and query) is passed
-    /// borrowed through [`RequestInfo`](crate::evidence::RequestInfo), and the
-    /// built-in HMAC module reads only the client IP.
+    /// and passes the same checks as a new one. The module is handed a module
+    /// context carrying the request captured at read time (the client IP, the
+    /// headers, and what the request resolved to), the settings, the services
+    /// and what this context resolved for the request, and the built-in HMAC
+    /// module reads only the client IP.
     ///
     /// # Errors
     ///
@@ -622,19 +621,27 @@ impl EcContext {
     pub(crate) async fn candidate_id(
         &mut self,
         ec_module: &dyn EdgeCookieModule,
+        settings: &Settings,
         services: &RuntimeServices,
     ) -> Result<Option<String>, Report<TrustedServerError>> {
-        let input = IdentityInput {
-            permissions: Some(&self.permissions),
-            consent: Some(&self.consent),
-        };
+        // Lend the request captured at read time, being the client IP, the
+        // request headers (so a module reads cookies and client hints), and
+        // what the request resolved to, with the address (so it reads request
+        // parameters). A built-in module reads only the client IP, and a vendor
+        // module names what it needs.
+        let request = self.request.view();
         let request_info = BorrowedRequestInfo::new(
             self.client_ip.as_deref().unwrap_or_default(),
             Some(&self.request_headers),
         )
-        .with_request_target(&self.request_path, &self.request_query);
-        let generated: GeneratedEdgeCookie =
-            ec_module.generate(&request_info, &input, services).await?;
+        .with_request_target(request.path(), request.query());
+        let context = ModuleContext::new(request)
+            .with_evidence(&request_info)
+            .with_settings(settings)
+            .with_request_state(self, services);
+        let generated: GeneratedEdgeCookie = ec_module
+            .generate(context.call(ec_module.id(), ec_module.required_permissions()))
+            .await?;
         // Check every response header the module asked for against core's
         // reserved surface before any of them are kept. A module may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
@@ -732,7 +739,7 @@ impl EcContext {
     ) -> Result<(), Report<TrustedServerError>> {
         const MAX_CREATE_ATTEMPTS: usize = 5;
         for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let Some(ec_id) = self.candidate_id(ec_module, services).await? else {
+            let Some(ec_id) = self.candidate_id(ec_module, settings, services).await? else {
                 return Ok(());
             };
             // Key the identity graph by the module's canonical form of the
@@ -1161,8 +1168,7 @@ impl EcContext {
             device_signals: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
-            request_path: String::new(),
-            request_query: String::new(),
+            request: ResolvedRequest::default(),
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
@@ -1207,8 +1213,7 @@ impl EcContext {
             device_signals: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
-            request_path: String::new(),
-            request_query: String::new(),
+            request: ResolvedRequest::default(),
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
@@ -1242,8 +1247,7 @@ impl EcContext {
             device_signals: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
-            request_path: String::new(),
-            request_query: String::new(),
+            request: ResolvedRequest::default(),
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
@@ -1303,6 +1307,7 @@ pub(crate) mod tests {
     };
     use crate::ec::module::{EcModuleSelection, ModuleCode};
     use crate::evidence::RequestInfo;
+    use crate::module_context::{ModuleCall, ModuleRequest};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
 
@@ -1485,9 +1490,7 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -1609,13 +1612,41 @@ pub(crate) mod tests {
         );
     }
 
-    /// A module that records the request query parameter `id` and the `Cookie`
-    /// header it is given at generate time, proving request evidence (parameters
-    /// and cookies) reaches a module through the organic generate path.
+    /// A module that records the request query parameter `id`, the `Cookie`
+    /// header, the client IP and the host and address the request resolved
+    /// to, as it is given them at generate time, proving the request reaches a
+    /// module through the organic generate path.
     #[derive(Debug, Default)]
     struct EvidenceCapturingModule {
         seen: std::sync::Mutex<Option<(String, String)>>,
         seen_client_ip: std::sync::Mutex<Option<String>>,
+        seen_request: std::sync::Mutex<Option<(String, String)>>,
+    }
+
+    impl EvidenceCapturingModule {
+        fn capture(
+            &self,
+            request_info: &dyn RequestInfo,
+            request: ModuleRequest<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            *self
+                .seen_request
+                .lock()
+                .expect("should lock the seen request") =
+                Some((request.host().to_owned(), request.path().to_owned()));
+            let query_id = request_info.query_param("id").unwrap_or_default();
+            let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
+            *self.seen.lock().expect("should lock seen evidence") = Some((query_id, cookie));
+            *self
+                .seen_client_ip
+                .lock()
+                .expect("should lock the seen client IP") =
+                Some(request_info.client_ip().to_owned());
+            Ok(GeneratedEdgeCookie {
+                id: Some("evidence-ec".to_owned()),
+                response_headers: Vec::new(),
+            })
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -1630,22 +1661,9 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-            let query_id = request_info.query_param("id").unwrap_or_default();
-            let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
-            *self.seen.lock().expect("should lock seen evidence") = Some((query_id, cookie));
-            *self
-                .seen_client_ip
-                .lock()
-                .expect("should lock the seen client IP") =
-                Some(request_info.client_ip().to_owned());
-            Ok(GeneratedEdgeCookie {
-                id: Some("evidence-ec".to_owned()),
-                response_headers: Vec::new(),
-            })
+            call.inject(self, Self::capture)?
         }
 
         fn accepts_id(&self, value: &str) -> bool {
@@ -1666,6 +1684,7 @@ pub(crate) mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("http://example.com/page?id=abc123&debug=1")
+            .header("host", "example.com")
             .header("cookie", "client-id=xyz789")
             .body(EdgeBody::empty())
             .expect("should build request");
@@ -1687,6 +1706,15 @@ pub(crate) mod tests {
             seen,
             Some(("abc123".to_owned(), "client-id=xyz789".to_owned())),
             "the module should read the request query parameter and cookies at generate time"
+        );
+        assert_eq!(
+            module
+                .seen_request
+                .lock()
+                .expect("should lock the seen request")
+                .clone(),
+            Some(("example.com".to_owned(), "/page".to_owned())),
+            "the module should be handed the host and address the request resolved to"
         );
         assert_eq!(
             ec.ec_value(),
@@ -1720,7 +1748,7 @@ pub(crate) mod tests {
             .expect("should read EC context");
         assert!(ec.ec_was_present(), "the identifier should be read back");
         let selected = ec.selected_module().expect("a module is selected");
-        ec.candidate_id(selected.as_ref(), &services)
+        ec.candidate_id(selected.as_ref(), &settings, &services)
             .await
             .expect("should create a replacement");
 
@@ -1754,9 +1782,7 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("Opaque_EC_Value_MixedCase_123".to_owned()),
@@ -1878,24 +1904,13 @@ pub(crate) mod tests {
     /// config store at generate time, which is the whole point of handing modules
     /// the platform services. Nothing about the value is known when the
     /// module is constructed, so an identifier carrying it can only come from
-    /// a real read through the services passed to `generate`.
+    /// a real read through the services it names in `generate`.
     #[derive(Debug)]
     struct ConfigReadingModule;
 
-    #[async_trait::async_trait(?Send)]
-    impl EdgeCookieModule for ConfigReadingModule {
-        fn id(&self) -> &'static str {
-            "config-reading"
-        }
-
-        fn code(&self) -> ModuleCode {
-            crate::module_code!("t0cr")
-        }
-
-        async fn generate(
+    impl ConfigReadingModule {
+        fn read_tenant(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
             services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             let tenant = services
@@ -1910,6 +1925,24 @@ pub(crate) mod tests {
                 id: Some(format!("tenant-{tenant}")),
                 response_headers: Vec::new(),
             })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl EdgeCookieModule for ConfigReadingModule {
+        fn id(&self) -> &'static str {
+            "config-reading"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0cr")
+        }
+
+        async fn generate(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            call.inject(self, Self::read_tenant)?
         }
 
         fn accepts_id(&self, value: &str) -> bool {
@@ -2060,9 +2093,7 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("bad;value with spaces".to_owned()),
@@ -2123,9 +2154,7 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.id.map(str::to_owned),
@@ -2467,9 +2496,7 @@ pub(crate) mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("MiXeD.CaseId".to_owned()),
