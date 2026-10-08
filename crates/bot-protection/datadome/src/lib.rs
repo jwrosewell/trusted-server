@@ -2042,4 +2042,21 @@ mod tests {
             "should identify the removed field: {error:?}"
         );
     }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
+        );
+    }
 }

@@ -725,6 +725,207 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 }
 
+/// Running a page through the document pipeline and comparing what comes out
+/// with a recording, for a module crate's own tests.
+///
+/// A recording is the page a reader receives, kept as a file beside the test.
+/// It is how a change to the way a module makes its page change is shown to
+/// leave the page as it was.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use std::io::Cursor;
+
+    use super::{HtmlProcessorConfig, create_html_processor};
+    use crate::integrations::IntegrationRegistry;
+    use crate::settings::Settings;
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+
+    /// The host a test page is fetched from.
+    pub const ORIGIN_HOST: &str = "origin.example.com";
+
+    /// The host a test page is served on, over HTTPS.
+    pub const REQUEST_HOST: &str = "publisher.example.com";
+
+    /// Set in the environment to write recordings in place of comparing with
+    /// them.
+    pub const RECORD_ENV: &str = "TS_RECORD_PAGES";
+
+    /// What stands in a recording for the hash of the script bundle, which
+    /// changes whenever any browser module does.
+    const BUNDLE_HASH: &str = "BUNDLE-HASH";
+
+    /// The page a reader of `html` receives from a deployment running
+    /// `settings` with `registry`'s modules, read from the origin `chunk_size`
+    /// bytes at a time.
+    ///
+    /// The script bundle's `?v=` hash is replaced by a fixed word, so a
+    /// recording changes when a module's page change does and not when a
+    /// browser module is rebuilt.
+    ///
+    /// # Panics
+    ///
+    /// When the pipeline refuses the page, or leaves something that is not
+    /// UTF-8.
+    #[must_use]
+    pub fn processed_page(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+        html: &str,
+        chunk_size: usize,
+    ) -> String {
+        let config = HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            ORIGIN_HOST,
+            REQUEST_HOST,
+            "https",
+        );
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            create_html_processor(config),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process the page");
+        without_bundle_hashes(&String::from_utf8(output).expect("should leave the page UTF-8"))
+    }
+
+    /// `page` with each `?v=` hash of a script bundle address replaced.
+    fn without_bundle_hashes(page: &str) -> String {
+        const MARK: &str = "/static/tsjs=";
+        let mut out = String::with_capacity(page.len());
+        let mut rest = page;
+        while let Some(at) = rest.find(MARK) {
+            let (before, address) = rest.split_at(at + MARK.len());
+            out.push_str(before);
+            let end = address
+                .find(['"', '\'', ' ', '>', '<'])
+                .unwrap_or(address.len());
+            let (address, after) = address.split_at(end);
+            match address.split_once("?v=") {
+                Some((file, hash))
+                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    out.push_str(file);
+                    out.push_str("?v=");
+                    out.push_str(BUNDLE_HASH);
+                }
+                _ => out.push_str(address),
+            }
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The least a deployment's settings must say, which a module's own
+    /// settings are written after.
+    const BASE_SETTINGS: &str = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "page-recording-password"
+
+[publisher]
+domain = "publisher.example.com"
+cookie_domain = ".publisher.example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "page-recording-proxy-secret"
+
+[geo]
+assume_single_jurisdiction = true
+
+[ec]
+module = "hmac"
+
+[ec.hmac]
+passphrase = "page-recording-passphrase-32-bytes"
+"#;
+
+    /// The settings of a deployment that writes `module_settings`, a TOML
+    /// document selecting a module and holding its table, after the least a
+    /// deployment must say.
+    ///
+    /// # Panics
+    ///
+    /// When the two together are not settings a deployment could load.
+    #[must_use]
+    pub fn page_settings(module_settings: &str) -> Settings {
+        Settings::from_toml(&format!("{BASE_SETTINGS}\n{module_settings}"))
+            .expect("should read the page's settings")
+    }
+
+    /// The size of the chunks a recorded page is read from the origin in,
+    /// large enough that a test page arrives whole.
+    const RECORDING_CHUNK_SIZE: usize = 8192;
+
+    /// Checks the page `html` becomes is the one in `recorded`, byte for
+    /// byte.
+    ///
+    /// The deployment writes `module_settings`, see [`page_settings`], and
+    /// links `builders` beside core's own modules. `recorded` is the recording
+    /// as the test embeds it and `path` is where it is kept. With
+    /// [`RECORD_ENV`] set the recording is written to `path` instead, which is
+    /// how a recording is made. A recording is made again only when the page
+    /// is meant to change for every reader.
+    ///
+    /// # Panics
+    ///
+    /// When the page is not the recorded one, or the recording cannot be
+    /// written.
+    pub fn assert_page_is_recorded(
+        module_settings: &str,
+        builders: &[crate::integrations::IntegrationBuilder],
+        html: &str,
+        recorded: &str,
+        path: &str,
+    ) {
+        let settings = &page_settings(module_settings);
+        let registry = &IntegrationRegistry::with_registrations(settings, builders)
+            .expect("should build the registry");
+        let page = processed_page(settings, registry, html, RECORDING_CHUNK_SIZE);
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os(RECORD_ENV).is_some() {
+            std::fs::write(path, &page).expect("should write the recording");
+            return;
+        }
+        assert!(
+            recorded == page,
+            "the page is not the one recorded at {path}.\n--- recorded\n{recorded}\n--- now\n{page}\n\
+             ---\nA recording changes only when the page is meant to change for every reader, \
+             by running the test with {RECORD_ENV} set."
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::without_bundle_hashes;
+
+        #[test]
+        fn a_bundle_hash_is_replaced_and_nothing_else_is() {
+            let page = "<script src=\"/static/tsjs=tsjs-unified.min.js?v=0a1B2c\" id=\"x\"></script>\
+                        <script src='/static/tsjs=tsjs-prebid.min.js?v=ff00' defer></script>\
+                        <a href=\"/static/tsjs=other.js?v=not-a-hash\">kept</a>\
+                        <a href=\"/page?v=0a1b2c\">kept</a>";
+
+            let replaced = without_bundle_hashes(page);
+
+            assert_eq!(
+                replaced,
+                "<script src=\"/static/tsjs=tsjs-unified.min.js?v=BUNDLE-HASH\" id=\"x\"></script>\
+                 <script src='/static/tsjs=tsjs-prebid.min.js?v=BUNDLE-HASH' defer></script>\
+                 <a href=\"/static/tsjs=other.js?v=not-a-hash\">kept</a>\
+                 <a href=\"/page?v=0a1b2c\">kept</a>"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

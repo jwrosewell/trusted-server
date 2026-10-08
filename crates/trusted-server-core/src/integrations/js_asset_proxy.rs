@@ -1696,4 +1696,21 @@ mod tests {
             "should identify the unknown asset field"
         );
     }
+
+    /// The page a reader receives with the script proxy running, kept as a
+    /// file so that changing how the page change is made can be shown to
+    /// leave the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        crate::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/js-asset-proxy.settings.toml"),
+            &[],
+            include_str!("fixtures/js-asset-proxy.input.html"),
+            include_str!("fixtures/js-asset-proxy.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/integrations/fixtures/js-asset-proxy.recorded.html"
+            ),
+        );
+    }
 }

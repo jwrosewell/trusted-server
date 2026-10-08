@@ -1,0 +1,5 @@
+[cmp]
+modules = ["sourcepoint"]
+
+[cmp.sourcepoint]
+rewrite_sdk = true

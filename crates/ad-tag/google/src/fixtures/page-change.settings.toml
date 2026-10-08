@@ -1,0 +1,5 @@
+[ad-tag]
+modules = ["google", "google.diagnostics"]
+
+[ad-tag.google]
+gam_attribution_enabled = false

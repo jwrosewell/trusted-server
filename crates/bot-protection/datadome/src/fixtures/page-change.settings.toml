@@ -1,0 +1,5 @@
+[bot-protection]
+modules = ["datadome"]
+
+[bot-protection.datadome]
+client_side_key = "test-client-key"

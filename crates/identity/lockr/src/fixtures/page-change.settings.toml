@@ -1,0 +1,5 @@
+[identity]
+modules = ["lockr"]
+
+[identity.lockr]
+app_id = "test-app-id"

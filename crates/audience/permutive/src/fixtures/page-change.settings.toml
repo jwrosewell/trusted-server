@@ -1,0 +1,6 @@
+[audience]
+modules = ["permutive"]
+
+[audience.permutive]
+organization_id = "myorg"
+workspace_id = "abc123"
