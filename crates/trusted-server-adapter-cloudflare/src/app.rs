@@ -28,6 +28,7 @@ use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::inspect::config::{CONFIG_PATHS, handle_config};
+use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
 use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permissions};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
@@ -947,6 +948,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for path in CONFIG_PATHS {
             router = router.route(path, Method::GET, config.clone());
         }
+
+        // What is held against the request's own Edge Cookie. This adapter
+        // keeps no identity graph, so the page says nothing is held.
+        let data = make_handler(Arc::clone(&state), |_s, _services, req| async move {
+            handle_data(None, None, &req)
+        });
+        router = router.route(DATA_PAGE_PATH, Method::GET, data);
 
         let cache_purge_unsupported =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {

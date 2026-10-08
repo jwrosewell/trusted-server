@@ -22,6 +22,7 @@ use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
+use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
 use trusted_server_core::inspect::permissions::{
     PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
 };
@@ -453,6 +454,7 @@ enum NamedRouteHandler {
     VerifySignature,
     Permissions,
     Config,
+    Data,
     AdminNotSupported,
     CachePurgeNotSupported,
     AdminEcNotSupported,
@@ -484,7 +486,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 21] {
+fn named_routes() -> [NamedRoute; 22] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -517,6 +519,13 @@ fn named_routes() -> [NamedRoute; 21] {
             path: CONFIG_JSON_PATH,
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::Config,
+        },
+        // What is held against the request's own Edge Cookie. This adapter
+        // keeps no identity graph, so the page says nothing is held.
+        NamedRoute {
+            path: DATA_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Data,
         },
         // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
         // and the production basic-auth handler regex (`^/_ts/admin`), so they
@@ -643,6 +652,7 @@ fn named_route_handler(
                         handle_permissions(&state.settings, &services, &req).await
                     }
                     NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
+                    NamedRouteHandler::Data => handle_data(None, None, &req),
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather
                         // than a fallthrough 404, so a CMS webhook can tell "not supported

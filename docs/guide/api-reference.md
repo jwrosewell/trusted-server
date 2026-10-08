@@ -48,6 +48,7 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/config.json`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/config`                          | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/data`                            | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
@@ -156,6 +157,92 @@ contains one of those values is masked wherever it sits, a key included.
 ```bash
 curl -s "https://edge.example.com/_ts/config.json"
 ```
+
+### GET /\_ts/data
+
+Shows a reader what the deployment holds against the Edge Cookie their own
+browser sent, being when the record was made, the consent recorded, the
+location and device class kept, and which partners hold an identifier of their
+own for the same browser. It answers as a page only, because the answer is for
+a person.
+
+**Contract:** Auth: none. The record shown is the one stored against the
+identifier in the request's own `ts-ec` cookie, and no other can be asked for.
+Request body: not applicable. Rate limit: none. Endpoint-specific CORS: none,
+so no other origin may read it.
+
+The Edge Cookie is `HttpOnly`, so a script on the page cannot read the
+identifier, and this page does not undo that.
+
+1. Only a browser opening the address as a page is answered, which the browser
+   marks with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. A
+   script cannot set either header, so a `fetch` from a page, a frame and an
+   embedded object are each answered `403 Forbidden`.
+2. The page is sent with `Content-Security-Policy: sandbox`, which gives the
+   document an origin of its own, so a page that opened it cannot read it.
+3. No identifier is shown. The Edge Cookie's value and each partner's
+   identifier show as `XXXX`.
+
+Two parties other than the reader can still read the page, and neither finds
+an identifier in it. The first is whoever holds an identifier, because a tool
+can send it as the cookie along with both headers. The second is a service
+worker the publisher's site registers for the whole site, because it handles
+this navigation as it does every other on the site.
+
+**Response:**
+
+- **Status:** `200 OK`, or `403 Forbidden` when the request is not a browser
+  opening the page
+- **Headers:** `Cache-Control: no-store, private`, `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Resource-Policy: same-origin` and the policy below
+
+```http
+Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+```
+
+The page shows this information.
+
+```json
+{
+  "consent_updated": "2026-03-14T09:30:00Z",
+  "created": "2026-03-14T09:30:00Z",
+  "held": true,
+  "identifier": "XXXX",
+  "record": {
+    "consent": { "ok": true, "tcf": "CP...", "updated": 1773480600 },
+    "created": 1773480600,
+    "geo": { "country": "GB", "region": "ENG" },
+    "ids": { "partner.example.com": { "uid": "XXXX" } },
+    "pub_properties": {
+      "origin_domain": "example.com",
+      "seen_domains": ["example.com"]
+    },
+    "v": 1
+  },
+  "version": "0.1.0",
+  "withdrawn": false
+}
+```
+
+| Field                           | Meaning                                                                       |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `held`                          | Whether a record is held against the request's Edge Cookie                    |
+| `why`                           | The reason, when nothing is held                                              |
+| `identifier`                    | Always `XXXX`, because the Edge Cookie's value is never shown                 |
+| `record`                        | The record as it is stored, with each partner's identifier replaced by `XXXX` |
+| `created` and `consent_updated` | The two times in the record, written as dates                                 |
+| `withdrawn`                     | Whether the record is the one a withdrawal of consent leaves                  |
+| `version`                       | The version of the core crate that answered                                   |
+
+Nothing is held, and `why` gives the reason, when the deployment keeps no
+identity graph, when the request carried no Edge Cookie, when the cookie is
+not one the deployment issued, and when no record is stored against it. Only
+the Fastly adapter keeps an identity graph, so every other adapter answers
+that nothing is held.
+
+Nothing is created or written for the reader. The Edge Cookie lifecycle does
+not run for this request, so no cookie is set and no identity row is written.
 
 ### GET /\_ts/permissions and GET /\_ts/permissions.json
 
@@ -1418,7 +1505,8 @@ publisher-domain policy and an explicit `OPTIONS` handler. Page-bids explicitly
 denies preflight. `/_ts/permissions` and `/_ts/permissions.json` answer any
 origin, because they show nothing but the asking request's own resolution,
 and `/_ts/config` and `/_ts/config.json` answer any origin, because what they
-show is the same for every request. Several integration proxies preserve or synthesize only the
+show is the same for every request. `/_ts/data` answers no other origin,
+because it shows what is held against one reader. Several integration proxies preserve or synthesize only the
 headers described in their contract. `response_headers` is standard response
 finalization, not a substitute for registering and validating an `OPTIONS`
 route; do not infer cross-origin support from a configured header alone.

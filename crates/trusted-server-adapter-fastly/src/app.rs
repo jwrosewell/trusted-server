@@ -31,6 +31,7 @@
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | GET | `/_ts/permissions` and `/_ts/permissions.json` | [`handle_permissions`] |
 //! | GET | `/_ts/config` and `/_ts/config.json` | [`handle_config`] |
+//! | GET | `/_ts/data` | [`handle_data`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
@@ -126,6 +127,7 @@ use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
+use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
 use trusted_server_core::inspect::permissions::{
     PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
 };
@@ -829,6 +831,17 @@ async fn execute_named(
         return Ok(response);
     }
 
+    // Read only. It shows what is held against the request's own Edge
+    // Cookie, read under the module the deployment selects, and the Edge
+    // Cookie lifecycle never runs, so nothing is written for the reader.
+    if matches!(handler, NamedRouteHandler::Data) {
+        let kv = crate::maybe_identity_graph(&state.settings);
+        let response = request_module(&state.settings.ec, &services)
+            .and_then(|module| handle_data(kv.as_ref(), module.as_deref(), &req))
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     if let Err(report) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&report));
     }
@@ -915,6 +928,9 @@ async fn run_named_route(
         }
         NamedRouteHandler::Config => {
             unreachable!("the configuration is answered before EC setup")
+        }
+        NamedRouteHandler::Data => {
+            unreachable!("what is held is answered before EC setup")
         }
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
@@ -1358,6 +1374,7 @@ enum NamedRouteHandler {
     ClearTester,
     Permissions,
     Config,
+    Data,
     EcResolve,
     Auction,
     PageBids,
@@ -1494,6 +1511,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: CONFIG_JSON_PATH,
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::Config,
+    },
+    // What is held against the request's own Edge Cookie, shown to a browser
+    // opening the address as a page.
+    NamedRoute {
+        path: DATA_PAGE_PATH,
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::Data,
     },
     NamedRoute {
         path: "/_ts/api/v1/ec/resolve",
@@ -2644,6 +2668,53 @@ mod tests {
         assert_eq!(
             page.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn dispatch_data_answers_a_browser_opening_the_page_and_nothing_else() {
+        let router = test_router();
+
+        let refused = route(&router, empty_request(Method::GET, "/_ts/data"));
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "should refuse a request that is not a browser opening the page"
+        );
+        assert!(
+            refused
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "should not run the Edge Cookie lifecycle for a refusal"
+        );
+
+        let mut opened = empty_request(Method::GET, "/_ts/data");
+        opened
+            .headers_mut()
+            .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        opened
+            .headers_mut()
+            .insert("sec-fetch-dest", HeaderValue::from_static("document"));
+        let page = route(&router, opened);
+        assert_eq!(page.status(), StatusCode::OK, "the page should answer");
+        assert_eq!(
+            page.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert!(
+            page.headers().get(header::SET_COOKIE).is_none(),
+            "should write nothing for the reader"
+        );
+        assert!(
+            page.extensions().get::<super::EcFinalizeState>().is_none(),
+            "should not run the Edge Cookie lifecycle for a read"
+        );
+        let body = page.into_body().into_bytes().unwrap_or_default();
+        assert!(
+            String::from_utf8_lossy(&body).contains("keeps no record"),
+            "should say a deployment with no identity graph keeps no record"
         );
     }
 

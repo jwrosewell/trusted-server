@@ -126,6 +126,7 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/permissions.json"),
         ("GET", "/_ts/config"),
         ("GET", "/_ts/config.json"),
+        ("GET", "/_ts/data"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
         ("GET", "/_ts/admin/ec"),
@@ -746,6 +747,47 @@ async fn config_endpoint_answers_anyone_and_masks_secrets() {
         assert!(
             !text.contains("admin-pass"),
             "{path} should not carry the admin password"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_endpoint_answers_a_browser_opening_the_page_and_nothing_else() {
+    for (opened_as_a_page, expected) in [(false, 403), (true, 200)] {
+        let mut svc = make_service();
+        let mut builder = Request::builder().method("GET").uri("/_ts/data");
+        if opened_as_a_page {
+            builder = builder
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-dest", "document");
+        }
+        let req = builder
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        assert_eq!(
+            resp.status().as_u16(),
+            expected,
+            "opened as a page: {opened_as_a_page}"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "no-store, private",
+            "should never be stored"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("should read the body");
+        assert_eq!(
+            String::from_utf8_lossy(&body).contains("keeps no record"),
+            opened_as_a_page,
+            "should say nothing is held to a browser opening the page, and to nothing else"
         );
     }
 }
