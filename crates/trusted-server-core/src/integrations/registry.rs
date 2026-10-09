@@ -3035,19 +3035,18 @@ pub(crate) mod test_support {
     /// core's own tests of how modules are divided between the bundle and
     /// deferred tags, and of how a module's settings reach a page template.
     ///
-    /// Selected, it carries a deferred browser module and writes its two
-    /// settings into `<head>`.
+    /// Selected, it carries a deferred browser module and supplies one fetch
+    /// middleware under its own name, which writes its two settings into
+    /// `<head>`.
     pub(crate) mod deferred_fixture {
         use std::sync::Arc;
 
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
-            IntegrationRegistration,
-        };
+        use crate::integrations::registry::{CarriedJsModule, IntegrationRegistration};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase};
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -3081,20 +3080,37 @@ pub(crate) mod test_support {
             timeout_ms: u32,
         }
 
-        impl IntegrationHeadInjector for Head {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 let config = serde_json::json!({
                     "label": self.label,
                     "timeoutMs": self.timeout_ms,
                 });
-                vec![format!(
-                    "<script>window.__ts_deferred_fixture={config};</script>"
-                )]
+                MiddlewareAction {
+                    head_inserts: vec![format!(
+                        "<script>window.__ts_deferred_fixture={config};</script>"
+                    )],
+                    ..MiddlewareAction::pass()
+                }
             }
+        }
+
+        /// Has `settings` run the stand-in's middleware, and no other, on
+        /// every page.
+        pub(crate) fn place(settings: &mut Settings) {
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Fetch,
+                &[MODULE],
+            );
         }
 
         fn register(
@@ -3110,7 +3126,7 @@ pub(crate) mod test_support {
                         sha256: JS_SHA256,
                     })
                     .with_deferred_js()
-                    .with_head_injector(Arc::new(Head {
+                    .with_middleware(Arc::new(Head {
                         label: config.label,
                         timeout_ms: config.timeout_ms,
                     }))
@@ -3444,13 +3460,14 @@ pub(crate) mod test_support {
     /// A stand-in for an integration that rewrites script payloads in two
     /// passes, for core's own tests of the page pipeline.
     ///
-    /// The script rewriter swaps the payload of each `fixture_payload("...")`
-    /// call for a placeholder that carries a namespace made per document, and
-    /// keeps the payload in the document state. The stream processor swaps
-    /// each placeholder back for its payload with the origin host rewritten.
-    /// A payload pushed with `fixture_payload_open` leaves its group
-    /// unresolved, and the processor holds its output from that placeholder
-    /// on until a `fixture_payload_close` arrives.
+    /// Selected, it supplies one fetch middleware under its own name. Its
+    /// text handler swaps the payload of each `fixture_payload("...")` call
+    /// for a placeholder that carries a namespace made per document, and
+    /// keeps the payload. Its stream processor swaps each placeholder back
+    /// for its payload with the origin host rewritten. A payload pushed with
+    /// `fixture_payload_open` leaves its group unresolved, and the processor
+    /// holds its output from that placeholder on until a
+    /// `fixture_payload_close` arrives.
     pub(crate) mod payload_fixture {
         use std::io;
         use std::sync::{Arc, Mutex, PoisonError};
@@ -3458,12 +3475,11 @@ pub(crate) mod test_support {
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
-            IntegrationRegistration, IntegrationScriptContext, IntegrationScriptRewriter,
-            ScriptRewriteAction, ScriptTextAccumulator,
-        };
+        use crate::integrations::registry::{IntegrationRegistration, ScriptRewriteAction};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
+        };
         use crate::settings::Settings;
         use crate::streaming_processor::StreamProcessor;
 
@@ -3488,7 +3504,7 @@ pub(crate) mod test_support {
             unresolved: bool,
         }
 
-        /// What one document's script rewriter has captured so far.
+        /// What one document's text handler has captured so far.
         struct Captured {
             namespace: String,
             payloads: Vec<Payload>,
@@ -3503,18 +3519,16 @@ pub(crate) mod test_support {
             }
         }
 
-        fn captured(
-            state: &crate::integrations::registry::IntegrationDocumentState,
-        ) -> Arc<Mutex<Captured>> {
-            state.get_or_insert_with(ID, || Mutex::new(Captured::default()))
+        /// The scripts of one document, each held until its last chunk.
+        struct Scripts {
+            captured: Arc<Mutex<Captured>>,
+            held: String,
         }
 
-        struct ScriptRewriter;
-
-        impl ScriptRewriter {
+        impl Scripts {
             /// Swaps the payload of a whole script for a placeholder, or
             /// leaves a script that pushes no payload as it is.
-            fn rewrite_whole(script: &str, ctx: &IntegrationScriptContext<'_>) -> Option<String> {
+            fn rewrite_whole(&self, script: &str) -> Option<String> {
                 let (call, opens, closes) = [
                     ("fixture_payload_open(\"", true, false),
                     ("fixture_payload_close(\"", false, true),
@@ -3528,8 +3542,7 @@ pub(crate) mod test_support {
                     return None;
                 }
 
-                let shared = captured(ctx.document_state);
-                let mut captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut captured = self.captured.lock().unwrap_or_else(PoisonError::into_inner);
                 let placeholder = format!(
                     "{PLACEHOLDER_PREFIX}{}_{}{PLACEHOLDER_END}",
                     captured.namespace,
@@ -3552,55 +3565,61 @@ pub(crate) mod test_support {
             }
         }
 
-        impl IntegrationScriptRewriter for ScriptRewriter {
-            fn integration_id(&self) -> &'static str {
-                ID
-            }
-
-            fn selector(&self) -> &'static str {
+        impl TextHandler for Scripts {
+            fn selector(&self) -> &str {
                 "script"
             }
 
-            fn rewrite(
-                &self,
-                content: &str,
-                ctx: &IntegrationScriptContext<'_>,
-            ) -> ScriptRewriteAction {
-                let accumulator = ctx
-                    .document_state
-                    .get_or_insert_with(ID, ScriptTextAccumulator::default);
-                let mut buffer = accumulator.buffer();
-                let claimed = !buffer.is_empty() || content.contains("fixture_payload");
+            fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction {
+                let claimed = !self.held.is_empty() || text.contains("fixture_payload");
                 if !claimed {
                     return ScriptRewriteAction::Keep;
                 }
-                buffer.push_str(content);
-                if !ctx.is_last_in_text_node {
+                self.held.push_str(text);
+                if !is_last {
                     return ScriptRewriteAction::RemoveNode;
                 }
-                let script = std::mem::take(&mut *buffer);
-                let rewritten = Self::rewrite_whole(&script, ctx).unwrap_or(script);
+                let script = std::mem::take(&mut self.held);
+                let rewritten = self.rewrite_whole(&script).unwrap_or(script);
                 ScriptRewriteAction::replace(rewritten)
             }
         }
 
-        struct StreamFactory;
+        struct Payloads;
 
-        impl IntegrationHtmlStreamProcessorFactory for StreamFactory {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Payloads {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
-                Box::new(Processor {
-                    context,
-                    held: Vec::new(),
-                })
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            /// The text handler and the stream processor of one document
+            /// share what the handler captures.
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let captured = Arc::new(Mutex::new(Captured::default()));
+                MiddlewareAction {
+                    text_handlers: vec![Box::new(Scripts {
+                        captured: Arc::clone(&captured),
+                        held: String::new(),
+                    })],
+                    stream: Some(Box::new(Processor {
+                        captured,
+                        origin_host: context.origin_host.to_owned(),
+                        request_host: context.request_host.to_owned(),
+                        held: Vec::new(),
+                    })),
+                    ..MiddlewareAction::pass()
+                }
             }
         }
 
         struct Processor {
-            context: IntegrationHtmlStreamContext,
+            captured: Arc<Mutex<Captured>>,
+            origin_host: String,
+            request_host: String,
             /// Output not yet released, because it ends inside a placeholder
             /// or starts at one whose group is unresolved.
             held: Vec<u8>,
@@ -3617,8 +3636,7 @@ pub(crate) mod test_support {
         impl StreamProcessor for Processor {
             fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
                 self.held.extend_from_slice(chunk);
-                let shared = captured(&self.context.document_state);
-                let captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let captured = self.captured.lock().unwrap_or_else(PoisonError::into_inner);
                 let prefix = PLACEHOLDER_PREFIX.as_bytes();
                 let mut out = Vec::with_capacity(self.held.len());
                 let mut at = 0;
@@ -3652,7 +3670,7 @@ pub(crate) mod test_support {
                             out.extend_from_slice(
                                 payload
                                     .original
-                                    .replace(&self.context.origin_host, &self.context.request_host)
+                                    .replace(&self.origin_host, &self.request_host)
                                     .as_bytes(),
                             );
                             at = end;
@@ -3686,6 +3704,17 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Has `settings` select the stand-in and run its middleware, and no
+        /// other, on every page.
+        pub(crate) fn select_and_place(settings: &mut Settings) {
+            settings.select_module("testing", MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Fetch,
+                &[MODULE],
+            );
+        }
+
         fn register(
             settings: &Settings,
         ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -3694,8 +3723,7 @@ pub(crate) mod test_support {
             }
             Ok(Some(
                 IntegrationRegistration::builder(ID)
-                    .with_script_rewriter(Arc::new(ScriptRewriter))
-                    .with_html_stream_processor(Arc::new(StreamFactory))
+                    .with_middleware(Arc::new(Payloads))
                     .build(),
             ))
         }

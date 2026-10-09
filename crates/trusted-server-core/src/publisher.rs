@@ -10023,8 +10023,8 @@ mod tests {
 
         #[test]
         fn reconfiguring_an_integration_changes_the_fingerprint() {
-            // Config reaches the template directly: an integration's head insert
-            // carries its settings into bytes shared between readers.
+            // Config reaches the template directly: a middleware's head markup
+            // carries its module's settings into bytes shared between readers.
             assert_ne!(
                 fingerprint(&settings_with_integration(true, 1000)),
                 fingerprint(&settings_with_integration(true, 2500)),
@@ -13687,14 +13687,20 @@ mod tests {
         async fn two_pass_integration_templates_are_identical_across_request_shapes() {
             let mut settings = settings_with_mode("esi");
             settings.publisher.origin_url = "https://origin.example.com".to_owned();
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            crate::integrations::registry_test_support::payload_fixture::select_and_place(
+                &mut settings,
             );
             let registry = IntegrationRegistry::new(&settings).expect("should create registry");
             assert!(
-                !registry.html_stream_processor_factories().is_empty(),
-                "should exercise the stand-in's stream processor"
+                !registry
+                    .middleware_chain(
+                        &settings.fetch,
+                        crate::middleware::MiddlewarePhase::Fetch,
+                        crate::middleware::HTML_MEDIA_TYPE,
+                        "/",
+                    )
+                    .is_empty(),
+                "should exercise the stand-in's middleware, which supplies a stream processor"
             );
             let settings = Arc::new(settings);
             let html = br#"<html><head></head><body><script>fixture_payload("link=https://origin.example.com/page")</script><div id="test-slot"></div></body></html>"#;
@@ -14086,6 +14092,7 @@ mod tests {
                     }),
                 )
                 .expect("should insert the stand-in's table");
+            crate::integrations::registry_test_support::deferred_fixture::place(&mut settings);
             settings
         }
 
@@ -14128,9 +14135,20 @@ mod tests {
             queue_shareable_html(&stub);
             queue_shareable_html(&stub);
 
-            let _ = run(&first, &services, navigation_request()).await;
-            let _ = run(&second, &services, navigation_request()).await;
+            let first_page = String::from_utf8(
+                body_of(run(&first, &services, navigation_request()).await).await,
+            )
+            .expect("should serve the first configuration's page as UTF-8");
+            let second_page = String::from_utf8(
+                body_of(run(&second, &services, navigation_request()).await).await,
+            )
+            .expect("should serve the second configuration's page as UTF-8");
 
+            assert!(
+                first_page.contains("\"timeoutMs\":1000")
+                    && second_page.contains("\"timeoutMs\":2500"),
+                "each page should carry the markup its own configuration writes"
+            );
             let stored = stored_cache_keys(&cache);
             assert_eq!(
                 stored.len(),
@@ -22501,9 +22519,8 @@ mod tests {
         // request token emitted by lol_html at the structural end is a seam.
         let page = br#"<html><head></head><body><script>fixture_payload("href=https://origin.example.com/app text=</body>")</script><article>still streaming</article>"#;
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
         let params = html_stream_params(
             "",
@@ -22678,9 +22695,8 @@ mod tests {
             settings.auction.enabled = true;
             settings.auction.provider_names = vec!["seam_test".to_owned()];
             settings.auction.timeout_ms = 60_000;
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            crate::integrations::registry_test_support::payload_fixture::select_and_place(
+                &mut settings,
             );
             let client = Arc::new(GatedAuctionHttpClient {
                 inner: StubHttpClient::new(),
@@ -23489,11 +23505,11 @@ mod tests {
     /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
     fn streaming_html_with_stream_processors_rewrites_body() {
-        // Select the stand-in so a stream processor is registered.
+        // Select the stand-in and place its middleware, so the page has a
+        // stream processor.
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
 
         let registry = IntegrationRegistry::with_plan(
@@ -23506,8 +23522,15 @@ mod tests {
         .expect("should create integration registry");
 
         assert!(
-            !registry.html_stream_processor_factories().is_empty(),
-            "the stand-in must register an HTML stream processor"
+            !registry
+                .middleware_chain(
+                    &settings.fetch,
+                    crate::middleware::MiddlewarePhase::Fetch,
+                    crate::middleware::HTML_MEDIA_TYPE,
+                    "/",
+                )
+                .is_empty(),
+            "the stand-in's middleware, which supplies an HTML stream processor, must run on the page"
         );
         assert_eq!(
             classify_response_route(
@@ -23572,9 +23595,8 @@ mod tests {
     #[test]
     fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
         let registry = IntegrationRegistry::with_plan(
             &settings,
