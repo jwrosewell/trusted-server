@@ -286,6 +286,45 @@ fn fetch_entry_builds_state_only_when_its_middleware_is_running() {
     );
 }
 
+/// A `[[serve]]` entry builds this adapter's state when it names a
+/// middleware that runs in that phase, and is a startup error when it names
+/// one that does not.
+#[test]
+fn serve_entry_builds_state_only_with_a_middleware_of_that_phase() {
+    let settings = |name: &str| {
+        settings_with(&format!(
+            r#"{HMAC_BLOCK}{PROBE_BLOCK}
+        [[serve]]
+        media_type = "text/html"
+        middleware = ["{name}"]
+"#
+        ))
+    };
+
+    assert!(
+        build_state_with_registrations(
+            settings(seam_probe::reader_middleware_name()),
+            &[seam_probe::builder()]
+        )
+        .is_ok(),
+        "should build state with a serve entry naming the module's serve middleware"
+    );
+
+    let error = build_state_with_registrations(
+        settings(seam_probe::module_name()),
+        &[seam_probe::builder()],
+    )
+    .err()
+    .expect("should refuse to start when a serve entry names a fetch middleware");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("[[serve]] entry 1 names `testing.seam-probe`")
+            && message.contains("does not run in that phase. It runs in [[fetch]]"),
+        "should say which phase the middleware runs in: {message}"
+    );
+}
+
 /// `[geo] module` naming a selected module that supplies no geo module is a
 /// startup error, raised where this adapter builds its state.
 #[test]
