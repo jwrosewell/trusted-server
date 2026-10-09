@@ -5,3 +5,7 @@ modules = ["didomi"]
 geo_query_parameters = false
 sdk_origin = "https://sdk.example.com"
 api_origin = "https://api.example.com"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["cmp.didomi"]
