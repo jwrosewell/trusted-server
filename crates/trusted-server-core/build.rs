@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use edgezero_core::manifest::ManifestLoader;
 
+mod build_time;
+
 /// Source file that must stay out of the generated list.
 ///
 /// `migration_guards.rs` holds the banned pattern itself, as the regex literal
@@ -15,6 +17,47 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     write_default_config_store_id();
     write_migration_guard_sources();
+    write_build_time();
+    write_build_identity();
+}
+
+/// Bakes the build time into the binary as `TRUSTED_SERVER_BUILT_AT`.
+///
+/// Some hosts give a WebAssembly guest no custom environment variable when it
+/// runs, so the time a build was made has to be in the binary or it cannot be
+/// reported at all.
+///
+/// `SOURCE_DATE_EPOCH` is honored where it is set, so a reproducible build
+/// stays reproducible rather than differing only by this string.
+fn write_build_time() {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let seconds = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or_default())
+                .unwrap_or_default()
+        });
+    println!(
+        "cargo:rustc-env=TRUSTED_SERVER_BUILT_AT={}",
+        build_time::rfc3339_utc(seconds)
+    );
+}
+
+/// Bakes in the commit and the build run the builder names, as
+/// `TRUSTED_SERVER_COMMIT` and `TRUSTED_SERVER_BUILD_RUN`, or `unknown`.
+fn write_build_identity() {
+    for name in ["TRUSTED_SERVER_COMMIT", "TRUSTED_SERVER_BUILD_RUN"] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!("cargo:rustc-env={name}={value}");
+    }
 }
 
 /// Keeps every adapter's compiled default synchronized with the repository
