@@ -779,20 +779,6 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
-    // An operator cache purge is not a reader request: running the EC lifecycle would
-    // attach finalization state and could ingest the operator's cookies into KV.
-    if matches!(handler, NamedRouteHandler::AdminCachePurge) {
-        let principal = trusted_server_core::auth::authenticated_username(&req);
-        let response = trusted_server_core::cache_purge::handle_cache_purge(
-            &services,
-            req,
-            principal.as_deref(),
-        )
-        .await
-        .unwrap_or_else(|error| http_error(&error));
-        return Ok(response);
-    }
-
     // Read only. The permissions are resolved for this request as a page's
     // would be, then shown, and the Edge Cookie lifecycle never runs, so
     // nothing is written for the reader.
@@ -864,9 +850,6 @@ async fn run_named_route(
         }
         NamedRouteHandler::VerifySignature => {
             handle_verify_signature(&state.settings, services, req)
-        }
-        NamedRouteHandler::AdminCachePurge => {
-            unreachable!("cache purge should be handled before EC setup")
         }
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -1309,7 +1292,6 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
-    AdminCachePurge,
     BatchSync,
     Identify,
     SetTester,
@@ -1332,18 +1314,6 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-/// Every method an admin route must claim to keep non-primary methods from falling
-/// through to the publisher with the `Authorization` header still attached.
-const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
 const NAMED_ROUTES: &[NamedRoute] = &[
     NamedRoute {
         path: "/.well-known/trusted-server.json",
@@ -1354,15 +1324,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/verify-signature",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::VerifySignature,
-    },
-    // Every method is claimed, not just POST. A method this route did not claim would
-    // fall through to the publisher, and `enforce_basic_auth` leaves the `Authorization`
-    // header in place, so a GET would ship the shared admin credential to the origin.
-    // The handler answers the non-POST methods with 405 itself.
-    NamedRoute {
-        path: "/_ts/admin/cache/purge",
-        primary_methods: LEGACY_ADMIN_DENY_METHODS,
-        handler: NamedRouteHandler::AdminCachePurge,
     },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
@@ -2126,40 +2087,6 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
             "FinalizeResponseMiddleware must run even for auth-rejected responses"
-        );
-    }
-
-    #[test]
-    fn cache_purge_claims_every_method_that_could_reach_the_publisher() {
-        // The guard this route exists behind. `enforce_basic_auth` authenticates on the raw
-        // path and leaves the `Authorization` header attached, so any method this route does
-        // not claim falls through to the publisher fallback carrying the shared admin
-        // credential to the origin. Asserted against the fallback list itself rather than a
-        // copy of it, so a method added there cannot quietly open a hole here.
-        let route = NAMED_ROUTES
-            .iter()
-            .find(|route| route.path == "/_ts/admin/cache/purge")
-            .expect("cache purge must be a named route");
-
-        for method in super::publisher_fallback_methods() {
-            assert!(
-                route.primary_methods.contains(&method),
-                "{method} /_ts/admin/cache/purge must be claimed, or it reaches the publisher \
-                 with the admin credential attached"
-            );
-        }
-        assert!(matches!(route.handler, NamedRouteHandler::AdminCachePurge));
-    }
-
-    #[test]
-    fn cache_purge_has_no_legacy_unauthenticated_alias() {
-        // The production basic-auth regex is `^/_ts/admin`. An `/admin/...` spelling would
-        // not match it, so it must not exist at all.
-        assert!(
-            !NAMED_ROUTES
-                .iter()
-                .any(|route| route.path == "/admin/cache/purge"),
-            "an /admin-prefixed alias would sit outside the basic-auth regex"
         );
     }
 
@@ -3337,17 +3264,6 @@ mod tests {
                 .lock()
                 .expect("should lock entries")
                 .remove(&key.to_cache_key());
-            Ok(())
-        }
-
-        /// A no-op beyond succeeding: this double stores by cache key, so it cannot
-        /// resolve a surrogate key to entries the way the platform does.
-        async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
-            Ok(())
-        }
-
-        async fn purge_all(&self) -> Result<(), TemplateCacheError> {
-            self.entries.lock().expect("should lock entries").clear();
             Ok(())
         }
     }

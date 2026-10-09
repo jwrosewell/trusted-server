@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
@@ -491,20 +491,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
-fn cache_purge_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Template cache purge is not supported on Cloudflare Workers.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 // ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
@@ -881,18 +867,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             handle_data(None, None, &req)
         });
         router = router.route(DATA_PAGE_PATH, Method::GET, data);
-
-        let cache_purge_unsupported =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(cache_purge_not_supported())
-            });
-        for method in publisher_fallback_methods() {
-            router = router.route(
-                "/_ts/admin/cache/purge",
-                method,
-                cache_purge_unsupported.clone(),
-            );
-        }
 
         // The attestation pages answer at the address the settings choose, so
         // they are registered here rather than with the fixed routes. Reads reach

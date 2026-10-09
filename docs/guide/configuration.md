@@ -1170,20 +1170,17 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 
 **Validation**: Application startup fails if regex is invalid.
 
-::: warning Admin coverage and passwords are validated at startup
-
-Startup fails when no handler covers an admin route. Use a prefix-level
-matcher such as `^/_ts/admin`.
+::: warning Passwords are validated at startup
 
 Handler expressions match the raw URI path, while a publisher origin may decode
 percent-encoded aliases before routing. For a whole-site staging gate, use
 `path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
 equivalent origin paths.
 
-Startup also fails when any handler, admin or not, uses a placeholder or
-well-known weak password (`changeme`, `password`, `admin`, or a
-`replace-with-…` template value). Handler selection is first-match-wins, so a
-narrow handler ahead of the admin pattern governs the paths it matches.
+Startup fails when any handler uses a placeholder or well-known weak password
+(`changeme`, `password`, `admin`, or a `replace-with-…` template value). Handler
+selection is first-match-wins, so a narrow handler ahead of a broader pattern
+governs the paths it matches.
 
 :::
 
@@ -2849,11 +2846,6 @@ The two headers together are the reliable verification signal. Timing alone can
 vary with the origin, auction, compression, browser connection reuse, and local
 proxy buffering.
 
-> **Upgrade note.** This release adds `/_ts/admin/cache/purge` to the admin endpoints
-> startup validation covers. A configuration whose `[[handlers]]` enumerate admin paths
-> individually, rather than using the `^/_ts/admin` prefix, fails to start until that path
-> is covered too. The failure is at startup and explicit, not at request time.
-
 Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
@@ -2874,12 +2866,11 @@ Rollback must preserve configuration compatibility:
    port: `http://example.com/article` and `https://example.com/article` have different
    purge keys. A success acknowledges invalidation of the requested key, not that an
    object existed. The command asks Fastly to purge, through the `fastly` CLI with the
-   token in `FASTLY_API_TOKEN`. The admin endpoint
-   `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
-   the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
-   works. With readthrough caching enabled, `--all` also purges tagged origin
-   documents, so the next requests refetch those documents from the origin. Check
-   whether the origin can absorb that load before purging during a traffic peak.
+   token in `FASTLY_API_TOKEN`, and `--all` clears the `ts-template` surrogate key.
+   Waiting out the bounded origin-derived lifetime also works. With readthrough
+   caching enabled, `--all` also purges tagged origin documents, so the next requests
+   refetch those documents from the origin. Check whether the origin can absorb that
+   load before purging during a traffic peak.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary

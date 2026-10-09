@@ -127,8 +127,7 @@ implementations compiled into the CLI.
   of the removed `[integrations]` and `[integration]` tables.
 - Every secret setting holding a non-empty key name rather than a value, with a
   secret store declared to hold it.
-- Basic-auth coverage of the admin namespace, and the placeholder values the
-  template ships with.
+- The placeholder values the template ships with.
 
 ### Checked when the service starts
 

@@ -436,7 +436,6 @@ enum NamedRouteHandler {
     Permissions,
     Config,
     Data,
-    CachePurgeNotSupported,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -451,17 +450,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
-fn named_routes() -> [NamedRoute; 15] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -501,14 +490,6 @@ fn named_routes() -> [NamedRoute; 15] {
             path: DATA_PAGE_PATH,
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::Data,
-        },
-        // Every method, for the same reason as the Fastly adapter: a method this route
-        // does not claim falls through to the publisher with the caller's `Authorization`
-        // header still attached.
-        NamedRoute {
-            path: "/_ts/admin/cache/purge",
-            primary_methods: LEGACY_ADMIN_DENY_METHODS,
-            handler: NamedRouteHandler::CachePurgeNotSupported,
         },
         NamedRoute {
             path: "/auction",
@@ -579,22 +560,6 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
                     NamedRouteHandler::Data => handle_data(None, None, &req),
-                    NamedRouteHandler::CachePurgeNotSupported => {
-                        // The Axum dev server has no template cache to purge. 501 rather
-                        // than a fallthrough 404, so a CMS webhook can tell "not supported
-                        // here" from "endpoint does not exist".
-                        let body = edgezero_core::body::Body::from(
-                            "Template cache purge is not supported on the Axum dev server.\n\
-                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-                        );
-                        let mut resp = Response::new(body);
-                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-                        resp.headers_mut().insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/plain; charset=utf-8"),
-                        );
-                        Ok(resp)
-                    }
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

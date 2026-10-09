@@ -4061,7 +4061,6 @@ impl Settings {
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
-        settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
         // Log the policy's declared default once per settings load, so an
@@ -4293,71 +4292,10 @@ impl Settings {
         path == "/_ts/admin" || path.starts_with("/_ts/admin/")
     }
 
-    /// Known admin endpoint paths that must be covered by a handler.
-    ///
-    /// [`from_toml`](Self::from_toml) rejects configurations
-    /// where any of these paths lack a matching handler, ensuring admin
-    /// endpoints are always protected by authentication.
-    /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/_ts/admin/cache/purge"];
-
-    /// Returns admin endpoint paths that no configured handler covers.
-    ///
-    /// Called during settings finalization to enforce that every admin endpoint
-    /// has a handler. An empty return
-    /// value means all admin endpoints are properly covered.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] if any handler has an invalid path regex.
-    pub(crate) fn uncovered_admin_endpoints(
-        &self,
-    ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
-        let mut uncovered = Vec::new();
-        for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = false;
-            for handler in &self.handlers {
-                if handler.matches_path(path)? {
-                    covered = true;
-                    break;
-                }
-            }
-            if !covered {
-                uncovered.push(path);
-            }
-        }
-        Ok(uncovered)
-    }
-
-    /// Validates that every admin endpoint is covered by at least one handler.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] listing any uncovered
-    /// admin endpoints.
-    pub(crate) fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
-        let uncovered = self.uncovered_admin_endpoints()?;
-        if uncovered.is_empty() {
-            return Ok(());
-        }
-        Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "No handler covers admin endpoint(s): {}. \
-                 Add a [[handlers]] entry with a path regex matching /_ts/admin/ \
-                 to protect admin access.",
-                uncovered.join(", ")
-            ),
-        }))
-    }
-
     /// Rejects placeholder and well-known weak handler passwords.
     ///
-    /// Applies to every handler rather than to handlers inferred to cover an
-    /// admin endpoint: handler selection is first-match-wins over operator
-    /// regexes, so a narrow handler can shadow the admin namespace for paths no
-    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
-    /// a placeholder password is never valid on any of them.
+    /// Applies to every handler. Handlers are Trusted Server's own basic-auth
+    /// gates, so a placeholder password is never valid on any of them.
     pub(crate) fn validate_admin_handler_passwords(
         &self,
     ) -> Result<(), Report<TrustedServerError>> {
@@ -7870,7 +7808,7 @@ source_domain = "partner.example.com"
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
-        // Admin handler at index 1 (required for admin endpoint coverage)
+        // The fixture's second handler, at index 1
         let path_key_1 = format!(
             "{}{}HANDLERS{}1{}PATH",
             ENVIRONMENT_VARIABLE_PREFIX,
@@ -9562,8 +9500,6 @@ source_domain = "partner.example.com"
         );
     }
 
-    // --- admin endpoint coverage ---
-
     #[test]
     fn test_publisher_rejects_cookie_domain_with_metacharacters() {
         for bad_domain in [
@@ -9590,92 +9526,11 @@ source_domain = "partner.example.com"
         );
     }
 
-    /// Helper that returns a settings TOML string WITHOUT any admin handler,
-    /// for tests that need to verify uncovered-admin-endpoint behaviour.
-    fn settings_str_without_admin_handler() -> String {
-        r#"
-            [[handlers]]
-            path = "^/secure"
-            username = "user"
-            password = "pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [ec]
-            module = "hmac"
-
-            [ec.hmac]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            assume_single_jurisdiction = true
-
-            [request_signing]
-            enabled = false
-        "#
-        .to_string()
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_returns_all_when_no_handler_covers_admin() {
-        // Deserialize directly to bypass from_toml's admin validation,
-        // since this test exercises uncovered_admin_endpoints itself.
-        let settings: Settings =
-            toml::from_str(&settings_str_without_admin_handler()).expect("should deserialize TOML");
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert_eq!(
-            uncovered,
-            vec!["/_ts/admin/cache/purge"],
-            "should report every admin endpoint as uncovered"
-        );
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
-        let settings = create_test_settings();
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert!(
-            uncovered.is_empty(),
-            "should report no uncovered admin endpoints when handler covers /_ts/admin"
-        );
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_detects_partial_coverage() {
-        let toml_str = settings_str_without_admin_handler()
-            + r#"
-            [[handlers]]
-            path = "^/_ts/admin/reports$"
-            username = "admin"
-            password = "secret"
-            "#;
-        // Deserialize directly to bypass from_toml's admin validation,
-        // since this test exercises uncovered_admin_endpoints itself.
-        let settings: Settings = toml::from_str(&toml_str).expect("should deserialize TOML");
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert_eq!(
-            uncovered,
-            vec!["/_ts/admin/cache/purge"],
-            "should detect the admin endpoint not covered by the narrow handler"
-        );
-    }
-
     #[test]
     fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
         // Handler selection is first-match-wins, so a narrow handler placed
-        // ahead of the admin matcher governs the paths it matches, and none of
-        // them need be a listed admin endpoint. The placeholder check therefore
-        // cannot be limited to handlers inferred to cover one.
+        // ahead of a broader one governs the paths it matches, and its password
+        // is checked like any other.
         let toml_str = crate_test_settings_str().replace(
             r#"path = "^/_ts/admin"
             username = "admin"
@@ -9725,32 +9580,6 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn from_toml_and_env_rejects_config_without_admin_handler() {
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                let result = Settings::from_toml_and_env(&settings_str_without_admin_handler());
-                assert!(
-                    result.is_err(),
-                    "should reject configuration when admin endpoints are not covered"
-                );
-                let err = format!("{:?}", result.unwrap_err());
-                assert!(
-                    err.contains("No handler covers admin endpoint"),
-                    "error should mention uncovered admin endpoints, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
     fn from_toml_rejects_admin_handler_placeholder_password() {
         let toml_str = crate_test_settings_str()
             .replace(r#"password = "admin-pass""#, r#"password = "changeme""#);
@@ -9775,24 +9604,22 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn from_toml_rejects_config_without_admin_handler() {
-        let result = Settings::from_toml(&settings_str_without_admin_handler());
-        assert!(
-            result.is_err(),
-            "should reject configuration when admin endpoints are not covered"
-        );
-        let err = format!("{:?}", result.expect_err("should be an error"));
-        assert!(
-            err.contains("No handler covers admin endpoint"),
-            "error should mention uncovered admin endpoints, got: {err}"
-        );
+    fn from_toml_accepts_a_configuration_with_no_handlers() {
+        let fixture = crate_test_settings_str();
+        let start = fixture
+            .find("[[handlers]]")
+            .expect("the fixture should open with its handlers");
+        let end = fixture
+            .find("[publisher]")
+            .expect("the fixture should have a publisher after them");
+        let without_handlers = format!("{}{}", &fixture[..start], &fixture[end..]);
+
+        let settings = Settings::from_toml(&without_handlers)
+            .expect("should load a configuration that gates no path");
+
+        assert!(settings.handlers.is_empty(), "should hold no handler");
     }
 
-    /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
-    /// admin route table in `crates/trusted-server-adapter-fastly/src/app.rs`.
-    ///
-    /// If this test fails, a route was added or removed in the Fastly
-    /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
     #[test]
     fn settings_parses_creative_opportunities_section() {
         let toml = r#"
@@ -10115,48 +9942,6 @@ formats = [{{ width = 300, height = 250 }}]
             !json.contains("module"),
             "an unset device selector should be omitted rather than serialized as null, got {json}"
         );
-    }
-
-    #[test]
-    fn admin_endpoints_match_fastly_router() {
-        let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
-
-        for endpoint in Settings::ADMIN_ENDPOINTS {
-            assert!(
-                router_source.contains(endpoint),
-                "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/trusted-server-adapter-fastly/src/app.rs — remove it from ADMIN_ENDPOINTS or \
-                 add the route back to the router"
-            );
-        }
-
-        // Also verify we haven't missed any admin routes in the router.
-        // Best-effort: only detects string-literal routes in the NamedRoute
-        // table. If you define admin routes differently (e.g. via constants),
-        // add them to ADMIN_ENDPOINTS manually.
-        let admin_routes_in_router: Vec<&str> = router_source
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                // Route entries look like: path: "/_ts/admin/...",
-                if trimmed.starts_with("path: ") && trimmed.contains("\"/_ts/admin/") {
-                    let start = trimmed.find("\"/_ts/admin/")?;
-                    let rest = &trimmed[start + 1..];
-                    let end = rest.find('"')?;
-                    Some(&rest[..end])
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for route in &admin_routes_in_router {
-            assert!(
-                Settings::ADMIN_ENDPOINTS.contains(route),
-                "Router has admin route \"{route}\" that is missing from \
-                 Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
-            );
-        }
     }
 }
 

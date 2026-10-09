@@ -989,7 +989,7 @@ core against the signing stores. See [Key Rotation](./key-rotation.md).
 
 The whole `/_ts/admin` prefix is closed to the publisher fallback. A request beneath it that no route claims, whether unknown, malformed or percent-encoded (`/_ts/admin%2Fec`), is answered locally with `404` and `Cache-Control: no-store` and is never proxied, so an admin `Authorization` header and request body never reach the publisher origin. The retired non-`/_ts` `/admin/keys` aliases are closed the same way.
 
-Configure a handler that covers the entire `/_ts/admin` namespace, because startup rejects configurations that do not protect every admin route. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge.
+No route is served beneath the prefix. Where a handler gates it, missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge before the path is looked at.
 
 What is held against a reader's own Edge Cookie is shown to that reader at [`GET /_ts/data`](#get-ts-data).
 
@@ -1291,7 +1291,7 @@ Endpoints under protected paths require HTTP Basic Authentication:
 
 ```toml
 [[handlers]]
-path = "^/_ts/admin"
+path = "^/secure"
 username = "admin"
 password = "admin_password"
 ```
@@ -1302,14 +1302,11 @@ Basic Authentication password under `admin_password`.
 **Usage:**
 
 ```bash
-curl -u 'admin:<resolved-admin-password>' -X POST \
-  -H 'Content-Type: application/json' -d '{"scope":"all"}' \
-  https://edge.example.com/_ts/admin/cache/purge
+curl -u 'admin:<resolved-admin-password>' https://edge.example.com/secure/report
 ```
 
 **Protected Endpoints:**
 
-- `/_ts/admin/cache/purge`
 - Any paths matching configured `handlers` patterns
 
 The EC partner APIs use their own Bearer-token contract. Signed first-party

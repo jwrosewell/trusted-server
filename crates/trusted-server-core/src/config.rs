@@ -360,7 +360,6 @@ pub fn validate_settings_for_deploy_with(
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
-    structural_settings.validate_admin_coverage()?;
 
     // The plan is compiled with the builders the blocks are validated
     // against, so a `[demand]` or `[ad-server]` name one of them supplies

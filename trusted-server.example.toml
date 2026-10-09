@@ -6,9 +6,8 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only two sections are REQUIRED for the server to start and pass validation:
-#   1. [[handlers]] covering /_ts/admin  (admin authentication)
-#   2. [publisher]                       (domain + origin)
+# Only one section is REQUIRED for the server to start and pass validation:
+#   1. [publisher]                       (domain + origin)
 #
 # Edge Cookie identity is optional and stays off until an [ec] module is
 # selected, so no identity secret is needed to start. See the Edge Cookie
@@ -44,14 +43,13 @@
 
 
 # -----------------------------------------------------------------------------
-# REQUIRED - Admin authentication
+# OPTIONAL - Password-protected paths
 # -----------------------------------------------------------------------------
-# HTTP Basic-auth handler(s). At least one handler whose `path` regex covers
-# the /_ts/admin endpoints is mandatory; startup fails without it. Each handler
-# needs a non-placeholder username/password (deploy validation rejects the
-# sample password below).
+# HTTP Basic-auth handler(s). Each handler gates the paths its `path` regex
+# matches, and needs a non-placeholder username/password (deploy validation
+# rejects the sample password below).
 [[handlers]]
-# Regex matched against the request path. This one guards the admin surface.
+# Regex matched against the request path.
 path = "^/_ts/admin"
 username = "admin"
 password = "handler_password"

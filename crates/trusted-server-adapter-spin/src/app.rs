@@ -367,17 +367,7 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // registry and rate limiter) that the portability adapters do not yet wire.
 // On Spin these paths fall through to the publisher/integration fallback,
 // identical to the other non-Fastly adapters.
-const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 15] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -386,7 +376,6 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 15] {
         (CONFIG_PAGE_PATH, &[Method::GET]),
         (CONFIG_JSON_PATH, &[Method::GET]),
         (DATA_PAGE_PATH, &[Method::GET]),
-        ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -588,20 +577,6 @@ async fn build_ec_context(
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
     EcContext::read_from_request_resolving_geo(settings, req, services).await
-}
-
-fn cache_purge_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Template cache purge is not supported on Spin.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 // ---------------------------------------------------------------------------
@@ -813,9 +788,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
-
-        let cache_purge_unsupported_handler =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
 
         // /auction
         let s = Arc::clone(&state);
@@ -1096,14 +1068,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/first-party/sign", fp_sign_post_handler)
             .get("/first-party/proxy-rebuild", fp_rebuild_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
-
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            builder = builder.route(
-                "/_ts/admin/cache/purge",
-                method.clone(),
-                cache_purge_unsupported_handler,
-            );
-        }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is
         // not a named route's primary method falls through to the publisher origin

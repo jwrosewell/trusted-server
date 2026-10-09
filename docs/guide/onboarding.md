@@ -19,8 +19,8 @@ publisher-page request, it can:
 4. expose configured integrations and third-party assets through first-party
    routes.
 
-Not every request enters the publisher pipeline. Health, administrative,
-integration, TSJS, and configured asset routes can terminate earlier.
+Not every request enters the publisher pipeline. Health, integration, TSJS,
+and configured asset routes can terminate earlier.
 
 ## Trace a Fastly publisher request
 

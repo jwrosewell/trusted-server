@@ -17,9 +17,8 @@ use trusted_server_core::settings::Settings;
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-/// The handler regex is the production-shaped `^/_ts/admin`, matching
-/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
-/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
+/// The handler regex is the production-shaped `^/_ts/admin`, matching the
+/// default config, so the admin prefix is auth-gated exactly as in production.
 fn test_router() -> RouterService {
     let settings = Settings::from_toml(
         r#"
