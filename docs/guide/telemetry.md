@@ -16,8 +16,8 @@ request to the configured auction datasource.
 Emission is best effort. Failure to construct or start telemetry is logged and
 must not change the customer response. The sink drops the in-flight handle
 after dispatch; it does not wait for Tinybird's response. Each batch is limited
-to 512 rows and `tinybird.max_body_bytes` bytes. The Fastly backend uses
-two-second first-byte and between-byte timeouts.
+to 512 rows and `analytics.tinybird.max_body_bytes` bytes. The Fastly backend
+uses two-second first-byte and between-byte timeouts.
 
 ## Privacy boundary
 
@@ -35,17 +35,18 @@ misclassify them.
 
 ## Configuration
 
-Set `tinybird.enabled = true`, provide the regional API host, select the
-auction datasource, and set `auction_token_secret` to the key holding that
+Select the module with `[analytics] module = "tinybird"`. In
+`[analytics.tinybird]` provide the regional API host, select the auction
+datasource, and set `auction_token_secret` to the key holding that
 datasource's APPEND token in the default app-config secret store. The default
 datasource is `auction_events_raw`; the default body limit is 1 MiB and the
 minimum accepted limit is 1 KiB.
 
-`tinybird.access_enabled = true` is rejected because no access-log emitter is
-wired. `access_dataset` and `access_sample_rate` are reserved.
+`analytics.tinybird.access_enabled = true` is rejected because no access-log
+emitter is wired. `access_dataset` and `access_sample_rate` are reserved.
 `access_token_secret` is deprecated input and is normalized away; it cannot
 enable access telemetry.
 
 The exact settings and secret-handling dispositions are in
-[Configuration](/guide/configuration#tinybird). The tracked Tinybird project is
-described in [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
+[Configuration](/guide/configuration#analytics-configuration). The tracked
+Tinybird project is described in [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
