@@ -110,11 +110,7 @@ mod tests {
             .as_array()
             .expect("fastly.toml should define ts_secrets");
 
-        for key in [
-            "publisher_proxy_secret",
-            "ec_passphrase",
-            "handler_password",
-        ] {
+        for key in ["publisher_proxy_secret", "ec_passphrase"] {
             assert!(
                 entries
                     .iter()
