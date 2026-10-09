@@ -1785,6 +1785,14 @@ script bundle, after the fetch middleware's.
 A middleware takes its settings from its module's own `[<section>.<name>]`
 table. An entry carries none and switches nothing on.
 
+The modules this repository ships supply the middleware below. A deployment
+that runs several of them names them all in one entry's list, because a page
+takes one entry, and the order written is the order they run in.
+
+| Middleware          | Phase       | What it changes                                                                               |
+| ------------------- | ----------- | --------------------------------------------------------------------------------------------- |
+| `testing.testlight` | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set |
+
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
 other than `text/html`, a path that does not start with `/` or that holds a
