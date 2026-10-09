@@ -7,3 +7,7 @@ gam_attribution_enabled = false
 [[fetch]]
 media_type = "text/html"
 middleware = ["ad-tag.google"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["ad-tag.google.diagnostics"]
