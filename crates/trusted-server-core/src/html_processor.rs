@@ -1630,6 +1630,37 @@ mod tests {
     }
 
     #[test]
+    fn the_origin_s_address_is_moved_in_srcset_and_imagesrcset() {
+        let mut processor = create_html_processor(create_test_config());
+
+        let output = processor
+            .process_chunk(
+                br#"<html><head><link rel="preload" as="image" imagesrcset="https://origin.example.com/a.png 1x, http://origin.example.com/b.png 2x, //origin.example.com/c.png 3x"></head><body><img srcset="https://origin.example.com/a.png 1x, http://origin.example.com/b.png 2x, //origin.example.com/c.png 3x, origin.example.com/d.png 4x"><img srcset="https://cdn.example.net/e.png 1x"></body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+        let processed = String::from_utf8(output).expect("should stay UTF-8");
+
+        assert!(
+            processed.contains(
+                r#"imagesrcset="https://test.example.com/a.png 1x, https://test.example.com/b.png 2x, //test.example.com/c.png 3x""#
+            ),
+            "should move the origin's address in every candidate of an imagesrcset: {processed}"
+        );
+        assert!(
+            processed.contains(
+                r#"srcset="https://test.example.com/a.png 1x, https://test.example.com/b.png 2x, //test.example.com/c.png 3x, test.example.com/d.png 4x""#
+            ),
+            "should move the origin's address in every candidate of a srcset, a bare host \
+             included: {processed}"
+        );
+        assert!(
+            processed.contains(r#"<img srcset="https://cdn.example.net/e.png 1x">"#),
+            "should leave a srcset that names another host as it is: {processed}"
+        );
+    }
+
+    #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::with_plan(
