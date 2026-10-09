@@ -18,6 +18,7 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_diagnostic_headers};
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::Settings;
 
@@ -76,6 +77,7 @@ impl Middleware for FinalizeResponseMiddleware {
             || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
             |info| info.client_ip,
         );
+        let path = ctx.request().uri().path().to_owned();
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -101,6 +103,8 @@ impl Middleware for FinalizeResponseMiddleware {
             None
         };
 
+        // Before finalizing, so a header finalizing writes is kept.
+        strip_diagnostic_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
             .headers_mut()
@@ -796,6 +800,88 @@ mod tests {
         assert_eq!(
             cookie_count, 2,
             "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
+        );
+    }
+
+    fn ctx_for(path: &str) -> RequestContext {
+        let req = request_builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("should build test request");
+        RequestContext::new(req, PathParams::new(HashMap::new()))
+    }
+
+    /// A response as an origin behind a cache sends it, naming the node that
+    /// answered and how the cache treated the request.
+    fn response_naming_its_node() -> Response {
+        response_builder()
+            .header("x-served-by", "cache-node-1")
+            .header("x-cache", "HIT")
+            .header("x-cache-hits", "3")
+            .body(Body::empty())
+            .expect("should build test response")
+    }
+
+    /// What the finalize middleware makes of that response for a request to
+    /// `path`.
+    fn finalized(path: &str, settings: Settings) -> Response {
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(FixedGeo(None)),
+            test_finalize_services(),
+        );
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Ok::<Response, EdgeError>(response_naming_its_node())
+        });
+
+        block_on(middleware.handle(ctx_for(path), Next::new(&[], &*handler)))
+            .expect("should run middleware")
+    }
+
+    #[test]
+    fn finalize_middleware_strips_diagnostic_headers_from_a_publisher_page() {
+        let response = finalized(
+            "/articles/an-article",
+            settings_with_response_headers(vec![]),
+        );
+
+        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should strip {name} from a publisher's page"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_middleware_keeps_diagnostic_headers_on_the_servers_own_path() {
+        let response = finalized("/_ts/permissions", settings_with_response_headers(vec![]));
+
+        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
+            assert!(
+                response.headers().contains_key(name),
+                "should keep {name} where a deployment is asked about itself"
+            );
+        }
+    }
+
+    /// The strip comes before finalizing, so a header an operator configures
+    /// reaches every page even when its name is a diagnostic one.
+    #[test]
+    fn finalize_middleware_keeps_a_diagnostic_header_the_operator_configures() {
+        let response = finalized(
+            "/articles/an-article",
+            settings_with_response_headers(vec![("X-Cache", "configured")]),
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("configured"),
+            "should carry the operator's header and not the origin's"
         );
     }
 }
