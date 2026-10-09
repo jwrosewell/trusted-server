@@ -99,7 +99,6 @@ fn command_words(args: &[String]) -> String {
 }
 
 /// The arguments of one `fastly` invocation, owned.
-#[cfg(test)]
 pub(crate) fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }

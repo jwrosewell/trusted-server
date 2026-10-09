@@ -182,7 +182,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Cache(command) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+            crate::commands::cache::run(&command, &mut out).map(|()| RunOutcome::Success)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();
@@ -203,6 +203,38 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn parses_cache_purge_with_its_service_and_one_scope() {
+        let args = parse(&[
+            "ts",
+            "cache",
+            "purge",
+            "--service-id",
+            "ExampleServiceId0123456",
+            "--page",
+            "https://example.com/article",
+        ]);
+        let Command::Cache(crate::commands::cache::CacheCommand::Purge(purge)) = args.command
+        else {
+            panic!("expected cache purge command");
+        };
+        assert_eq!(purge.service_id, "ExampleServiceId0123456");
+        assert_eq!(purge.page.as_deref(), Some("https://example.com/article"));
+        assert!(!purge.all, "should not also purge everything");
+
+        Args::try_parse_from([
+            "ts",
+            "cache",
+            "purge",
+            "--service-id",
+            "ExampleServiceId0123456",
+            "--all",
+            "--page",
+            "https://example.com/article",
+        ])
+        .expect_err("should refuse both scopes at once");
     }
 
     #[test]

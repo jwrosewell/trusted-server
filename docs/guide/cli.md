@@ -23,6 +23,8 @@ commands are shown explicitly.
 | `ts auth logout`                 | Linux + macOS | Sign out (`wrangler logout` / `fastly profile delete` / `spin cloud logout`)                     | `ts auth logout --adapter <ADAPTER>`                                                                           |
 | `ts auth status`                 | Linux + macOS | Show the current session (`wrangler whoami` / `fastly profile list` / `spin cloud info`)         | `ts auth status --adapter <ADAPTER>`                                                                           |
 | `ts build`                       | Linux + macOS | Build the project for a target adapter                                                           | `ts build --adapter <ADAPTER> [ADAPTER_ARGS]...`                                                               |
+| `ts cache`                       | Linux + macOS | Shared template cache commands                                                                   | `ts cache <COMMAND>`                                                                                           |
+| `ts cache purge`                 | Linux + macOS | Purge cached templates and tagged origin responses through the hosting platform's purge API      | `ts cache purge [OPTIONS] --service-id <ID>`                                                                   |
 | `ts config`                      | Linux + macOS | Trusted Server app-config commands                                                               | `ts config <COMMAND>`                                                                                          |
 | `ts config ad-templates`         | Linux + macOS | Diagnose server-side ad-template configuration and path matching                                 | `ts config ad-templates <COMMAND>`                                                                             |
 | `ts config ad-templates check`   | Linux + macOS | Assert that a page path or URL matches the expected slot set                                     | `ts config ad-templates check [OPTIONS] <--expected-slot <ID>\|--expect-no-slots> <PATH_OR_URL>`               |
@@ -317,6 +319,32 @@ for no other, so check `--config-store-id` when it appears on a store in use.
 A command that cannot read the config store writes nothing. `ts keys deactivate
 --delete` can be run again after a failure, because a key that is already gone
 from a store counts as deleted there. See [Key Rotation](./key-rotation.md).
+
+## Cache purge
+
+`ts cache purge` asks Fastly to purge what the service cached. It runs
+`fastly service purge`, which the Fastly CLI has had since version 14.0.0, with
+the token in `FASTLY_API_TOKEN`. A token with the `purge_select` scope is
+enough. That scope allows a purge by surrogate key and does not allow a purge
+of everything the service holds.
+
+```bash
+export FASTLY_API_TOKEN=<token>
+
+# Every cached template and tagged origin response.
+ts cache purge --service-id <service-id> --all
+
+# One page, as a reader addresses it.
+ts cache purge --service-id <service-id> --page https://example.com/article
+```
+
+Both purge by surrogate key. `--all` purges the `ts-template` key every cached
+object carries, and `--page` purges the key the service derives from that page's
+URL, which the command derives the same way. Neither runs
+`fastly service purge --all`, so objects the service cached without one of these
+keys are left alone. A success means the key was invalidated, not that an object
+existed. See
+[Configuration](./configuration.md) for when to purge.
 
 ## Audit a public page
 

@@ -2876,12 +2876,12 @@ Rollback must preserve configuration compatibility:
    the lists loses variant separation and session bypass.
    Remove `origin_readthrough_enabled` even when rolling it back: `false` still
    serializes the field and older binaries reject it.
-3. Purge the template cache with `ts cache purge --service <url> --all`, or
+3. Purge the template cache with `ts cache purge --service-id <id> --all`, or
    `--page <url>` for a single reader-facing URL. Use its exact scheme, host, and
    port: `http://example.com/article` and `https://example.com/article` have different
    purge keys. A success acknowledges invalidation of the requested key, not that an
-   object existed. `--service` requires HTTPS, except for loopback development
-   services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
+   object existed. The command asks Fastly to purge, through the `fastly` CLI with the
+   token in `FASTLY_API_TOKEN`. The admin endpoint
    `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
    the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
    works. With readthrough caching enabled, `--all` also purges tagged origin
@@ -3035,7 +3035,7 @@ saying nothing about this setting.
    next request with no deploy and restores the previous policy: ad-serving
    requests bypass, while non-ad traffic keeps the platform default. It does not
    disable origin caching globally.
-2. Purge tagged objects with `ts cache purge --service <https-service-url> --all`,
+2. Purge tagged objects with `ts cache purge --service-id <service-id> --all`,
    or `--page <reader-url>` for one exact reader-facing URL. Both the template cache
    and opted-in origin readthrough objects carry the page key and `ts-template`
    purge-all key. The readthrough tags use the original reader URL, before origin
