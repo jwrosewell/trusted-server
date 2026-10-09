@@ -43,6 +43,9 @@ commands are shown explicitly.
 | `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                          | `ts dev proxy ca regenerate`                                                                                   |
 | `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
 | `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
+| `ts keys`                        | Linux + macOS | Rotate and retire request signing keys, with a Fastly API token                                  | `ts keys <COMMAND>`                                                                                            |
+| `ts keys deactivate`             | Linux + macOS | Take a key out of the active set, and delete it with `--delete`                                  | `ts keys deactivate [OPTIONS] --config-store-id <ID> --secret-store-id <ID> --kid <KID>`                       |
+| `ts keys rotate`                 | Linux + macOS | Create a signing key and make it the one the service signs with                                  | `ts keys rotate [OPTIONS] --config-store-id <ID> --secret-store-id <ID>`                                       |
 | `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
 | `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                        | `ts prebid client [OPTIONS]`                                                                                   |
 | `ts prebid server`               | Linux + macOS | Configure and operate a self-hosted Prebid Server deployment                                     | `ts prebid server [OPTIONS] <COMMAND>`                                                                         |
@@ -276,6 +279,44 @@ service id and probes that instead of the production endpoint.
 metadata to tell a previously live version from a staged one, so pass the
 version to re-activate via `--rollback-to`. With `--staging`, it deactivates
 the staged `--version` instead and needs no `--rollback-to`.
+
+## Request signing keys
+
+`ts keys` rotates and retires the keys request signing uses. It writes the two
+stores the service links as `jwks_store` and `signing_keys` through the
+`fastly` CLI, with the token in `FASTLY_API_TOKEN`, which needs the `global`
+scope to write a store. The token reaches `fastly` in its environment and a
+private key reaches it on standard input, so neither appears in a process list.
+
+```bash
+export FASTLY_API_TOKEN=<token>
+
+# Create a key and make it the one the service signs with. The old key stays
+# active, so a signature made with it still verifies.
+ts keys rotate --config-store-id <jwks-store-id> --secret-store-id <signing-keys-store-id>
+
+# Once nothing signed with the old key is in flight, take it out of the active
+# set, and with --delete remove it from both stores.
+ts keys deactivate --config-store-id <jwks-store-id> \
+  --secret-store-id <signing-keys-store-id> --kid <old-kid> --delete
+```
+
+`ts keys rotate` names the key `ts-<date>` unless `--kid` gives one, and adds
+a random suffix when a key of that date exists. It refuses a `--kid` that does
+not start with a lower case letter, that holds anything but letters, digits,
+`-`, `_`, `.` and `:`, or that is longer than 128 characters. `ts keys
+deactivate` refuses the current key, so rotate first, and takes any id made of
+those characters, so that a key created under an earlier rule can still be
+retired. Neither takes `current-kid` or `active-kids` for a key, which are the
+two entries the config store keeps its key list in.
+
+Both print what they did as JSON. A `previous_kid` of `null` from `ts keys
+rotate` means the store held no current key. That is right for a new store and
+for no other, so check `--config-store-id` when it appears on a store in use.
+
+A command that cannot read the config store writes nothing. `ts keys deactivate
+--delete` can be run again after a failure, because a key that is already gone
+from a store counts as deleted there. See [Key Rotation](./key-rotation.md).
 
 ## Audit a public page
 

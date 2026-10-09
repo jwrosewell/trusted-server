@@ -279,6 +279,17 @@ pub fn kid_is_creatable(kid: &str) -> bool {
     validate_kid(kid).is_ok()
 }
 
+/// Returns whether `kid` has the shape of a stored key id, which
+/// [`validate_kid_format`] checks.
+///
+/// Looser than [`kid_is_creatable`], so that a key created under an earlier
+/// rule can still be deactivated and deleted. Exposed for the tool that
+/// retires keys, which asks before it reads or writes anything.
+#[must_use]
+pub fn kid_is_well_formed(kid: &str) -> bool {
+    validate_kid_format(kid).is_ok()
+}
+
 /// Rotates the current active kid by generating and saving a new one.
 ///
 /// # Response contract
@@ -1184,6 +1195,20 @@ mod tests {
             serde_json::from_str(json).expect("should deserialize deactivate key request");
         assert_eq!(req.kid, "old-key");
         assert!(req.delete);
+    }
+
+    #[test]
+    fn a_well_formed_kid_need_not_be_one_a_new_key_may_take() {
+        for kid in ["2026-key", "KidA", "-kid", "ts-2026-01-01"] {
+            assert!(kid_is_well_formed(kid), "should accept {kid}");
+        }
+        for kid in ["2026-key", "KidA", "-kid"] {
+            assert!(!kid_is_creatable(kid), "should not create {kid}");
+        }
+        let too_long = "a".repeat(129);
+        for kid in ["", "kid-a,kid-b", "kid a", "kid/a", &too_long] {
+            assert!(!kid_is_well_formed(kid), "should refuse {kid:?}");
+        }
     }
 
     #[test]
