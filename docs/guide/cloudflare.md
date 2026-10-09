@@ -32,8 +32,8 @@ value of `app_config` in a JSON object; that outer JSON is assigned to the
 `TRUSTED_SERVER_CONFIG` Worker variable. This double encoding is required by
 the current startup reader.
 
-The generated local Wrangler files define `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
+The generated local Wrangler files define `publisher_proxy_secret` and
+`ec_passphrase` separately. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
 secret. Each case requires a 500 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher
@@ -49,10 +49,9 @@ the checked-in manifests.
 Local `[vars]` are only for the isolated smoke. For a deployed Worker, obtain
 the validated envelope from the target KV namespace, construct the same nested
 `TRUSTED_SERVER_CONFIG` JSON, and configure it in the deployment environment.
-Store the three credential values with `wrangler secret put
-handler_password`, `wrangler secret put publisher_proxy_secret`, and `wrangler
-secret put ec_passphrase`; do not commit them to a Wrangler manifest. Deploy
-only after all four bindings are present.
+Store the two credential values with `wrangler secret put
+publisher_proxy_secret` and `wrangler secret put ec_passphrase`; do not commit
+them to a Wrangler manifest. Deploy only after all three bindings are present.
 
 A successful `ts config push` alone does not configure this runtime: the
 Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time

@@ -1,10 +1,11 @@
 //! Paths this server answers itself and never forwards to the publisher's origin.
 //!
-//! A request to the server's administration prefix, `/_ts/admin`, or to the
-//! `/admin/keys` addresses beside it, can carry an operator's `Authorization`
-//! header and an administration payload. Forwarding one would hand both to the
-//! origin, so every adapter asks [`closed_path_response`] before its publisher
-//! fallback, and a request that no route claims is answered `404` here.
+//! A request to `/_ts/admin`, or to the `/admin/keys` addresses beside it, is
+//! an administration request. It can carry an operator's `Authorization`
+//! header and a payload meant for this server alone. No route serves either
+//! prefix, and forwarding such a request would hand both to the origin, so
+//! every adapter asks [`closed_path_response`] before its publisher fallback
+//! and the request is answered `404` here.
 
 use std::borrow::Cow;
 
@@ -13,18 +14,16 @@ use http::{Request, Response, StatusCode, header};
 
 /// The server's administration prefix.
 ///
-/// Mirrors the documented `^/_ts/admin` basic-auth handler regex, so every
-/// path that handler authenticates is also closed at the fallback boundary.
-/// It is matched as a bare prefix, with no `/` after it, which also covers a
-/// percent-encoded separator such as `/_ts/admin%2Fec`. The auth handler
-/// matches that spelling and a check for a literal slash would not.
+/// It is matched as a bare prefix, with no `/` after it, so that a
+/// percent-encoded separator such as `/_ts/admin%2Fec` is closed with the
+/// paths it decodes to. A check for a literal slash would miss that spelling.
 const ADMIN_NAMESPACE_PREFIX: &str = "/_ts/admin";
 
 /// The key administration alias outside `/_ts`.
 ///
-/// No auth handler matches it, so only the alias itself and its separator
-/// descendants are closed. A bare prefix here would also close unrelated
-/// publisher paths such as `/admin/keystore`.
+/// Only the alias itself and its separator descendants are closed. A bare
+/// prefix here would also close unrelated publisher paths such as
+/// `/admin/keystore`.
 const ADMIN_KEYS_PREFIX: &str = "/admin/keys";
 
 /// Maximum percent-decoding rounds applied when testing a path.
@@ -174,10 +173,9 @@ mod tests {
 
     #[test]
     fn an_encoded_separator_does_not_open_a_closed_path() {
-        // `/_ts/admin%2Fec` matches the documented `^/_ts/admin` basic-auth
-        // handler, so it is authenticated, and a check for a literal slash
-        // would miss it. Reaching the publisher fallback would forward the
-        // caller's `Authorization` header and body to the origin.
+        // A check for a literal slash would miss `/_ts/admin%2Fec`, and
+        // reaching the publisher fallback would forward the caller's
+        // `Authorization` header and body to the origin.
         for path in [
             "/_ts/admin%2Fec",
             "/_ts/admin%2fec",

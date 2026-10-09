@@ -6,14 +6,14 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only one section is REQUIRED for the server to start and pass validation:
-#   1. [publisher]                       (domain + origin)
+# Only one section is REQUIRED for the server to start and pass validation,
+# which is [publisher] (domain + origin).
 #
 # Edge Cookie identity is optional and stays off until an [ec] module is
 # selected, so no identity secret is needed to start. See the Edge Cookie
 # section below.
 #
-# Everything below those is OPTIONAL. Most optional blocks are commented out, so
+# Everything below it is OPTIONAL. Most optional blocks are commented out, so
 # uncomment and edit one to switch it on. All example hosts use `example.com`,
 # so replace them with your real endpoints in your private config, not in this
 # template.
@@ -40,27 +40,6 @@
 # deployed runtime reads the pushed config blob, so these env vars do not change
 # live behavior on their own.
 # =============================================================================
-
-
-# -----------------------------------------------------------------------------
-# OPTIONAL - Password-protected paths
-# -----------------------------------------------------------------------------
-# HTTP Basic-auth handler(s). Each handler gates the paths its `path` regex
-# matches, and needs a non-placeholder username/password (deploy validation
-# rejects the sample password below).
-[[handlers]]
-# Regex matched against the request path.
-path = "^/_ts/admin"
-username = "admin"
-password = "handler_password"
-
-# You can add more handlers to basic-auth-protect other path prefixes. The
-# sample password below is a known placeholder that deploy validation rejects,
-# so it forces a real secret before push:
-# [[handlers]]
-# path = "^/secure"
-# username = "user"
-# password = "replace-with-admin-password"
 
 
 # -----------------------------------------------------------------------------

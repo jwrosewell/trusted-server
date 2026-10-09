@@ -53,7 +53,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{
-    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+    FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -1030,12 +1030,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip
             // spoofable forwarded headers, derive the trusted Host/scheme/client-IP
             // from Spin's synthetic runtime headers) so no handler can opt out of
-            // the de-spoofing invariant. Runs after auth so the basic-auth gate
-            // continues to see the original request, matching prior behaviour.
+            // the de-spoofing invariant.
             .middleware(NormalizeMiddleware::new())
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
@@ -1127,11 +1125,6 @@ mod tests {
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1257,11 +1250,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"

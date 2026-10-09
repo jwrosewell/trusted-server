@@ -2,7 +2,7 @@
 //!
 //! Sends identical requests to all host-runnable adapters and asserts that:
 //! - Response status codes match
-//! - Critical headers (X-Geo-Info-Available, WWW-Authenticate on 401) match
+//! - Critical headers (X-Geo-Info-Available) match
 //!
 //! Fastly parity is verified via cargo test-fastly + Viceroy in CI.
 
@@ -28,16 +28,9 @@ use trusted_server_core::test_support::nextjs_auction;
 /// The settings baked into the binaries contain placeholder secrets that
 /// `get_settings()` rejects by design, so all routers are built through
 /// their `routes_with_settings` testing seams from this known-good config.
-/// The handler regex is the production-shaped `^/_ts/admin`, matching the
-/// default config, so the admin prefix is auth-gated exactly as in production.
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
@@ -665,95 +658,6 @@ async fn verify_signature_route_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_prefix_unauthenticated_parity() {
-    // Every adapter must return 401 for an unauthenticated request beneath
-    // the `/_ts/admin` prefix that production config auth-gates.
-    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/anything", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/anything", "{}").await;
-    let (spin_status, spin_headers) = spin_post_headers("/_ts/admin/anything", "{}").await;
-
-    assert_eq!(
-        axum_status, 401,
-        "Axum must return 401 for unauthenticated admin route"
-    );
-    assert_eq!(
-        cf_status, 401,
-        "Cloudflare must return 401 for unauthenticated admin route"
-    );
-    assert_eq!(
-        spin_status, 401,
-        "Spin must return 401 for unauthenticated admin route"
-    );
-    assert_eq!(
-        axum_status, cf_status,
-        "Axum and Cloudflare must return the same status for unauthenticated admin route"
-    );
-    assert_eq!(
-        cf_status, spin_status,
-        "Cloudflare and Spin must return the same status for unauthenticated admin route"
-    );
-
-    let axum_www_auth = axum_headers
-        .get("www-authenticate")
-        .expect("Axum 401 must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    let cf_www_auth = cf_headers
-        .get("www-authenticate")
-        .expect("Cloudflare 401 must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    assert_eq!(
-        axum_www_auth, cf_www_auth,
-        "WWW-Authenticate header value must match across adapters beneath /_ts/admin"
-    );
-    assert!(
-        axum_www_auth.starts_with("Basic"),
-        "WWW-Authenticate must use Basic scheme: {axum_www_auth:?}"
-    );
-    let spin_www_auth = spin_headers
-        .get("www-authenticate")
-        .expect("Spin 401 must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    assert_eq!(
-        cf_www_auth, spin_www_auth,
-        "WWW-Authenticate value must match: cf={cf_www_auth:?} spin={spin_www_auth:?}"
-    );
-    assert!(
-        spin_www_auth.starts_with("Basic"),
-        "Spin WWW-Authenticate must use Basic scheme: {spin_www_auth:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spin_key_aliases_are_answered_here_and_never_proxied() {
-    // The production handler regex `^/_ts/admin` only matches the canonical
-    // `/_ts/admin/keys/*` paths. The aliases outside `/_ts` must therefore be
-    // answered here with 404 instead of reaching the publisher fallback.
-    for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let (canonical_status, _) = spin_post_headers(&format!("/_ts{alias}"), "{}").await;
-        assert_eq!(
-            canonical_status, 401,
-            "canonical /_ts{alias} must challenge unauthenticated callers"
-        );
-
-        for method in ["POST", "GET"] {
-            let (alias_status, alias_headers) =
-                spin_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
-            assert_eq!(
-                alias_status, 404,
-                "Spin legacy {method} {alias} must be denied locally with 404"
-            );
-            assert!(
-                !alias_headers.contains_key("www-authenticate"),
-                "Spin legacy {method} {alias} must not issue an admin auth challenge"
-            );
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn geo_header_parity_on_all_responses() {
     let routes_to_check: &[(&str, &str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json", ""),
@@ -812,14 +716,11 @@ async fn geo_header_parity_on_all_responses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auction_not_challenged_by_auth_parity() {
+async fn auction_is_routed_parity() {
     let (axum_status, _) = axum_post_headers("/auction", r#"{"adUnits":[]}"#).await;
     let (cf_status, _) = cf_post_headers("/auction", r#"{"adUnits":[]}"#).await;
     let (spin_status, _) = spin_post_headers("/auction", r#"{"adUnits":[]}"#).await;
 
-    assert_ne!(axum_status, 401, "Axum /auction must not 401");
-    assert_ne!(cf_status, 401, "Cloudflare /auction must not 401");
-    assert_ne!(spin_status, 401, "Spin /auction must not 401");
     assert_ne!(axum_status, 404, "Axum /auction must be routed (not 404)");
     assert_ne!(
         cf_status, 404,
@@ -890,7 +791,6 @@ async fn spin_auction_ignores_spoofed_forwarded_headers() {
     )
     .await;
 
-    assert_ne!(spoofed_status, 401, "Spin /auction must not 401");
     assert_ne!(
         spoofed_status, 404,
         "Spin /auction must be routed (not 404)"
@@ -955,65 +855,40 @@ async fn unknown_route_returns_same_status_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn key_aliases_are_answered_here_and_never_proxied() {
-    // The production handler regex `^/_ts/admin` only matches the canonical
-    // `/_ts/admin/keys/*` paths, so the `/admin/keys/*` aliases are not
-    // auth-gated. They must be answered here with 404 and never reach the
-    // publisher fallback, which forwards the request (including any
-    // `Authorization` header and key-management body) to the origin and leaks
-    // admin credentials.
-    //
-    // Canonical paths challenge unauthenticated callers (401). The aliases are
-    // answered here with 404 and carry no auth challenge. A key handler at
-    // these ungated paths would not return 404, and the publisher fallback
+async fn key_administration_paths_are_answered_here_and_never_proxied() {
+    // A request to a key administration path can carry an operator's
+    // credentials and a key payload. Every adapter must answer it with 404 and
+    // never reach the publisher fallback, which forwards the request,
+    // `Authorization` header and body included, to the origin. A key handler
+    // at one of these paths would not return 404, and the publisher fallback
     // would not either, so 404 proves the request was answered here.
-    for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
-        assert_eq!(
-            canonical_status, 401,
-            "Cloudflare canonical /_ts{alias} must challenge unauthenticated callers"
-        );
-        let (spin_canonical_status, _) = spin_post_headers(&format!("/_ts{alias}"), "{}").await;
-        assert_eq!(
-            spin_canonical_status, 401,
-            "Spin canonical /_ts{alias} must challenge unauthenticated callers"
-        );
-
+    for path in [
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+    ] {
         for method in ["POST", "GET"] {
             let (axum_status, axum_headers) =
-                axum_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
+                axum_authorized_json(method, path, r#"{"key_id":"leak-me"}"#).await;
             let (cf_status, cf_headers) =
-                cf_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
+                cf_authorized_json(method, path, r#"{"key_id":"leak-me"}"#).await;
             let (spin_status, spin_headers) =
-                spin_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
-            assert_eq!(
-                axum_status, 404,
-                "Axum legacy {method} {alias} must be denied locally with 404"
-            );
-            assert_eq!(
-                cf_status, 404,
-                "Cloudflare legacy {method} {alias} must be denied locally with 404"
-            );
-            assert_eq!(
-                axum_status, cf_status,
-                "legacy {method} {alias} status must match across adapters"
-            );
-            assert_eq!(
-                cf_status, spin_status,
-                "legacy {method} {alias} status must match across adapters"
-            );
-            assert!(
-                !axum_headers.contains_key("www-authenticate"),
-                "Axum legacy {method} {alias} must not issue an admin auth challenge"
-            );
-            assert!(
-                !cf_headers.contains_key("www-authenticate"),
-                "Cloudflare legacy {method} {alias} must not issue an admin auth challenge"
-            );
-            assert!(
-                !spin_headers.contains_key("www-authenticate"),
-                "Spin legacy {method} {alias} must not issue an admin auth challenge"
-            );
+                spin_authorized_json(method, path, r#"{"key_id":"leak-me"}"#).await;
+            for (adapter, status, headers) in [
+                ("Axum", axum_status, &axum_headers),
+                ("Cloudflare", cf_status, &cf_headers),
+                ("Spin", spin_status, &spin_headers),
+            ] {
+                assert_eq!(
+                    status, 404,
+                    "{adapter} {method} {path} must be answered here with 404"
+                );
+                assert!(
+                    !headers.contains_key("www-authenticate"),
+                    "{adapter} {method} {path} must not ask for credentials"
+                );
+            }
         }
     }
 }

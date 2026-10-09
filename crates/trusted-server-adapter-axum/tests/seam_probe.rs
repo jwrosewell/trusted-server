@@ -58,11 +58,6 @@ assume_single_jurisdiction = true
     };
     Settings::from_toml(&format!(
         r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
@@ -638,11 +633,6 @@ fn deploy_validation_accepts_a_modules_ad_server_only_with_its_builder() {
 fn settings_selecting_module(extra: &str) -> Settings {
     Settings::from_toml(&format!(
         r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"

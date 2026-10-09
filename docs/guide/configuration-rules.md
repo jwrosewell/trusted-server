@@ -158,15 +158,15 @@ loaded, and these join it.
 The other tables configure Trusted Server itself rather than choose what runs.
 They keep their own keys and have no selector.
 
-| Table                                                      | Configures                                                            |
-| ---------------------------------------------------------- | --------------------------------------------------------------------- |
-| `[publisher]`                                              | the site, its origin and the proxy secret                             |
-| `[auction]`                                                | whether auctions run, the whole-auction timeout and creative handling |
-| `[auction.bidders.<code>]`                                 | which demand provider a browser bidder code is sent to                |
-| `[creative_opportunities]`                                 | server-rendered ad slots                                              |
-| `[proxy]`, `[cache]`, `[rewrite]`                          | first-party proxying, caching and URL rewriting                       |
-| `[request_signing]`, `[trusted_client_ip]`, `[[handlers]]` | signing, client addresses and admin access                            |
-| `[debug]`, `[tinybird]`                                    | diagnostics and telemetry                                             |
+| Table                                      | Configures                                                            |
+| ------------------------------------------ | --------------------------------------------------------------------- |
+| `[publisher]`                              | the site, its origin and the proxy secret                             |
+| `[auction]`                                | whether auctions run, the whole-auction timeout and creative handling |
+| `[auction.bidders.<code>]`                 | which demand provider a browser bidder code is sent to                |
+| `[creative_opportunities]`                 | server-rendered ad slots                                              |
+| `[proxy]`, `[cache]`, `[rewrite]`          | first-party proxying, caching and URL rewriting                       |
+| `[request_signing]`, `[trusted_client_ip]` | signing and client addresses                                          |
+| `[debug]`, `[tinybird]`                    | diagnostics and telemetry                                             |
 
 ## Why the file works this way
 
@@ -194,16 +194,11 @@ that can be trusted in production and handed from one team to another.
 A site with every kind of component the rules cover.
 
 ```toml
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "handler_password"              # key name in trusted_server_secrets
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
-proxy_secret = "publisher_proxy_secret"    # key name
+proxy_secret = "publisher_proxy_secret"    # key name in trusted_server_secrets
 
 [proxy]
 allowed_domains = ["assets.example.com"]

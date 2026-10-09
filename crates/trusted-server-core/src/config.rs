@@ -264,14 +264,6 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    object("handlers"),
-                    SecretPathSegment::ArrayEach,
-                    object("password"),
-                ],
-                false,
-            ),
-            field(
-                vec![
                     optional_object("trusted_client_ip"),
                     object("shared_secret"),
                 ],
@@ -407,7 +399,6 @@ pub fn validate_settings_for_runtime_with(
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
     validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
@@ -496,13 +487,6 @@ fn validate_secret_key_references(
                 token.expose(),
             )?;
         }
-    }
-
-    for (index, handler) in settings.handlers.iter().enumerate() {
-        validate_secret_key_reference(
-            &format!("handlers[{index}].password"),
-            handler.password.expose(),
-        )?;
     }
 
     if let Some(trusted_client_ip) = &settings.trusted_client_ip {
@@ -788,8 +772,6 @@ formats = [{ width = 300, height = 250 }]
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "ec_key");
-        settings.handlers[0].password = Redacted::new("handler_password".to_owned());
-        settings.handlers[1].password = Redacted::new("admin_password".to_owned());
         let app_config = TrustedServerAppConfig::new(settings)
             .expect("should validate key names without values");
 
@@ -952,7 +934,6 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.host_signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
-                ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
@@ -1224,10 +1205,6 @@ module = "hmac"
 [ec.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "production-admin-password-32-bytes"
 "#,
         )
         .expect("should parse placeholder settings before runtime validation");

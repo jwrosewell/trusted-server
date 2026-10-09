@@ -78,9 +78,8 @@ Each endpoint contract below states authentication, request and response shape,
 status behavior, cache and CORS behavior, configuration gates, rate limiting,
 and an example or an explicit not-applicable value.
 
-`Auth: none` means that the endpoint has no built-in authentication. An
-operator can still wrap any path with a `[[handlers]]` Basic-auth rule. Unless
-an endpoint says otherwise, it has no endpoint-specific CORS policy and no
+`Auth: none` means that the endpoint has no built-in authentication. Unless an
+endpoint says otherwise, it has no endpoint-specific CORS policy and no
 in-process rate limiter. Responses still pass through the adapter's standard
 response finalizer. Upstream proxies can preserve selected upstream headers;
 that is not a blanket CORS grant.
@@ -117,15 +116,8 @@ Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
 
 ```json
 {
-  "masked": [
-    "handlers[0].password",
-    "handlers[0].path",
-    "handlers[0].username",
-    "publisher.origin_url",
-    "publisher.proxy_secret"
-  ],
+  "masked": ["publisher.origin_url", "publisher.proxy_secret"],
   "settings": {
-    "handlers": [{ "password": "XXXX", "path": "XXXX", "username": "XXXX" }],
     "publisher": {
       "cookie_domain": ".example.com",
       "domain": "example.com",
@@ -759,7 +751,7 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 URL signing endpoint. Returns a signed first-party proxy URL for a valid HTTP or HTTPS target. When `proxy.allowed_domains` is non-empty, the endpoint checks the parsed target host before signing. An empty list permits every valid host.
 
-**Contract:** Auth: none unless an operator adds a handler. GET accepts a `url`
+**Contract:** Auth: none. GET accepts a `url`
 query value; POST accepts `{ "url": "..." }` and is limited to 64 KiB. `200`
 returns `{href, base}` and gives `href` a 30-second `tsexp`. A disallowed host
 returns `403`, an oversized POST returns `413`, and malformed/unsupported URLs
@@ -987,9 +979,9 @@ core against the signing stores. See [Key Rotation](./key-rotation.md).
 
 ## The Administration Prefix
 
-The whole `/_ts/admin` prefix is closed to the publisher fallback. A request beneath it that no route claims, whether unknown, malformed or percent-encoded (`/_ts/admin%2Fec`), is answered locally with `404` and `Cache-Control: no-store` and is never proxied, so an admin `Authorization` header and request body never reach the publisher origin. The retired non-`/_ts` `/admin/keys` aliases are closed the same way.
+The whole `/_ts/admin` prefix is closed. No route is served beneath it, and a request to any path beneath it, as sent or percent-encoded (`/_ts/admin%2Fec`), is answered here with `404` and `Cache-Control: no-store` before the publisher fallback, so an `Authorization` header and a request body sent to it never reach the publisher's origin. The `/admin/keys` aliases outside `/_ts` are closed the same way.
 
-No route is served beneath the prefix. Where a handler gates it, missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge before the path is looked at.
+No request is asked for a password.
 
 What is held against a reader's own Edge Cookie is shown to that reader at [`GET /_ts/data`](#get-ts-data).
 
@@ -1011,8 +1003,8 @@ stores, publisher proxying, or integrations are usable.
 
 ### GET /\_ts/debug/ja4
 
-**Contract:** Fastly-only; gated by `[debug].ja4_endpoint_enabled`. Auth: none
-unless wrapped by a handler. The request has no body. Enabled requests return
+**Contract:** Fastly-only; gated by `[debug].ja4_endpoint_enabled`. Auth: none.
+The request has no body. Enabled requests return
 `200 text/plain` with JA4, HTTP/2 fingerprint, cipher, TLS version, user-agent,
 and client-hint values. Disabled requests return `404`. The response is
 `no-store, private` and varies on the user-agent/client-hint fields. It defines
@@ -1167,8 +1159,8 @@ true. An integration no section selects registers no route,
 so its path continues through
 normal routing and can reach the publisher fallback. Duplicate registrations
 are startup errors. None of these routes has built-in caller authentication or
-an in-process rate limiter; `[[handlers]]` and platform controls remain
-available when a deployment needs either.
+an in-process rate limiter; platform controls remain available when a
+deployment needs either.
 
 | Route family      | Request and success contract                                                                                                                                           | Errors, cache, and CORS                                                                                                                                                                       | Example                                                                                                                                   |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1283,36 +1275,15 @@ No EC ID response header is emitted. EC identity is maintained with the `ts-ec` 
 
 ## Authentication and policy boundaries
 
-### Basic Authentication
+### Authentication
 
-Endpoints under protected paths require HTTP Basic Authentication:
-
-**Configuration:**
-
-```toml
-[[handlers]]
-path = "^/secure"
-username = "admin"
-password = "admin_password"
-```
-
-`password` is a key in the Trusted Server secret store. Provision the actual
-Basic Authentication password under `admin_password`.
-
-**Usage:**
-
-```bash
-curl -u 'admin:<resolved-admin-password>' https://edge.example.com/secure/report
-```
-
-**Protected Endpoints:**
-
-- Any paths matching configured `handlers` patterns
-
-The EC partner APIs use their own Bearer-token contract. Signed first-party
-proxy routes use `tstoken` instead of HTTP authentication. All other built-in
-routes are unauthenticated unless the operator deliberately wraps them with a
-handler.
+Trusted Server asks no request for a password. The EC partner APIs use their
+own Bearer-token contract, and signed first-party proxy routes use `tstoken`
+instead of HTTP authentication. All other built-in routes are unauthenticated.
+A deployment that needs a password on a path of the publisher's own sets it at
+the origin or in the hosting platform. An `Authorization` header a reader
+sends is passed to the origin with the request, and the response to it is
+never stored in a shared cache.
 
 ### Rate limiting
 

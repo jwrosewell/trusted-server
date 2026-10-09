@@ -47,7 +47,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -742,7 +742,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -912,11 +911,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"
@@ -973,11 +967,6 @@ mod tests {
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1075,11 +1064,6 @@ mod tests {
     fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1105,11 +1089,6 @@ mod tests {
     fn startup_rejects_multi_provider_auction_plan() {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"

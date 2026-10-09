@@ -33,7 +33,6 @@ a store the runtime never reads. Local push writes the temporary
 Spin encodes `v_<store>_v_<key>` names. The smoke supplies these exact
 variables:
 
-- `v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword`
 - `v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret`
 - `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
 

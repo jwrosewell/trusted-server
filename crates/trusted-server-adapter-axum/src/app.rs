@@ -46,7 +46,7 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::RuntimeServices;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
@@ -778,8 +778,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // any middleware registered ahead of it would observe the
         // shared-secret authentication header.
         .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)));
 
     router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
         Ok::<Response, EdgeError>(
@@ -847,11 +846,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"

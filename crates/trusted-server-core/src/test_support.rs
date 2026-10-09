@@ -7,16 +7,6 @@ pub mod tests {
     #[must_use]
     pub fn crate_test_settings_str() -> String {
         r#"
-            [[handlers]]
-            path = "^/secure"
-            username = "user"
-            password = "pass"
-
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -177,10 +167,6 @@ pub mod template {
     pub fn template_with_resolved_required_secrets() -> String {
         EXAMPLE_TEMPLATE
             .replace(
-                "password = \"handler_password\"",
-                "password = \"unit-test-resolved-handler-password-0001\"",
-            )
-            .replace(
                 "proxy_secret = \"publisher_proxy_secret\"",
                 "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
             )
@@ -259,11 +245,6 @@ pub mod nextjs_auction {
     pub fn settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"

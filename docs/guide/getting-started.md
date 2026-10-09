@@ -90,11 +90,10 @@ export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
   jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
 )"
 
-# Populate the three secret references from the starter config for this shell.
+# Populate the two secret references from the starter config for this shell.
 # Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
 export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
 export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
 
 # Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum

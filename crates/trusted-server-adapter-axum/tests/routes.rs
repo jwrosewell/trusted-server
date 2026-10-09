@@ -21,11 +21,6 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 fn test_settings() -> trusted_server_core::settings::Settings {
     trusted_server_core::settings::Settings::from_toml(
         r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
@@ -307,31 +302,8 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 }
 
 // ---------------------------------------------------------------------------
-// Basic-auth parity tests
+// Closed paths and the inspection endpoints
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_route_without_credentials_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/anything")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin route must return 401 without credentials"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_authenticated_request_to_a_closed_path_is_answered_here() {
@@ -347,14 +319,13 @@ async fn an_authenticated_request_to_a_closed_path_is_answered_here() {
         "/_ts/admin/eids.json".to_owned(),
         "/_ts/admin/ec;foo".to_owned(),
         format!("/_ts/admin/ec%2F{ec_id}"),
-        // Percent-encoded separators match the `^/_ts/admin` basic-auth
-        // handler but not a literal-slash namespace check, so they must be
-        // reserved before publisher fallback forwards credentials upstream.
+        // A check for a literal slash would miss a percent-encoded separator,
+        // so these are closed before the publisher fallback forwards
+        // credentials upstream.
         "/_ts/admin%2Fec".to_owned(),
         "/_ts/admin%2fec".to_owned(),
-        // Retired non-`/_ts` alias namespace: only the two exact paths are
-        // routed to a local deny, so descendants and encoded separators must
-        // be reserved at the shared fallback boundary.
+        // The alias outside `/_ts`, with its descendants and encoded
+        // separators.
         "/admin/keys".to_owned(),
         "/admin/keys/rotate/extra".to_owned(),
         "/admin/keys%2Frotate".to_owned(),
@@ -427,91 +398,6 @@ async fn key_administration_paths_are_answered_here_and_never_proxied() {
             );
         }
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_route_without_credentials_includes_www_authenticate_header() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/anything")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "should be 401 before checking header"
-    );
-    assert!(
-        resp.headers().contains_key("www-authenticate"),
-        "401 response must include WWW-Authenticate header"
-    );
-    let www_auth = resp
-        .headers()
-        .get("www-authenticate")
-        .expect("should have www-authenticate header")
-        .to_str()
-        .expect("should be valid UTF-8");
-    assert!(
-        www_auth.starts_with("Basic realm="),
-        "WWW-Authenticate must be Basic scheme, got: {www_auth}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_route_with_wrong_credentials_returns_401() {
-    use base64::Engine as _;
-    let creds = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/anything")
-        .header("content-type", "application/json")
-        .header("authorization", format!("Basic {creds}"))
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin route must reject wrong credentials with 401"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn discovery_endpoint_does_not_require_auth() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/.well-known/trusted-server.json")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        401,
-        "/.well-known/trusted-server.json must not require auth"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -589,8 +475,8 @@ async fn config_endpoint_answers_anyone_and_masks_secrets() {
             "{path} should mask what it does not show"
         );
         assert!(
-            !text.contains("admin-pass"),
-            "{path} should not carry the admin password"
+            !text.contains("integration-test-proxy-secret"),
+            "{path} should not carry the proxy secret"
         );
     }
 }
@@ -634,29 +520,6 @@ async fn data_endpoint_answers_a_browser_opening_the_page_and_nothing_else() {
             "should say nothing is held to a browser opening the page, and to nothing else"
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auction_endpoint_does_not_require_auth() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/auction")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"adUnits":[]}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        401,
-        "/auction must not apply admin basic-auth gate"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -783,11 +646,6 @@ async fn first_party_proxy_rebuild_is_routed() {
 /// inject, with the `[ec.acme]` block that module's settings live in.
 /// `acme` is a fictional vendor key.
 const UNINJECTED_MODULE_TOML: &str = r#"
-    [[handlers]]
-    path = "^/_ts/admin"
-    username = "admin"
-    password = "admin-pass"
-
     [publisher]
     domain = "test-publisher.example.com"
     cookie_domain = ".test-publisher.example.com"

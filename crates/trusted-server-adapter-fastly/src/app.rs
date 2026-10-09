@@ -1,8 +1,8 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
 //! Registers all routes for Trusted Server into a
-//! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
-//! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
+//! [`RouterService`]. On successful startup, attaches
+//! [`FinalizeResponseMiddleware`]. When startup fails,
 //! [`startup_error_router`] returns a bare router without middleware.
 //! Builds the [`AppState`] once per Wasm instance.
 //!
@@ -65,11 +65,6 @@
 //!
 //! ## Intentional deviations from legacy
 //!
-//! - **401 auth challenges**: [`AuthMiddleware`] short-circuits before the
-//!   handler runs, so no EC state is built and `ec_finalize_response` does not
-//!   run on these responses. Legacy ran EC finalization on its own auth
-//!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
-//!   cookies are issued to unauthenticated callers.
 //! - **Publisher responses** keep Fastly origin bodies streaming through the
 //!   `EdgeZero` response body when the body is processable or pass-through.
 //!   Adapters without streaming-body support still use the bounded buffered
@@ -153,7 +148,7 @@ use trusted_server_core::settings_data::{
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_device_fastly::FastlyHostSignals;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::FinalizeResponseMiddleware;
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore,
@@ -701,8 +696,8 @@ enum PreRoute {
 
 /// Runs the integration request-filter pipeline before route dispatch.
 ///
-/// Mirrors the legacy `route_request` ordering: filters run after auth
-/// (`AuthMiddleware` on this path) and before route matching. Request header
+/// Mirrors the legacy `route_request` ordering: filters run before route
+/// matching. Request header
 /// mutations are applied to `req` so the routed handler observes them; response
 /// effects are returned for the entry point to apply after EC finalization. A
 /// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
@@ -1511,13 +1506,11 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder()
-            .middleware(FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
-                build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store)),
-            ))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+            Arc::clone(&state.settings),
+            build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
+            build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store)),
+        ));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1604,17 +1597,12 @@ mod seam_probe_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use super::{
-        AppContext, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource,
-        HandlerFuture, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        RuntimeStoreConfig, TrustedServerApp, build_orchestrator_with_plan,
-        build_per_request_services, build_state_from_settings, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        AppState, EidSyncSource, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH,
+        PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
+        build_state_from_settings, startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
@@ -1642,9 +1630,7 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
-        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
-        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
+        PlatformSelectResult, RuntimeServices,
     };
     use trusted_server_core::settings::Settings;
 
@@ -1746,16 +1732,6 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [[handlers]]
-            path = "^/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -2058,39 +2034,6 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn dispatch_auth_rejected_401_carries_finalize_headers() {
-        // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
-        // must still carry standard TS headers before reaching the client.
-        //
-        // Test settings protect `^/(_ts/)?admin` with basic-auth. Sending the
-        // request without an Authorization header causes AuthMiddleware to
-        // short-circuit with a 401, which then bubbles through
-        // FinalizeResponseMiddleware for header injection.
-        //
-        // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
-        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
-        // short-circuits without calling any Fastly ABI.
-        let router = test_router();
-        let req = empty_request(Method::POST, "/_ts/admin/anything");
-
-        let response = route(&router, req);
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "request without credentials should be rejected"
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(HEADER_X_GEO_INFO_AVAILABLE)
-                .and_then(|v| v.to_str().ok()),
-            Some("false"),
-            "FinalizeResponseMiddleware must run even for auth-rejected responses"
-        );
-    }
-
-    #[test]
     fn page_bids_serves_canonical_path_and_deprecated_alias() {
         // The SPA re-auction endpoint lives at the canonical single-underscore
         // `/_ts/page-bids`, matching every other internal route. The deprecated
@@ -2142,11 +2085,6 @@ mod tests {
         // answered here.
         let settings = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -2207,14 +2145,13 @@ mod tests {
             "/_ts/admin/eids.json".to_owned(),
             "/_ts/admin/ec;foo".to_owned(),
             format!("/_ts/admin/ec%2F{ec_id}"),
-            // Percent-encoded separators match the `^/_ts/admin` basic-auth
-            // handler but not a literal-slash namespace check, so they must be
-            // reserved before publisher fallback forwards credentials upstream.
+            // A check for a literal slash would miss a percent-encoded separator,
+            // so these are closed before the publisher fallback forwards
+            // credentials upstream.
             "/_ts/admin%2Fec".to_owned(),
             "/_ts/admin%2fec".to_owned(),
-            // Retired non-`/_ts` alias namespace: only the two exact paths are
-            // routed to a local deny, so descendants and encoded separators must
-            // be reserved at the shared fallback boundary.
+            // The alias outside `/_ts`, with its descendants and encoded
+            // separators.
             "/admin/keys".to_owned(),
             "/admin/keys/rotate/extra".to_owned(),
             "/admin/keys%2Frotate".to_owned(),
@@ -3054,11 +2991,6 @@ mod tests {
         // ran instead of the publisher fallback (which always attaches one).
         let settings = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -3178,303 +3110,6 @@ mod tests {
             .build()
     }
 
-    #[derive(Default)]
-    struct DispatchTemplateCache {
-        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
-    }
-
-    struct DispatchTemplateReservation {
-        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
-        key: TemplateCacheKey,
-    }
-
-    impl PlatformTemplateCacheReservation for DispatchTemplateReservation {
-        fn insert(
-            self: Box<Self>,
-            metadata: &TemplateMetadata,
-            body: Vec<u8>,
-            _max_age: Duration,
-        ) -> Result<(), TemplateCacheError> {
-            self.entries.lock().expect("should lock entries").insert(
-                self.key.to_cache_key(),
-                TemplateEntry {
-                    metadata: metadata.clone(),
-                    body,
-                },
-            );
-            Ok(())
-        }
-
-        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformTemplateCache for DispatchTemplateCache {
-        async fn lookup_or_reserve(
-            &self,
-            key: &TemplateCacheKey,
-        ) -> Result<TemplateCacheLookup, TemplateCacheError> {
-            if let Some(entry) = self
-                .entries
-                .lock()
-                .expect("should lock entries")
-                .get(&key.to_cache_key())
-                .cloned()
-            {
-                return Ok(TemplateCacheLookup::Hit(entry));
-            }
-            Ok(TemplateCacheLookup::Reserved(
-                TemplateCacheReservation::new(Box::new(DispatchTemplateReservation {
-                    entries: Arc::clone(&self.entries),
-                    key: key.clone(),
-                })),
-            ))
-        }
-
-        async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
-            self.entries
-                .lock()
-                .expect("should lock entries")
-                .get(&key.to_cache_key())
-                .cloned()
-                .ok_or(TemplateCacheMiss::NotFound)
-        }
-
-        async fn put(
-            &self,
-            key: &TemplateCacheKey,
-            metadata: &TemplateMetadata,
-            body: Vec<u8>,
-            _max_age: Duration,
-        ) -> Result<(), TemplateCacheError> {
-            self.entries.lock().expect("should lock entries").insert(
-                key.to_cache_key(),
-                TemplateEntry {
-                    metadata: metadata.clone(),
-                    body,
-                },
-            );
-            Ok(())
-        }
-
-        async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
-            self.entries
-                .lock()
-                .expect("should lock entries")
-                .remove(&key.to_cache_key());
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct DispatchOriginClient {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for DispatchOriginClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .header(header::CACHE_CONTROL, "public, max-age=300")
-                .body(Body::from(
-                    b"<html><head></head><body>origin</body></html>".as_ref(),
-                ))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    #[test]
-    fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
-        let settings = Arc::new(
-            Settings::from_toml(
-                r#"
-                    [[handlers]]
-                    path = "^/secure"
-                    username = "user"
-                    password = "pass"
-
-                    [[handlers]]
-                    path = "^/_ts/admin"
-                    username = "admin"
-                    password = "admin-pass"
-
-                    [publisher]
-                    domain = "test-publisher.com"
-                    cookie_domain = ".test-publisher.com"
-                    origin_url = "https://origin.test-publisher.com"
-                    proxy_secret = "unit-test-proxy-secret"
-
-                    [ec]
-                    passphrase = "test-secret-key-32-bytes-minimum"
-
-                    # The deprecated passphrase migrates to the hmac module, so
-                    # single-jurisdiction operation is acknowledged because no
-                    # geo module is selected.
-                    [geo]
-                    assume_single_jurisdiction = true
-
-                    [auction]
-                    enabled = true
-
-                    [creative_opportunities]
-                    gam_network_id = "99999"
-                    assembly_mode = "esi"
-
-                    [[creative_opportunities.slot]]
-                    id = "test-slot"
-                    page_patterns = ["/secure/article"]
-                    formats = [{ width = 728, height = 90 }]
-                "#,
-            )
-            .expect("should parse dispatch cache settings"),
-        );
-        let cache = Arc::new(DispatchTemplateCache::default());
-        let origin = Arc::new(DispatchOriginClient::default());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
-            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
-            .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
-            .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
-            .client_info(ClientInfo::default())
-            .build();
-        let stock = trusted_server_modules::builders();
-        let plan = Arc::new(
-            compile_auction_plan_with(&settings, &stock).expect("should compile auction plan"),
-        );
-        let registry = Arc::new(
-            IntegrationRegistry::with_plan_and_registrations(&settings, Arc::clone(&plan), &stock)
-                .expect("should build integration registry"),
-        );
-        let orchestrator = Arc::new(
-            build_orchestrator_with_plan(plan).expect("should build auction orchestrator"),
-        );
-
-        let handler = {
-            let settings = Arc::clone(&settings);
-            let services = services.clone();
-            let registry = Arc::clone(&registry);
-            let orchestrator = Arc::clone(&orchestrator);
-            move |ctx: RequestContext| {
-                let settings = Arc::clone(&settings);
-                let services = services.clone();
-                let registry = Arc::clone(&registry);
-                let orchestrator = Arc::clone(&orchestrator);
-                Box::pin(async move {
-                    let request = ctx.into_request();
-                    let method = request.method().clone();
-                    let mut ec_context =
-                        match EcContext::read_from_request(&settings, &request, &services) {
-                            Ok(context) => context,
-                            Err(report) => return Ok(super::http_error(&report)),
-                        };
-                    let response = match handle_publisher_request(
-                        AppContext {
-                            settings: &settings,
-                            integration_registry: registry.as_ref(),
-                        },
-                        &services,
-                        None,
-                        &mut ec_context,
-                        AuctionDispatch {
-                            orchestrator: &orchestrator,
-                            slots: settings.creative_opportunity_slots(),
-                            registry: None,
-                        },
-                        request,
-                        EdgeCacheHeader::SurrogateControl,
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(report) => return Ok(super::http_error(&report)),
-                    };
-                    match publisher_response_into_streaming_response(
-                        response,
-                        &method,
-                        Arc::clone(&settings),
-                        &registry,
-                        orchestrator,
-                        services,
-                    )
-                    .await
-                    {
-                        Ok(response) => Ok(response),
-                        Err(report) => Ok(super::http_error(&report)),
-                    }
-                }) as HandlerFuture
-            }
-        };
-        let router = RouterService::builder()
-            .middleware(crate::middleware::AuthMiddleware::new(Arc::clone(
-                &settings,
-            )))
-            .route("/secure/article", Method::GET, handler)
-            .build();
-        let authorized_request = || {
-            request_builder()
-                .method(Method::GET)
-                .uri("https://test-publisher.com/secure/article")
-                .header(header::HOST, "test-publisher.com")
-                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
-                .header("sec-fetch-dest", "document")
-                .header("sec-fetch-mode", "navigate")
-                .body(Body::empty())
-                .expect("should build authorized navigation")
-        };
-
-        let cold = route(&router, authorized_request());
-        assert_eq!(
-            cold.headers()
-                .get("x-ts-template-cache")
-                .and_then(|value| value.to_str().ok()),
-            Some("miss-stored")
-        );
-        block_on(cold.into_body().into_bytes_bounded(1024 * 1024))
-            .expect("should drain cold response");
-
-        let warm = route(&router, authorized_request());
-        assert_eq!(
-            warm.headers()
-                .get("x-ts-template-cache")
-                .and_then(|value| value.to_str().ok()),
-            Some("hit")
-        );
-        block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
-            .expect("should drain warm response");
-        assert_eq!(
-            origin.calls.load(Ordering::Relaxed),
-            1,
-            "the warm dispatch must not fetch the publisher origin"
-        );
-    }
-
     #[test]
     fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
         // Regression guard for the EdgeZero asset streaming cutover: a successful
@@ -3484,11 +3119,6 @@ mod tests {
         // pipe straight to the client via `stream_to_client`.
         let settings = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"

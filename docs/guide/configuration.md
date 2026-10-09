@@ -68,7 +68,7 @@ ts config push --adapter fastly
 ### Static secret references
 
 Static app-config credentials contain stable key names only. This includes
-publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
+publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
@@ -76,7 +76,6 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.host_signals.passphrase`, when `[ec] module = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
-- `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
@@ -119,7 +118,6 @@ serialization, runtime, and secret axes for every exceptional field:
 | `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
@@ -230,7 +228,6 @@ fail and the service will return its startup-error response.
 | `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
 | `[[fetch]]`                                                                                                       | nothing               | Which page changes run on a page as it is fetched, and in what order                        |
 | `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
-| `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
 | `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                          |
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
@@ -677,7 +674,8 @@ defaults.
 Each entry of `show` and `hide` is a path pattern, being keys joined by `.`,
 with `[]` for every element of a list and `[N]` for one, such as
 `publisher.origin_url`, `proxy.asset_routes[].origin_url` or
-`handlers[0].path`. A pattern names the values at exactly its own depth.
+`proxy.asset_routes[0].prefix`. A pattern names the values at exactly its own
+depth.
 
 A masked value shows as `XXXX`, and the page lists every masked path.
 
@@ -686,7 +684,6 @@ A masked value shows as `XXXX`, and the page lists every masked path.
 | A secret, meaning a value the settings loader fills from the secret store | Always     | No                               |
 | `publisher.origin_url` and `publisher.origin_host_header_override`        | By default | Yes                              |
 | `proxy.asset_routes[].origin_url`                                         | By default | Yes                              |
-| `handlers[].path` and `handlers[].username`                               | By default | Yes                              |
 | `ec.ec_store` and `auction.creative_store`                                | By default | Yes                              |
 | Anything `hide` names                                                     | When named | It is the publisher's own choice |
 
@@ -1093,142 +1090,6 @@ fastly secret-store list
 ```
 
 See [Request Signing](/guide/request-signing) and [Key Rotation](/guide/key-rotation) for usage.
-
-## Basic Authentication Handlers
-
-Path-based HTTP Basic Authentication.
-
-### `[[handlers]]`
-
-**Purpose**: Protect specific paths with username/password authentication.
-
-**Format**: Array of handler objects
-
-| Field      | Type           | Required | Description                       |
-| ---------- | -------------- | -------- | --------------------------------- |
-| `path`     | String (Regex) | Yes      | Regular expression matching paths |
-| `username` | String         | Yes      | HTTP Basic Auth username          |
-| `password` | String         | Yes      | HTTP Basic Auth password          |
-
-**Example**:
-
-```toml
-# Single handler
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin_password"
-
-# Multiple handlers
-[[handlers]]
-path = "^/secure"
-username = "user1"
-password = "secure_handler_password"
-
-[[handlers]]
-path = "^/api/private"
-username = "api-user"
-password = "api_handler_password"
-```
-
-**Environment Override**:
-
-```bash
-# Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
-TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
-TRUSTED_SERVER__HANDLERS__0__PASSWORD="admin_password"
-
-# Handler 1
-TRUSTED_SERVER__HANDLERS__1__PATH="^/api/private"
-TRUSTED_SERVER__HANDLERS__1__USERNAME="api-user"
-TRUSTED_SERVER__HANDLERS__1__PASSWORD="api_handler_password"
-```
-
-### Path Patterns
-
-**Regex Syntax**: Standard Rust regex patterns
-
-**Examples**:
-
-```toml
-# Exact path
-path = "^/_ts/admin$"  # Only /_ts/admin
-
-# Prefix match
-path = "^/_ts/admin"   # /_ts/admin, /_ts/admin/users, /_ts/admin/settings
-
-# Multiple paths
-path = "^/(admin|secure|private)"
-
-# File extension
-path = "\\.pdf$"   # All PDF files
-
-# Complex pattern
-path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
-```
-
-**Validation**: Application startup fails if regex is invalid.
-
-::: warning Passwords are validated at startup
-
-Handler expressions match the raw URI path, while a publisher origin may decode
-percent-encoded aliases before routing. For a whole-site staging gate, use
-`path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
-equivalent origin paths.
-
-Startup fails when any handler uses a placeholder or well-known weak password
-(`changeme`, `password`, `admin`, or a `replace-with-…` template value). Handler
-selection is first-match-wins, so a narrow handler ahead of a broader pattern
-governs the paths it matches.
-
-:::
-
-::: warning Scope patterns to the paths you mean
-
-Handler patterns are matched against the full request path, so a broad pattern
-covers everything beneath it. The `/_ts/` namespace holds both admin routes and
-browser-facing endpoints that anonymous visitors must be able to reach:
-
-| Path                     | Called by                            |
-| ------------------------ | ------------------------------------ |
-| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
-| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
-| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
-
-A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
-fetches never carry Basic credentials, so every visitor gets `401`, on
-`/_ts/page-bids` that means no ads after any client-side navigation. Match the
-admin routes specifically (`^/_ts/admin`) instead.
-
-Upgrading from a release before `/_ts/page-bids` existed: if any handler
-pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
-to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
-scheduled for removal
-([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
-
-:::
-
-### Security Considerations
-
-**Password Storage**:
-
-- `handlers[*].password` is a key name in `trusted_server_secrets`
-- Store the resolved password only in the platform secret store
-- Rotate passwords through the store and restart/redeploy instances
-
-**Limitations**:
-
-- HTTP Basic Auth (not OAuth/JWT)
-- Single username/password per path
-- No role-based access control
-- No rate limiting (add at edge)
-
-::: warning Production Use
-Do not put handler passwords in `trusted-server.toml`, environment overlays, or
-app-config blobs. Provision the referenced key in `trusted_server_secrets`
-before pushing the config.
-:::
 
 ## URL Rewrite Configuration
 
@@ -3392,12 +3253,6 @@ from the file, and startup checks the rest and runs the first set again.
 
 - Every secret setting holds a key name and no secret value
 
-**Handlers**:
-
-- `path` is a valid regex
-- `username` is ordinary configuration and non-empty
-- At least one handler covers the `/_ts/admin` namespace
-
 **Integrations**:
 
 - Each integration validates its own block, selected or not, so a typo in a
@@ -3421,8 +3276,8 @@ Everything above runs again on the loaded configuration, and these join it:
   running module supplies, or one named in the phase it does not run in,
   stops the service on its next start, because which middleware a build has
   is only known where its modules are registered
-- Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
-  or a weak handler password fails here
+- Resolved secret values, so a passphrase shorter than 32 bytes or a
+  placeholder fails here
 - The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`
   acknowledgment an Edge Cookie module needs when no geo module is selected
 - The checks only the host can make, being backend name prediction and
@@ -3516,12 +3371,6 @@ trusted-server.dev.toml      # Development overrides
 - Ensure the resolved value is non-empty and not a known placeholder
 - Do not replace the key name with a plaintext value in the app config
 - Rotate the value in the platform secret store, then restart/redeploy
-
-**"Invalid regex"**:
-
-- Handler `path` must be valid regex
-- Test pattern: `echo "^/_ts/admin" | grep -E "^/_ts/admin"`
-- Escape special characters: `\.`, `\$`, etc.
 
 **"Integration configuration could not be parsed"**:
 

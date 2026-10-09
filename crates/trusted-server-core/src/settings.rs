@@ -1506,73 +1506,6 @@ impl Rewrite {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct Handler {
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    #[validate(length(min = 1), custom(function = validate_path))]
-    pub path: String,
-    #[validate(custom(function = validate_redacted_not_empty))]
-    pub username: Redacted<String>,
-    #[validate(custom(function = validate_redacted_not_empty))]
-    pub password: Redacted<String>,
-    #[serde(skip, default)]
-    #[validate(skip)]
-    regex: OnceLock<Result<Regex, String>>,
-}
-
-impl Handler {
-    /// Known handler password placeholders that must not be used in deployments.
-    pub const PASSWORD_PLACEHOLDERS: &[&str] = &[
-        "replace-with-admin-password-32-bytes",
-        "replace-with-admin-password",
-        "change-me-admin-password",
-    ];
-
-    /// Returns `true` if `password` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_password(password: &str) -> bool {
-        let password = password.trim();
-        Self::PASSWORD_PLACEHOLDERS
-            .iter()
-            .any(|placeholder| placeholder.eq_ignore_ascii_case(password))
-    }
-
-    fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
-        match self
-            .regex
-            .get_or_init(|| Regex::new(&self.path).map_err(|err| err.to_string()))
-        {
-            Ok(regex) => Ok(regex),
-            Err(message) => Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Handler path regex `{}` failed to compile: {message}",
-                    self.path
-                ),
-            })),
-        }
-    }
-
-    /// Eagerly compile the handler regex to fail fast during startup.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if the handler path regex does not compile.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        self.compiled_regex().map(|_| ())
-    }
-
-    /// Determine whether this handler applies to the request path.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if the handler path regex does not compile.
-    pub fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
-        self.compiled_regex().map(|regex| regex.is_match(path))
-    }
-}
-
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSigning {
@@ -2574,14 +2507,6 @@ fn default_certificate_check() -> bool {
     true
 }
 
-fn is_admin_placeholder_password(password: &str) -> bool {
-    Handler::is_placeholder_password(password)
-        || matches!(
-            password.trim().to_ascii_lowercase().as_str(),
-            "changeme" | "password" | "admin"
-        )
-}
-
 impl Default for Proxy {
     fn default() -> Self {
         Self {
@@ -3542,6 +3467,16 @@ refused_table! {
 }
 
 refused_table! {
+    /// The `[[handlers]]` list, which gated paths behind HTTP Basic
+    /// authentication.
+    RemovedHandlers => "Configuration list `[[handlers]]` is not read, and no request is \
+        asked for a password. Remove every `[[handlers]]` entry. Nothing is served beneath \
+        /_ts/admin, so rotate signing keys with `ts keys`, purge the cache with \
+        `ts cache purge`, and put a password on a path of the publisher's own at its origin \
+        or in the hosting platform"
+}
+
+refused_table! {
     /// A store id under `[request_signing]`, which the service does not read.
     RemovedSigningStoreId => "`[request_signing]` does not take `config_store_id` or \
         `secret_store_id`. The service reads its signing keys from the stores linked as \
@@ -3848,9 +3783,14 @@ pub struct Settings {
     /// `[cmp]` or `[tag]`, each named for the type of module it selects.
     #[serde(flatten)]
     pub sections: TypeSections,
-    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
-    #[validate(nested)]
-    pub handlers: Vec<Handler>,
+    /// The `[[handlers]]` list, kept so a configuration carrying one is
+    /// told that no path is gated by a password.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed list fails with directions"
+    )]
+    handlers: RemovedHandlers,
     #[serde(default, deserialize_with = "map_from_obj_or_str")]
     pub response_headers: HashMap<String, String>,
     pub request_signing: Option<RequestSigning>,
@@ -4061,7 +4001,6 @@ impl Settings {
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
-        settings.validate_admin_handler_passwords()?;
 
         // Log the policy's declared default once per settings load, so an
         // operator can see which permissions an unmatched request is granted
@@ -4099,10 +4038,6 @@ impl Settings {
             .auction_html_comment_options
             .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
-
-        for handler in &self.handlers {
-            handler.prepare_runtime()?;
-        }
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
@@ -4199,11 +4134,6 @@ impl Settings {
                 ));
             }
         }
-        for handler in &self.handlers {
-            if Handler::is_placeholder_password(handler.password.expose()) {
-                insecure_fields.push(format!("handlers[{}].password", handler.path));
-            }
-        }
         if Publisher::is_placeholder_domain(&self.publisher.domain) {
             insecure_fields.push("publisher.domain".to_owned());
         }
@@ -4265,52 +4195,6 @@ impl Settings {
     #[must_use]
     pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
         self.proxy.asset_route_for_path(path)
-    }
-
-    /// Resolve the first handler whose regex matches the request path.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if any handler regex does not compile.
-    pub fn handler_for_path(
-        &self,
-        path: &str,
-    ) -> Result<Option<&Handler>, Report<TrustedServerError>> {
-        for handler in &self.handlers {
-            if handler.matches_path(path)? {
-                return Ok(Some(handler));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Returns whether `path` is within the reserved Trusted Server admin
-    /// namespace.
-    #[must_use]
-    pub(crate) fn is_admin_path(path: &str) -> bool {
-        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
-    }
-
-    /// Rejects placeholder and well-known weak handler passwords.
-    ///
-    /// Applies to every handler. Handlers are Trusted Server's own basic-auth
-    /// gates, so a placeholder password is never valid on any of them.
-    pub(crate) fn validate_admin_handler_passwords(
-        &self,
-    ) -> Result<(), Report<TrustedServerError>> {
-        for handler in &self.handlers {
-            if is_admin_placeholder_password(handler.password.expose()) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "Handler `{}` uses a placeholder password; configure a strong secret",
-                        handler.path
-                    ),
-                }));
-            }
-        }
-
-        Ok(())
     }
 
     /// Every section that selects modules, with its name: `[proxy]`,
@@ -4705,14 +4589,6 @@ fn validate_proxy_origin_url(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_path(value: &str) -> Result<(), ValidationError> {
-    Regex::new(value).map(|_| ()).map_err(|err| {
-        let mut validation_error = ValidationError::new("invalid_regex");
-        validation_error.add_param("value".into(), &value);
-        validation_error.add_param("message".into(), &err.to_string());
-        validation_error
-    })
-}
 fn from_value_or_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -5126,7 +5002,7 @@ module = \"none\"",
     // hand-written `Debug` impl prints only integration IDs, never values.
     //
     // Do not use `..Struct::default()` anywhere in this function. A default
-    // spread would let a new secret field be added to `Handler`,
+    // spread would let a new secret field be added to `EcPartner`,
     // `TinybirdSettings`, or any other struct built here without forcing
     // anyone to consider it. The compile break is the prompt; the canary
     // list below is still maintained by hand. List every field explicitly.
@@ -5134,8 +5010,6 @@ module = \"none\"",
     fn settings_debug_output_redacts_every_secret_field() {
         const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
         const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
-        const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
-        const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
         const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
         const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
         const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
@@ -5151,13 +5025,6 @@ module = \"none\"",
 
         settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, CANARY_EC_PASSPHRASE);
-
-        settings.handlers = vec![Handler {
-            path: "^/secure".to_string(),
-            username: Redacted::new(CANARY_HANDLER_USERNAME.to_string()),
-            password: Redacted::new(CANARY_HANDLER_PASSWORD.to_string()),
-            regex: OnceLock::new(),
-        }];
 
         settings.ec.partners = vec![EcPartner {
             name: "canary-partner".to_string(),
@@ -5224,15 +5091,13 @@ module = \"none\"",
             "should redact secret fields in Settings debug output"
         );
         assert!(
-            debug.contains("^/secure"),
-            "should leave non-secret handler path visible in debug output"
+            debug.contains("canary-partner.example"),
+            "should leave a non-secret value visible in debug output"
         );
 
         let canaries = [
             ("publisher.proxy_secret", CANARY_PROXY_SECRET),
             ("ec.hmac.passphrase", CANARY_EC_PASSPHRASE),
-            ("handlers[].username", CANARY_HANDLER_USERNAME),
-            ("handlers[].password", CANARY_HANDLER_PASSWORD),
             ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
             (
                 "ec.partners[].ts_pull_token",
@@ -5668,6 +5533,77 @@ module = \"none\"",
                 "should name the placeholder trusted client IP shared secret field"
             );
         }
+    }
+
+    /// The shared fixture with one `[[handlers]]` entry ahead of everything
+    /// else, as a configuration written for a build that asked for passwords
+    /// carries it.
+    fn settings_str_with_a_handler() -> String {
+        format!(
+            "[[handlers]]\npath = \"^/_ts/admin\"\nusername = \"admin\"\n\
+             password = \"admin-pass\"\n{}",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn toml_settings_refuse_a_handlers_list_with_directions() {
+        let error = Settings::from_toml(&settings_str_with_a_handler())
+            .expect_err("should refuse a configuration that still gates a path");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {rendered}"
+        );
+        assert!(
+            rendered.contains("ts keys") && rendered.contains("ts cache purge"),
+            "should say where administration went: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_settings_refuse_a_handlers_list_with_directions() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["handlers"] = json!([
+            { "path": "^/secure", "username": "user", "password": "handler_password" },
+        ]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should refuse a stored document that still gates a path");
+
+        assert!(
+            format!("{error:?}").contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_handlers_list_is_refused_too() {
+        let toml = format!("handlers = []\n{}", crate_test_settings_str());
+
+        let error = Settings::from_toml(&toml).expect_err("should refuse the key itself");
+
+        assert!(
+            format!("{error:?}").contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {error:?}"
+        );
+    }
+
+    #[test]
+    fn settings_are_written_without_a_handlers_list() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+
+        let value = serde_json::to_value(&settings).expect("should serialize the settings");
+
+        assert!(
+            value.get("handlers").is_none(),
+            "should write nothing a later read would refuse"
+        );
     }
 
     #[test]
@@ -7423,18 +7359,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn prepare_runtime_rejects_invalid_handler_regex() {
-        let toml_str = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
-
-        let err = Settings::from_toml(&toml_str).expect_err("should reject invalid handler regex");
-        assert!(
-            err.to_string()
-                .contains("Handler path regex `(` failed to compile"),
-            "should describe the invalid handler regex"
-        );
-    }
-
-    #[test]
     fn test_settings_missing_required_fields() {
         let re = Regex::new(r"origin_url = .*").expect("regex should compile");
 
@@ -7641,36 +7565,6 @@ source_domain = "partner.example.com"
         );
     }
 
-    #[test]
-    fn is_placeholder_handler_password_rejects_known_template_value() {
-        assert!(
-            Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
-            "init-template handler password should be rejected"
-        );
-    }
-
-    #[test]
-    fn reject_placeholder_secrets_includes_handler_passwords() {
-        let mut settings =
-            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
-        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        select_hmac_module(
-            &mut settings.ec,
-            HMAC_MODULE_KEY,
-            "test-secret-key-32-bytes-minimum",
-        );
-        settings.handlers[0].password =
-            Redacted::new("replace-with-admin-password-32-bytes".to_owned());
-
-        let err = settings
-            .reject_placeholder_secrets()
-            .expect_err("should reject placeholder handler password");
-        assert!(
-            format!("{err:?}").contains("handlers"),
-            "error should mention handler password field"
-        );
-    }
-
     fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
         test_partner_with_tokens(None, ts_pull_token)
     }
@@ -7774,83 +7668,6 @@ source_domain = "partner.example.com"
 
         let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail when sections are missing");
-    }
-
-    #[test]
-    fn test_handlers_override_with_env() {
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        // Override handler 0 via env vars
-        let path_key_0 = format!(
-            "{}{}HANDLERS{}0{}PATH",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let username_key_0 = format!(
-            "{}{}HANDLERS{}0{}USERNAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let password_key_0 = format!(
-            "{}{}HANDLERS{}0{}PASSWORD",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        // The fixture's second handler, at index 1
-        let path_key_1 = format!(
-            "{}{}HANDLERS{}1{}PATH",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let username_key_1 = format!(
-            "{}{}HANDLERS{}1{}USERNAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let password_key_1 = format!(
-            "{}{}HANDLERS{}1{}PASSWORD",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (path_key_0, Some("^/env-handler")),
-                (username_key_0, Some("env-user")),
-                (password_key_0, Some("env-pass")),
-                (path_key_1, Some("^/_ts/admin")),
-                (username_key_1, Some("admin")),
-                (password_key_1, Some("admin-pass")),
-            ],
-            || {
-                let settings =
-                    Settings::from_toml_and_env(&toml_str).expect("Settings should load from env");
-                assert_eq!(settings.handlers.len(), 2);
-                let handler = &settings.handlers[0];
-                assert_eq!(handler.path, "^/env-handler");
-                assert_eq!(handler.username.expose(), "env-user");
-                assert_eq!(handler.password.expose(), "env-pass");
-            },
-        );
     }
 
     #[test]
@@ -7997,8 +7814,10 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// An environment variable can give a handler to a configuration that
+    /// carries none, and that is refused as the list itself is.
     #[test]
-    fn test_invalid_handler_override_fails_during_runtime_preparation() {
+    fn a_handler_given_by_an_environment_variable_is_refused_too() {
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
@@ -8019,9 +7838,14 @@ source_domain = "partner.example.com"
             origin_key,
             Some("https://origin.test-publisher.com"),
             || {
-                temp_env::with_var(path_key, Some("("), || {
-                    let _ = Settings::from_toml_and_env(&toml_str)
-                        .expect_err("should reject invalid handler regex override");
+                temp_env::with_var(path_key, Some("^/secure"), || {
+                    let error = Settings::from_toml_and_env(&toml_str)
+                        .expect_err("should refuse a handler an environment variable gives");
+
+                    assert!(
+                        format!("{error:?}").contains("`[[handlers]]` is not read"),
+                        "should say the list is not read: {error:?}"
+                    );
                 });
             },
         );
@@ -8261,11 +8085,6 @@ source_domain = "partner.example.com"
 
         let from_toml = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
@@ -8297,11 +8116,6 @@ source_domain = "partner.example.com"
         // silently breaking traffic.
         let result = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
@@ -9527,107 +9341,8 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
-        // Handler selection is first-match-wins, so a narrow handler placed
-        // ahead of a broader one governs the paths it matches, and its password
-        // is checked like any other.
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/reports/[a-z0-9]{6}$"
-            username = "admin"
-            password = "change-me-admin-password"
-
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject placeholder password on shadowing admin handler");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("placeholder password"),
-            "should identify the placeholder handler password, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_weak_password_on_non_admin_handler() {
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/private"
-            username = "admin"
-            password = "changeme""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject a weak password on any handler");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("placeholder password"),
-            "should identify the weak handler password, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_admin_handler_placeholder_password() {
-        let toml_str = crate_test_settings_str()
-            .replace(r#"password = "admin-pass""#, r#"password = "changeme""#);
-
-        let result = Settings::from_toml(&toml_str);
-        assert!(
-            result.is_err(),
-            "should reject placeholder password on admin handler"
-        );
-        let err = format!("{:?}", result.expect_err("should reject placeholder"));
-        assert!(
-            err.contains("placeholder password"),
-            "error should mention placeholder admin password, got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_toml_accepts_non_placeholder_admin_password() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
-            .expect("should accept non-placeholder admin password");
-        assert_eq!(settings.handlers.len(), 2, "should parse handlers");
-    }
-
-    #[test]
-    fn from_toml_accepts_a_configuration_with_no_handlers() {
-        let fixture = crate_test_settings_str();
-        let start = fixture
-            .find("[[handlers]]")
-            .expect("the fixture should open with its handlers");
-        let end = fixture
-            .find("[publisher]")
-            .expect("the fixture should have a publisher after them");
-        let without_handlers = format!("{}{}", &fixture[..start], &fixture[end..]);
-
-        let settings = Settings::from_toml(&without_handlers)
-            .expect("should load a configuration that gates no path");
-
-        assert!(settings.handlers.is_empty(), "should hold no handler");
-    }
-
-    #[test]
     fn settings_parses_creative_opportunities_section() {
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -9713,11 +9428,6 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn settings_rejects_invalid_creative_opportunity_slot_id() {
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -9755,11 +9465,6 @@ formats = [{ width = 300, height = 250 }]
         // id injected via env is rejected by from_toml_and_env (the build-time
         // path uses the same validation against the merged config).
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -9803,11 +9508,6 @@ gam_network_id = "21765378893"
     fn creative_opportunity_settings_toml(slot_body: &str) -> String {
         format!(
             r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
