@@ -256,6 +256,36 @@ fn a_named_route_and_the_fallback_each_prepare_the_request_exactly_once() {
     );
 }
 
+/// A `[[fetch]]` entry naming the probe's middleware builds this adapter's
+/// state, and one naming the middleware of a module no section selects is a
+/// startup error.
+#[test]
+fn fetch_entry_builds_state_only_when_its_middleware_is_running() {
+    const ENTRY: &str = r#"
+        [[fetch]]
+        media_type = "text/html"
+        middleware = ["testing.seam-probe"]
+"#;
+
+    let selected = settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}{ENTRY}"));
+    assert!(
+        build_state_with_registrations(selected, &[seam_probe::builder()]).is_ok(),
+        "should build state with an entry naming a middleware the module supplies"
+    );
+
+    let unselected = settings_with(&format!("{HMAC_BLOCK}{ENTRY}"));
+    let error = build_state_with_registrations(unselected, &[seam_probe::builder()])
+        .err()
+        .expect("should refuse to start when an entry names a middleware that does not run");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("[[fetch]] entry 1 names `testing.seam-probe`")
+            && message.contains("`testing.seam-probe` is a module no section selects"),
+        "should name the entry and say why the middleware is not running: {message}"
+    );
+}
+
 /// `[geo] module` naming a selected module that supplies no geo module is a
 /// startup error, raised where this adapter builds its state.
 #[test]

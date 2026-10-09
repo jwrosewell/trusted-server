@@ -228,6 +228,7 @@ fail and the service will return its startup-error response.
 | `[demand]`                                                                                                        | several modules       | The auction's demand sources                                                                |
 | `[device]`                                                                                                        | one module            | Device classification                                                                       |
 | `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
+| `[[fetch]]`                                                                                                       | nothing               | Which page changes run on which pages, and in what order                                    |
 | `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
 | `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
@@ -1723,6 +1724,53 @@ behind after a module is switched off is caught rather than sitting unread.
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
 `[ad-server.<name>]`.
+
+### Placing page changes
+
+A module can supply a change it makes to a page as a middleware, and a
+middleware runs only on the pages where an entry names it. Selecting the
+module makes its middleware available, and the `[[fetch]]` entries say which
+pages each one runs on and in what order.
+
+| Field        | Type             | Required | Description                                                                            |
+| ------------ | ---------------- | -------- | -------------------------------------------------------------------------------------- |
+| `media_type` | String           | Yes      | The media type the entry covers. Only `text/html` is accepted                          |
+| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, the entry covers every path |
+| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it     |
+
+A page takes the first entry that covers it and runs that entry's middleware
+alone. Entries are therefore written from the longest path to the entry with
+no path, and a folder is written with its closing slash, because `/news` also
+begins `/newsletter`.
+
+```toml
+[[fetch]]
+media_type = "text/html"
+path = "/news/"
+middleware = ["tag.example.cleanup", "tag.example"]
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["tag.example"]
+```
+
+A fetch middleware runs on the page as the origin sent it. It is told nothing
+about the reader, because what it leaves is what a
+[shared template](#shared-template-assembly-assembly-mode-esi) stores for
+every reader, and the entries are part of what selects a stored template, so
+changing them never serves a page built under the old ones.
+
+A middleware takes its settings from its module's own `[<section>.<name>]`
+table. An entry carries none and switches nothing on.
+
+An entry that could not do what it says refuses the configuration, both when
+a deployment is validated and when the settings load. That is a media type
+other than `text/html`, a path that does not start with `/` or that holds a
+`*`, a `?` or a `#`, an entry that names no middleware or names one twice, a
+key an entry does not read, and an entry that an earlier one already covers.
+An entry naming a middleware that no running module supplies refuses startup,
+and the message lists the names that could be written. A middleware that no
+entry names changes no page, and startup logs a warning that names it.
 
 The sections below give each module's settings, and the integration guides
 describe what each one does.
@@ -3229,6 +3277,11 @@ from the file, and startup checks the rest and runs the first set again.
 - Each integration validates its own block, selected or not, so a typo in a
   block that is switched off is still caught
 
+**Page changes**:
+
+- Every `[[fetch]]` entry covers `text/html`, has a path no earlier entry
+  already covers, and names at least one middleware, each once
+
 ### Checked when the service starts
 
 Everything above runs again on the loaded configuration, and these join it:
@@ -3237,6 +3290,9 @@ Everything above runs again on the loaded configuration, and these join it:
   this build does not have, a missing settings table, or a table the selector
   does not name, stops the service on its next start. A passing
   `ts config validate` is not proof that a change to those four will start
+- The middleware each `[[fetch]]` entry names. A name no running module
+  supplies stops the service on its next start, because which middleware a
+  build has is only known where its modules are registered
 - Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
   or a weak handler password fails here
 - The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`

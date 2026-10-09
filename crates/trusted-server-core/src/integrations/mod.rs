@@ -717,6 +717,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // the same tests.
     #[cfg(test)]
     registry_test_support::deferred_fixture::BUILDER,
+    // A stand-in for a module that changes a page through middleware, for
+    // the same tests.
+    #[cfg(test)]
+    registry_test_support::middleware_fixture::BUILDER,
     // A stand-in for the plainest demand implementation there can be, which
     // core's own tests name where they need a source.
     #[cfg(test)]

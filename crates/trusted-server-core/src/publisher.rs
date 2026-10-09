@@ -630,6 +630,8 @@ struct ProcessResponseParams<'a> {
     origin_url: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
+    /// See [`OwnedProcessResponseParams::request_path`].
+    request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
@@ -676,6 +678,7 @@ impl PublisherBodyProcessor {
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,
+                request_path: &params.request_path,
                 settings,
                 integration_registry,
                 permissions_script: permissions_script_for(params, settings),
@@ -760,6 +763,7 @@ fn process_response_streaming<W: Write>(
             origin_host: params.origin_host,
             request_host: params.request_host,
             request_scheme: params.request_scheme,
+            request_path: params.request_path,
             settings: params.settings,
             integration_registry: params.integration_registry,
             permissions_script: params.permissions_script.map(str::to_string),
@@ -1317,6 +1321,8 @@ struct HtmlStreamProcessorParams<'a> {
     origin_host: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
+    /// See [`OwnedProcessResponseParams::request_path`].
+    request_path: &'a str,
     settings: &'a Settings,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
@@ -1513,7 +1519,8 @@ fn deferred_inline_seam_token(
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     let config = HtmlProcessorConfig::from_settings(
         params.settings,
@@ -1547,7 +1554,16 @@ fn create_html_stream_processor(
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed);
 
-    Ok(create_html_processor(config))
+    // The middleware of the first [[fetch]] entry covering this path. What
+    // they leave is what a shared template stores.
+    let chain = params.integration_registry.middleware_chain(
+        &params.settings.fetch,
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        params.request_path,
+    );
+    create_html_processor_with_middleware(config, &chain)
+        .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
 }
 
 /// Result of publisher request handling, indicating whether the response body
@@ -1731,6 +1747,9 @@ pub struct OwnedProcessResponseParams {
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
+    /// The path the reader asked for, which decides the `[[fetch]]` entry
+    /// that covers the document.
+    pub(crate) request_path: String,
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
@@ -2182,6 +2201,8 @@ fn build_template_assembly_params(
         origin_url: settings.publisher.origin_url.clone(),
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
+        // Set by the caller, with the rest of what belongs to the request.
+        request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
@@ -2951,6 +2972,7 @@ pub fn stream_publisher_body<W: Write>(
         origin_url: &params.origin_url,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
+        request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
         integration_registry,
@@ -3057,6 +3079,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
+        request_path: &params.request_path,
         settings,
         integration_registry,
         permissions_script: permissions_script_for(params, settings),
@@ -5198,6 +5221,7 @@ pub async fn handle_publisher_request(
                         ad_bids_state.clone(),
                         permissions_json.clone(),
                     );
+                    params.request_path.clone_from(&request_path);
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -5571,6 +5595,7 @@ pub async fn handle_publisher_request(
                     origin_url: settings.publisher.origin_url.clone(),
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
+                    request_path: request_path.clone(),
                     content_type,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
@@ -9215,6 +9240,7 @@ mod tests {
             origin_url: settings.publisher.origin_url.clone(),
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
+            request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -9830,6 +9856,50 @@ mod tests {
                     .expect("should insert the stand-in's table");
             }
             settings
+        }
+
+        #[test]
+        fn the_fetch_entries_change_the_fingerprint() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+            use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+            // What a fetch middleware writes is stored with the template, so
+            // which run, in what order and on which paths all select one.
+            let fingerprint_with = |entries: &[(Option<&str>, &[&str])]| {
+                let mut settings = create_test_settings();
+                settings.select_module("testing", fixture::MODULE);
+                settings.fetch = PhaseEntries::new(
+                    entries
+                        .iter()
+                        .map(|(path, names)| PhaseEntry {
+                            media_type: HTML_MEDIA_TYPE.to_owned(),
+                            path: path.map(str::to_owned),
+                            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+                        })
+                        .collect(),
+                );
+                fingerprint(&settings)
+            };
+
+            let fingerprints = [
+                fingerprint_with(&[]),
+                fingerprint_with(&[(None, &[fixture::HEAD])]),
+                fingerprint_with(&[(None, &[fixture::HEAD, fixture::LINKS])]),
+                fingerprint_with(&[(None, &[fixture::LINKS, fixture::HEAD])]),
+                fingerprint_with(&[(Some("/news/"), &[fixture::HEAD])]),
+            ];
+
+            for (index, fingerprint) in fingerprints.iter().enumerate() {
+                assert!(
+                    !fingerprints[..index].contains(fingerprint),
+                    "entries {index} must select a template of their own"
+                );
+            }
+            assert_eq!(
+                fingerprint_with(&[(None, &[fixture::HEAD])]),
+                fingerprints[1],
+                "the same entries must select the same template"
+            );
         }
 
         #[test]
@@ -11046,6 +11116,145 @@ mod tests {
                 last_summary_row(&sink).is_some(),
                 "the harness must emit a summary row, or every assertion built on it is vacuous"
             );
+        }
+
+        /// [`settings_with_mode`], with core's middleware stand-in selected
+        /// under `label` and one `[[fetch]]` entry naming `names` for `path`.
+        fn settings_with_fetch_entry(
+            mode: &str,
+            label: &str,
+            path: Option<&str>,
+            names: &[&str],
+        ) -> Settings {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_mode(mode);
+            settings
+                .insert_module_config(
+                    "testing",
+                    fixture::MODULE,
+                    &serde_json::json!({ "label": label }),
+                )
+                .expect("should select the middleware stand-in");
+            settings.fetch =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: path.map(str::to_owned),
+                    middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+                }]);
+            settings
+        }
+
+        /// [`navigation_request`], for another path of the same site.
+        fn navigation_request_for(path: &str) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            *request.uri_mut() = format!("https://ts.example.com{path}")
+                .parse()
+                .expect("should build the address");
+            request
+        }
+
+        async fn page_of(response: Response<EdgeBody>) -> String {
+            String::from_utf8(body_of(response).await).expect("should serve a UTF-8 page")
+        }
+
+        #[tokio::test]
+        async fn a_fetch_middleware_changes_a_page_under_the_path_its_entry_covers() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_fetch_entry(
+                    "inline",
+                    label,
+                    Some("/article"),
+                    &[fixture::HEAD],
+                ));
+                let marker = fixture::head_marker(label);
+
+                queue_shareable_html(&stub);
+                let covered =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                assert_eq!(
+                    covered.matches(&marker).count(),
+                    1,
+                    "should run the entry's middleware once on a {label} page under its path, \
+                     with the module's own setting: {covered}"
+                );
+
+                queue_shareable_html(&stub);
+                let elsewhere = page_of(
+                    run_via(
+                        &settings,
+                        &services,
+                        navigation_request_for("/elsewhere"),
+                        finalizer,
+                    )
+                    .await,
+                )
+                .await;
+                assert!(
+                    elsewhere.contains("origin") && !elsewhere.contains(&marker),
+                    "should run nothing on a {label} page no entry covers: {elsewhere}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn what_a_fetch_middleware_writes_is_stored_with_the_shared_template() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_fetch_entry(
+                    "esi",
+                    label,
+                    None,
+                    &[fixture::HEAD],
+                ));
+                let marker = fixture::head_marker(label);
+                // One answer from the origin, so the second reader can only
+                // be served from the store.
+                queue_shareable_html(&stub);
+
+                let first =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                let second =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents().len(),
+                    1,
+                    "should serve the second {label} reader from the stored template"
+                );
+                for (reader, page) in [("first", &first), ("second", &second)] {
+                    assert_eq!(
+                        page.matches(&marker).count(),
+                        1,
+                        "should serve the {reader} {label} reader what the middleware wrote, \
+                         once: {page}"
+                    );
+                }
+            }
         }
 
         /// Drive `handle_publisher_request` through the **EC-preload** fetch path.
@@ -20294,6 +20503,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20328,6 +20538,169 @@ mod tests {
         );
     }
 
+    /// A selector is chosen for each document, so one that does not parse
+    /// cannot be refused when the settings load. The response is refused
+    /// instead of the parser panicking.
+    #[test]
+    fn a_middleware_whose_selector_does_not_parse_refuses_the_response() {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN.to_owned()],
+        }]);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+
+        let mut output = Vec::new();
+        let error = stream_publisher_body(
+            EdgeBody::from(b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect_err("should refuse a page whose middleware cannot run");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "the fetch middleware `{}` cannot run",
+                fixture::BROKEN
+            )) && message.contains(&format!(
+                "`{}` is not a usable selector",
+                fixture::BROKEN_SELECTOR
+            )),
+            "should name the middleware and the selector: {message}"
+        );
+        assert_eq!(
+            error.current_context().status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer as a fault of the deployment's own"
+        );
+        assert!(output.is_empty(), "should write nothing of the page");
+    }
+
+    /// The same refusal through each finalizer, so an adapter answers with an
+    /// error where it would otherwise send the headers of a page it cannot
+    /// deliver.
+    #[tokio::test]
+    async fn a_middleware_whose_selector_does_not_parse_fails_the_response_through_each_finalizer()
+    {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN.to_owned()],
+        }]);
+        let settings = Arc::new(settings);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let services = noop_services();
+        let page = || PublisherResponse::Stream {
+            response: Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(EdgeBody::empty())
+                .expect("should build the response"),
+            body: EdgeBody::from(
+                b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
+            ),
+            params: Box::new(OwnedProcessResponseParams {
+                csp_nonce_observed: None,
+                template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
+                ad_slots_script: None,
+                ad_bids_state: AdBidsState::default(),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+                request_state: IntegrationRequestState::default(),
+            }),
+        };
+
+        let streamed = publisher_response_into_streaming_response(
+            page(),
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            services.clone(),
+        )
+        .await;
+        let buffered = buffer_publisher_response_async(
+            page(),
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await;
+
+        for (finalizer, result) in [("streaming", streamed), ("buffered", buffered)] {
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("should fail the response in the {finalizer} finalizer"));
+            assert!(
+                error.to_string().contains(&format!(
+                    "the fetch middleware `{}` cannot run",
+                    fixture::BROKEN
+                )),
+                "should name the middleware in the {finalizer} finalizer: {error}"
+            );
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should answer as a fault of the deployment's own in the {finalizer} finalizer"
+            );
+        }
+    }
+
     /// Empty origin body on the streaming route must produce no output
     /// without erroring. Exercises the `Ok(0)` branch of `process_chunks`
     /// plus the processor's `is_last=true, chunk=[]` terminal call.
@@ -20353,6 +20726,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20401,6 +20775,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20529,6 +20904,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -20595,6 +20971,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -20664,6 +21041,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -20733,6 +21111,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -20802,6 +21181,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -20851,6 +21231,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -21076,6 +21457,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: Some(
@@ -21153,6 +21535,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: Some(
@@ -21232,6 +21615,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21305,6 +21689,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -21460,6 +21845,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -22132,6 +22518,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -22329,6 +22716,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -22410,6 +22798,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -22474,6 +22863,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -22586,6 +22976,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -22647,6 +23038,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,

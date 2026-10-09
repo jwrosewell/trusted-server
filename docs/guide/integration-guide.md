@@ -17,6 +17,8 @@ Axum, or Spin SDK types.
 - `IntegrationHtmlPostProcessor` is for bounded whole-document work that
   cannot be performed during streaming.
 - `IntegrationRequestFilter` makes an early request decision.
+- `Middleware` changes a page, on the pages where the operator's settings
+  place it. See [Changing a page](#changing-a-page).
 
 Build one `IntegrationRegistration` with only the hooks the feature needs.
 Use `with_deferred_js()` only for a separately loaded integration module and
@@ -306,6 +308,7 @@ builder every integration uses.
 | `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
 | `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
 | `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                |
+| `.with_middleware(...)`                               | Offers a page change that a `[[fetch]]` entry may place by the middleware's name    |
 | `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`     |
 | `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
 | `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
@@ -341,6 +344,115 @@ selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
 module of that type.
+
+### Changing a page
+
+A middleware is a page change that the operator's settings place. The module
+registers each one with `.with_middleware(...)`, and it runs only on the
+pages where an entry names it, in the order that entry gives. See
+[Placing page changes](/guide/configuration#placing-page-changes).
+
+The fixture below loads a vendor's tag from a first-party path and marks the
+head. The documentation test extracts this exact fence and compiles it as an
+isolated crate.
+
+<!-- documentation-snippet:middleware:start -->
+
+```rust
+use std::rc::Rc;
+use std::sync::Arc;
+
+use trusted_server_core::integrations::{AttributeRewriteAction, IntegrationRegistration};
+use trusted_server_core::middleware::{
+    AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+};
+
+/// The tag the vendor serves, and the first-party path it is loaded from
+/// instead.
+const VENDOR_TAG: &str = "https://cdn.vendor.example/tag.js";
+const FIRST_PARTY_TAG: &str = "/integrations/example_tag/tag.js";
+
+/// Loads the vendor's tag from a first-party path, and says so in the head.
+pub struct ExampleTag;
+
+impl Middleware for ExampleTag {
+    fn middleware_id(&self) -> &'static str {
+        "tag.example"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec!["<meta name=\"example-tag\" content=\"first-party\">".to_owned()],
+            element_handlers: vec![Box::new(AttributeRewrite::matching(
+                "script[src]",
+                "src",
+                Rc::new(|matched| {
+                    if matched.value == VENDOR_TAG {
+                        AttributeRewriteAction::replace(FIRST_PARTY_TAG)
+                    } else {
+                        AttributeRewriteAction::keep()
+                    }
+                }),
+            ))],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// What the module's build function returns.
+pub fn registration() -> IntegrationRegistration {
+    IntegrationRegistration::builder("example_tag")
+        .without_js()
+        .with_middleware(Arc::new(ExampleTag))
+        .build()
+}
+```
+
+<!-- documentation-snippet:middleware:end -->
+
+A middleware is asked once for each document, by `create`, and what it
+answers is used for that document alone, so a handler may hold state between
+the chunks of one script. The answer is a `MiddlewareAction`, which may set
+any of five things.
+
+| Field                  | What it does                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- |
+| `head_inserts`         | Writes markup at the start of `<head>`, ahead of the script bundle                                       |
+| `after_bundle_inserts` | Writes markup straight after the script bundle, for a script that needs the bundle to have run           |
+| `element_handlers`     | For the elements a CSS selector matches, keeps the element, replaces one attribute's value or removes it |
+| `text_handlers`        | For the text inside the elements a CSS selector matches, keeps a chunk, replaces it or removes it        |
+| `stream`               | Runs a stream processor over the document the handlers left                                              |
+
+A middleware can rely on these rules.
+
+- The middleware of one entry run in the order the entry names them. Two
+  handlers that match one element, or one script, are both asked, and each is
+  handed what the one before it left.
+- An element handler is asked after core has moved the origin's address in
+  the attribute to the reader's host, and an element an earlier handler
+  removed is not asked about again.
+- A script's text arrives in chunks. A handler that needs the whole script
+  removes each chunk while keeping a copy, and writes back what it kept with
+  the last chunk. A replacement is written as it is, with no character
+  escaped.
+- A fetch middleware is told nothing about the reader, because what it leaves
+  is what a shared template stores. `MiddlewareContext::document_state` is
+  shared by the middleware working on one document, and holds nothing a
+  request left.
+- A selector that does not parse fails the response with a `500` and a
+  message naming the middleware. A middleware chooses its selectors for each
+  document, so they cannot be checked when the service starts.
+
+A middleware's name is the module's own name, as `module_name!()` gives it,
+with a part of its own after it when the module supplies several, such as
+`tag.example` and `tag.example.cleanup`. Startup refuses two registrations
+that supply one name, and a name an entry could not write. A middleware reads
+its settings from the module's own table, which the build function is
+handed.
 
 ### What a module is handed
 

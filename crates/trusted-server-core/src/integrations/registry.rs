@@ -18,6 +18,7 @@ use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
+use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
@@ -782,6 +783,11 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// The page changes this registration supplies, see [`crate::middleware`].
+    ///
+    /// Declaring one does not make it run, because a middleware changes a
+    /// page only where an entry of the settings names it.
+    pub middleware: Vec<Arc<dyn Middleware>>,
     /// Geo module this registration supplies, with the name `[geo] module`
     /// selects it by.
     ///
@@ -830,6 +836,7 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -876,6 +883,18 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
+        self
+    }
+
+    /// Declare a page change this registration supplies, see
+    /// [`crate::middleware`]. Called once for each one.
+    ///
+    /// The middleware changes a page only where an entry of the settings
+    /// names it, and one no entry names is logged as a warning when the
+    /// registry is built.
+    #[must_use]
+    pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
+        self.registration.middleware.push(middleware);
         self
     }
 
@@ -998,6 +1017,9 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    // The middleware the running registrations supply, each against the
+    // integration that supplied it, in registration order.
+    middleware: Vec<(&'static str, Arc<dyn Middleware>)>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
@@ -1049,6 +1071,7 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            middleware: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
             response_finalizers: Vec::new(),
@@ -1087,6 +1110,35 @@ const DEVICE_TYPE: &str = "device";
 const GEO_TYPE: &str = "geo";
 
 impl IntegrationRegistryInner {
+    /// The registered middleware an entry means by `name`.
+    fn middleware_named(&self, name: &str) -> Option<&Arc<dyn Middleware>> {
+        self.middleware
+            .iter()
+            .map(|(_, middleware)| middleware)
+            .find(|middleware| middleware.middleware_id() == name)
+    }
+
+    /// A sentence to follow the refusal of a middleware name an entry wrote,
+    /// when the name is that of a module no section selects, or begins with
+    /// one. Empty otherwise.
+    fn unselected_module_note(&self, name: &str) -> String {
+        self.builder_modules
+            .iter()
+            .find(|(module, selected)| {
+                !*selected
+                    && name
+                        .strip_prefix(*module)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            })
+            .map(|(module, _)| {
+                format!(
+                    ". `{module}` is a module no section selects, so nothing it supplies is \
+                     running"
+                )
+            })
+            .unwrap_or_default()
+    }
+
     /// A sentence to follow the refusal of a name a selector wrote, when the
     /// name is a builder's module: one no section selects, which is why
     /// nothing it supplies is running, or one that is selected and supplies no
@@ -1373,6 +1425,113 @@ pub struct ProxyDispatchInput<'a> {
     pub req: Request<EdgeBody>,
 }
 
+/// Refuses a registered middleware no entry could name, and an entry this
+/// deployment cannot run.
+///
+/// Only knowable here, where every running module's middleware have been
+/// handed over. A name no module supplies, or one named in a phase it does not
+/// run in, would otherwise do nothing on every request and say so nowhere.
+///
+/// A middleware no entry names is left alone and logged, because a module
+/// may be selected for what else it does.
+///
+/// # Errors
+///
+/// Naming the integration or the entry at fault.
+fn check_middleware(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<(), Report<TrustedServerError>> {
+    let refuse = |message: String| Report::new(TrustedServerError::Configuration { message });
+    let phases_of = |middleware: &Arc<dyn Middleware>| -> Vec<String> {
+        middleware
+            .phases()
+            .iter()
+            .map(|phase| format!("[[{phase}]]"))
+            .collect()
+    };
+    for (position, (integration, middleware)) in inner.middleware.iter().enumerate() {
+        let id = middleware.middleware_id();
+        if !crate::module_name::is_valid(id) {
+            return Err(refuse(format!(
+                "integration `{integration}` supplies a middleware named `{id}`, which is not a \
+                 name an entry can write. A name is parts joined by `.`, each in lower case \
+                 letters, digits, `_` or `-`"
+            )));
+        }
+        if middleware.phases().is_empty() {
+            return Err(refuse(format!(
+                "integration `{integration}` supplies the middleware `{id}`, which says it runs \
+                 in no phase, so no entry could name it"
+            )));
+        }
+        if let Some((earlier, _)) = inner.middleware[..position]
+            .iter()
+            .find(|(_, earlier)| earlier.middleware_id() == id)
+        {
+            return Err(refuse(format!(
+                "integrations `{earlier}` and `{integration}` both supply a middleware named \
+                 `{id}`, so an entry could not say which one it means"
+            )));
+        }
+    }
+    for phase in MiddlewarePhase::ALL {
+        for (index, entry) in settings.phase_entries(phase).entries().iter().enumerate() {
+            let at = format!("[[{phase}]] entry {}", index + 1);
+            for name in &entry.middleware {
+                let Some(middleware) = inner.middleware_named(name) else {
+                    let supplied: Vec<&str> = inner
+                        .middleware
+                        .iter()
+                        .map(|(_, middleware)| middleware.middleware_id())
+                        .collect();
+                    return Err(refuse(format!(
+                        "{at} names `{name}`, which no module that runs supplies. The \
+                         middleware the running modules supply is [{}]{}",
+                        supplied.join(", "),
+                        inner.unselected_module_note(name)
+                    )));
+                };
+                if !middleware.phases().contains(&phase) {
+                    return Err(refuse(format!(
+                        "{at} names `{name}`, which does not run in that phase. It runs in {}",
+                        phases_of(middleware).join(" and ")
+                    )));
+                }
+            }
+        }
+    }
+    for (integration, middleware) in unnamed_middleware(settings, inner) {
+        log::warn!(
+            "Integration `{integration}` supplies the middleware `{}` and no {} entry names \
+             it, so it changes no page",
+            middleware.middleware_id(),
+            phases_of(middleware).join(" or ")
+        );
+    }
+    Ok(())
+}
+
+/// The middleware no entry names in a phase it runs in, each with the
+/// integration that supplies it, in registration order.
+fn unnamed_middleware<'a>(
+    settings: &Settings,
+    inner: &'a IntegrationRegistryInner,
+) -> Vec<(&'static str, &'a Arc<dyn Middleware>)> {
+    inner
+        .middleware
+        .iter()
+        .filter(|(_, middleware)| {
+            let id = middleware.middleware_id();
+            !middleware
+                .phases()
+                .iter()
+                .any(|phase| settings.phase_entries(*phase).names().contains(&id))
+        })
+        .map(|(integration, middleware)| (*integration, middleware))
+        .collect()
+}
+
 /// In-memory registry of integrations discovered from settings.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
@@ -1644,6 +1803,11 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
+            for middleware in registration.middleware {
+                inner
+                    .middleware
+                    .push((registration.integration_id, middleware));
+            }
             if let Some((name, module)) = registration.geo_module {
                 claim_module_name(&mut claimed, "geo", name, registration.integration_id)?;
                 inner.geo_modules.push((name, module));
@@ -1723,6 +1887,7 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
+        check_middleware(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -1758,6 +1923,36 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
+    }
+
+    /// The name of every middleware a running module supplies, in
+    /// registration order.
+    #[must_use]
+    pub fn middleware_ids(&self) -> Vec<&'static str> {
+        self.inner
+            .middleware
+            .iter()
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect()
+    }
+
+    /// The middleware the first entry covering a response selects, in the
+    /// order they run, for a response of `media_type` to a request for `path`.
+    /// A response no entry covers gives an empty chain.
+    #[must_use]
+    pub fn middleware_chain(
+        &self,
+        entries: &PhaseEntries,
+        phase: MiddlewarePhase,
+        media_type: &str,
+        path: &str,
+    ) -> MiddlewareChain {
+        let middleware = entries
+            .for_response(media_type, path)
+            .iter()
+            .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
+            .collect();
+        MiddlewareChain::new(phase, middleware)
     }
 
     /// Every integration id the registry was built from, named or not, in
@@ -2305,6 +2500,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2348,6 +2544,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2387,6 +2584,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                middleware: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2466,6 +2664,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2856,6 +3055,153 @@ pub(crate) mod test_support {
                         label: config.label,
                         timeout_ms: config.timeout_ms,
                     }))
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
+    /// A stand-in for a module that changes a page through middleware, for
+    /// core's own tests of the entries and of the page path.
+    ///
+    /// Selected, it supplies three fetch middleware. The one under the
+    /// module's own name writes a marker carrying the module's `label`
+    /// setting at the start of `<head>`. The one named `.links` points every
+    /// link that carries `data-fixture` at a fixed path. The one named
+    /// `.broken` asks for a selector that does not parse.
+    pub(crate) mod middleware_fixture {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{AttributeRewriteAction, IntegrationRegistration};
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+        };
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "middleware_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.middleware-fixture";
+        /// The name of the middleware that marks the head.
+        pub(crate) const HEAD: &str = MODULE;
+        /// The name of the middleware that moves links.
+        pub(crate) const LINKS: &str = "testing.middleware-fixture.links";
+        /// The name of the middleware whose selector does not parse.
+        pub(crate) const BROKEN: &str = "testing.middleware-fixture.broken";
+        /// Where the links middleware points a link.
+        pub(crate) const LINK_TARGET: &str = "/fixture/link";
+        /// The selector the broken middleware asks for.
+        pub(crate) const BROKEN_SELECTOR: &str = "a[";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            label: String,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        /// The marker the head middleware writes for `label`.
+        pub(crate) fn head_marker(label: &str) -> String {
+            format!("<meta name=\"middleware-fixture\" content=\"{label}\">")
+        }
+
+        struct Head {
+            label: String,
+        }
+
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                HEAD
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    head_inserts: vec![head_marker(&self.label)],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Links;
+
+        impl Middleware for Links {
+            fn middleware_id(&self) -> &'static str {
+                LINKS
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        "a[data-fixture]",
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::replace(LINK_TARGET)),
+                    ))],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Broken;
+
+        impl Middleware for Broken {
+            fn middleware_id(&self) -> &'static str {
+                BROKEN
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        BROKEN_SELECTOR,
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::keep()),
+                    ))],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .without_js()
+                    .with_middleware(Arc::new(Head {
+                        label: config.label,
+                    }))
+                    .with_middleware(Arc::new(Links))
+                    .with_middleware(Arc::new(Broken))
                     .build(),
             ))
         }
@@ -3260,11 +3606,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::middleware_fixture as fixture;
     use super::test_support::{
         PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, probe_registration, validate_nothing,
     };
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewareAction, MiddlewareContext, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
@@ -5892,6 +6240,307 @@ mod tests {
                 && message.contains("`geo-probe`")
                 && message.contains("`geo-second`"),
             "error should name the module and both integrations: {message}"
+        );
+    }
+
+    fn html_entry(path: Option<&str>, names: &[&str]) -> PhaseEntry {
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: path.map(str::to_owned),
+            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    /// Settings that select core's middleware stand-in and hold `entries`.
+    fn fixture_settings_with_entries(entries: Vec<PhaseEntry>) -> Settings {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(entries);
+        settings
+    }
+
+    #[test]
+    fn a_selected_module_s_middleware_run_where_an_entry_names_them() {
+        let settings = fixture_settings_with_entries(vec![
+            html_entry(Some("/news/"), &[fixture::LINKS, fixture::HEAD]),
+            html_entry(None, &[fixture::HEAD]),
+        ]);
+
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should build a registry whose entries name registered middleware");
+
+        assert_eq!(
+            registry.middleware_ids(),
+            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            "should list the middleware the selected module supplies"
+        );
+        let chain_for = |media_type: &str, path: &str| {
+            registry
+                .middleware_chain(&settings.fetch, MiddlewarePhase::Fetch, media_type, path)
+                .ids()
+        };
+        assert_eq!(
+            chain_for(HTML_MEDIA_TYPE, "/news/today"),
+            [fixture::LINKS, fixture::HEAD],
+            "should run the first covering entry's middleware in the order it names them"
+        );
+        assert_eq!(chain_for(HTML_MEDIA_TYPE, "/"), [fixture::HEAD]);
+        assert!(
+            chain_for("text/css", "/news/site.css").is_empty(),
+            "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn a_module_no_section_selects_supplies_no_middleware() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+
+        assert!(
+            !registry.middleware_ids().contains(&fixture::HEAD),
+            "should register nothing of a module that does not run"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_middleware_nothing_supplies_is_refused_with_what_is_supplied() {
+        let settings = fixture_settings_with_entries(vec![
+            html_entry(Some("/news/"), &[fixture::HEAD]),
+            html_entry(None, &[fixture::HEAD, "testing.nothing"]),
+        ]);
+
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse an entry naming a middleware nothing supplies");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
+            ) && message.contains(&format!(
+                "[{}, {}, {}]",
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN
+            )),
+            "should name the entry and list what could be named: {message}"
+        );
+        assert!(
+            !message.contains("no section selects"),
+            "should not blame a selection when the name is no module's: {message}"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_the_middleware_of_a_module_no_section_selects_says_so() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::LINKS])]);
+
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse an entry naming the middleware of a module that does not run");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[fetch]] entry 1 names `{}`", fixture::LINKS))
+                && message.contains(&format!(
+                    "`{}` is a module no section selects, so nothing it supplies is running",
+                    fixture::MODULE
+                )),
+            "should say the module is not selected: {message}"
+        );
+    }
+
+    #[test]
+    fn a_middleware_no_entry_names_is_listed_for_the_startup_warning() {
+        let unnamed = |entries: Vec<PhaseEntry>| -> Vec<&'static str> {
+            let settings = fixture_settings_with_entries(entries);
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            unnamed_middleware(&settings, &registry.inner)
+                .into_iter()
+                .map(|(integration, middleware)| {
+                    assert_eq!(integration, fixture::ID, "should name the supplier");
+                    middleware.middleware_id()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            unnamed(Vec::new()),
+            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            "should list every middleware when there are no entries"
+        );
+        assert_eq!(
+            unnamed(vec![
+                html_entry(Some("/news/"), &[fixture::LINKS]),
+                html_entry(None, &[fixture::HEAD]),
+            ]),
+            [fixture::BROKEN],
+            "should leave out a middleware any entry names"
+        );
+    }
+
+    /// A middleware under a name of the test's choosing, running in the
+    /// phases given.
+    struct Named {
+        id: &'static str,
+        phases: &'static [MiddlewarePhase],
+    }
+
+    impl Middleware for Named {
+        fn middleware_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn phases(&self) -> &[MiddlewarePhase] {
+            self.phases
+        }
+
+        fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+            MiddlewareAction::pass()
+        }
+    }
+
+    const FETCH_ONLY: &[MiddlewarePhase] = &[MiddlewarePhase::Fetch];
+
+    fn first_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("first_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.shared-name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn second_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("second_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.shared-name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn misnamed_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("misnamed_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "Not A Name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn phaseless_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("phaseless_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.phaseless",
+                    phases: &[],
+                }))
+                .build(),
+        ))
+    }
+
+    /// A builder for `register`, selected in `settings` under a module name
+    /// made from its id.
+    fn selected_supplier(
+        settings: &mut Settings,
+        id: &'static str,
+        module: &'static str,
+        register: crate::integrations::IntegrationBuilderFn,
+    ) -> crate::integrations::IntegrationBuilder {
+        settings.select_module("testing", module);
+        crate::integrations::IntegrationBuilder::new(
+            id,
+            "a-vendor-crate",
+            register,
+            validate_nothing,
+        )
+        .with_module_name(module)
+    }
+
+    #[test]
+    fn two_modules_supplying_one_middleware_name_are_refused() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            selected_supplier(
+                &mut settings,
+                "first_supplier",
+                "testing.first-supplier",
+                first_supplier,
+            ),
+            selected_supplier(
+                &mut settings,
+                "second_supplier",
+                "testing.second-supplier",
+                second_supplier,
+            ),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse one middleware name supplied twice");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("`first_supplier` and `second_supplier` both supply a middleware")
+                && message.contains("`testing.shared-name`"),
+            "should name both suppliers and the name: {message}"
+        );
+    }
+
+    #[test]
+    fn a_middleware_no_entry_could_name_is_refused() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [selected_supplier(
+            &mut settings,
+            "misnamed_supplier",
+            "testing.misnamed-supplier",
+            misnamed_supplier,
+        )];
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse a middleware whose name no entry can write");
+        let message = error.to_string();
+        assert!(
+            message.contains("`misnamed_supplier` supplies a middleware named `Not A Name`")
+                && message.contains("not a name an entry can write"),
+            "should name the supplier and the name: {message}"
+        );
+
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [selected_supplier(
+            &mut settings,
+            "phaseless_supplier",
+            "testing.phaseless-supplier",
+            phaseless_supplier,
+        )];
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse a middleware that runs in no phase");
+        let message = error.to_string();
+        assert!(
+            message.contains("`phaseless_supplier` supplies the middleware `testing.phaseless`")
+                && message.contains("runs in no phase"),
+            "should name the supplier and the middleware: {message}"
         );
     }
 }

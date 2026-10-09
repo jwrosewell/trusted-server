@@ -1,7 +1,7 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -9,15 +9,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
-    html_content::{ContentType, EndTag},
+    html_content::{ContentType, EndTag, TextChunk},
     text,
 };
 
 use crate::integrations::{
-    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
-    IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState, IntegrationScriptContext,
-    ScriptRewriteAction,
+    AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
+    IntegrationDocumentState, IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState,
+    IntegrationScriptContext, ScriptRewriteAction,
 };
+use crate::middleware::{MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan};
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -194,6 +195,42 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// The chunk of text being rewritten, as the last handler to change it left
+/// it, shared by every text handler of one document.
+///
+/// The parser hands every handler a chunk as the origin sent it and writes
+/// only the last replacement, so without this a handler would undo the change
+/// of each handler before it.
+#[derive(Default)]
+struct TextEdits(RefCell<String>);
+
+impl TextEdits {
+    /// The chunk as the handlers before this one left it.
+    fn current(&self, chunk: &TextChunk<'_>) -> String {
+        if chunk.removed() {
+            self.0.borrow().clone()
+        } else {
+            chunk.as_str().to_owned()
+        }
+    }
+
+    /// Writes `text` in the chunk's place, as it is.
+    ///
+    /// Written as markup, because a handler is handed the text as the page
+    /// wrote it. Writing it as text would escape `&`, `<` and `>`, and a
+    /// browser decodes none of those inside a script.
+    fn replace(&self, chunk: &mut TextChunk<'_>, text: &str) {
+        chunk.replace(text, ContentType::Html);
+        text.clone_into(&mut self.0.borrow_mut());
+    }
+
+    /// Leaves the chunk out, along with anything an earlier handler wrote in
+    /// its place.
+    fn remove(&self, chunk: &mut TextChunk<'_>) {
+        self.replace(chunk, "");
+    }
+}
+
 /// Create an HTML processor with URL replacement and integration hooks.
 ///
 /// # Panics
@@ -201,11 +238,67 @@ impl HtmlProcessorConfig {
 /// Panics if the `ad_bids_state` `Mutex` is poisoned. This cannot happen in
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
+pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    build_html_processor(config, MiddlewarePlan::default())
+}
+
+/// [`create_html_processor`], with the middleware of `chain` run on the
+/// document as well.
+///
+/// Each middleware is asked once, here, what it will do with this document.
+/// The state the chain shares is the document's own and holds nothing a
+/// request left, because what this processor writes may be stored and served
+/// to other readers.
+///
+/// A middleware's head markup follows the hooks' own. Its element handlers
+/// are asked after core has moved the origin's address in an attribute and
+/// after the hooks. Its text handlers are handed a chunk as the hooks and the
+/// handlers before them left it, and its stream processors run after the
+/// hooks' own.
+///
+/// # Errors
+///
+/// When a handler's selector does not parse, naming the selector.
+///
+/// # Panics
+///
+/// As [`create_html_processor`].
+pub fn create_html_processor_with_middleware(
+    config: HtmlProcessorConfig,
+    chain: &MiddlewareChain,
+) -> Result<impl StreamProcessor + use<>, String> {
+    let document_state = IntegrationDocumentState::default();
+    let plan = chain.plan(&MiddlewareContext {
+        phase: chain.phase(),
+        request_host: &config.request_host,
+        request_scheme: &config.request_scheme,
+        origin_host: &config.origin_host,
+        document_state: &document_state,
+        max_buffered_script_bytes: config.max_buffered_body_bytes,
+    })?;
+    Ok(build_html_processor(config, plan))
+}
+
+/// The processor behind [`create_html_processor`] and
+/// [`create_html_processor_with_middleware`], carrying out `plan`.
+///
+/// A handler in `plan` whose selector does not parse panics here, which
+/// [`MiddlewareChain::plan`] rules out by refusing to plan one.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the returned processor owns request configuration captured by its handlers"
 )]
-pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+fn build_html_processor(
+    config: HtmlProcessorConfig,
+    plan: MiddlewarePlan,
+) -> impl StreamProcessor + use<> {
+    let MiddlewarePlan {
+        head_inserts: middleware_head_inserts,
+        after_bundle_inserts: middleware_after_bundle_inserts,
+        element_handlers: middleware_element_handlers,
+        text_handlers: middleware_text_handlers,
+        processors: middleware_processors,
+    } = plan;
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
     let document_state = IntegrationDocumentState::default();
     config.request_state.seed(&document_state);
@@ -335,6 +428,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
+                    for insert in &middleware_head_inserts {
+                        snippet.push_str(insert);
+                    }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_parts = integrations.js_parts_immediate();
                     let script_attributes = integrations.tsjs_script_tag_attributes();
@@ -346,6 +442,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     // the page's own scripts in the origin head.
                     for insert in integrations.after_bundle_inserts(&ctx) {
                         snippet.push_str(&insert);
+                    }
+                    for insert in &middleware_after_bundle_inserts {
+                        snippet.push_str(insert);
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
@@ -668,15 +767,51 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
+    // Asked after core has moved the origin's address in an attribute and
+    // after the hooks, so a handler judges an address as it will be served.
+    for mut handler in middleware_element_handlers {
+        let selector = handler.selector().to_owned();
+        let attribute = handler.attribute().to_owned();
+        element_content_handlers.push(element!(selector, move |el| {
+            if el.removed() {
+                return Ok(());
+            }
+            let Some(value) = el.get_attribute(&attribute) else {
+                return Ok(());
+            };
+            let element_name = el.tag_name();
+            match handler.decide(&MatchedAttribute {
+                element_name: &element_name,
+                attribute_name: &attribute,
+                value: &value,
+            }) {
+                AttributeRewriteAction::Keep => {}
+                AttributeRewriteAction::Replace(replacement) => {
+                    if replacement != value {
+                        el.set_attribute(&attribute, &replacement)?;
+                    }
+                }
+                AttributeRewriteAction::RemoveElement => el.remove(),
+            }
+            Ok(())
+        }));
+    }
+
+    // Shared by every text handler below, the hooks' and the middleware's,
+    // so each is handed a chunk as the one before it left it.
+    let edits = Rc::new(TextEdits::default());
+
     for script_rewriter in script_rewriters {
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
         let patterns = patterns.clone();
         let document_state = document_state.clone();
+        let edits = Rc::clone(&edits);
         element_content_handlers.push(text!(selector, {
             let rewriter = rewriter.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let edits = Rc::clone(&edits);
             move |text| {
                 let ctx = IntegrationScriptContext {
                     selector,
@@ -687,21 +822,28 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     max_buffered_script_bytes: config.max_buffered_body_bytes,
                     document_state: &document_state,
                 };
-                match rewriter.rewrite(text.as_str(), &ctx) {
+                let current = edits.current(text);
+                match rewriter.rewrite(&current, &ctx) {
                     ScriptRewriteAction::Keep => {}
-                    ScriptRewriteAction::Replace(rewritten) => {
-                        // Written back as markup, because the rewriter was
-                        // handed the text as the page wrote it. Writing it as
-                        // text would escape `&`, `<` and `>`, and a browser
-                        // decodes none of those inside a script.
-                        text.replace(&rewritten, ContentType::Html);
-                    }
-                    ScriptRewriteAction::RemoveNode => {
-                        text.remove();
-                    }
+                    ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
+                    ScriptRewriteAction::RemoveNode => edits.remove(text),
                 }
                 Ok(())
             }
+        }));
+    }
+
+    for mut handler in middleware_text_handlers {
+        let selector = handler.selector().to_owned();
+        let edits = Rc::clone(&edits);
+        element_content_handlers.push(text!(selector, move |text| {
+            let current = edits.current(text);
+            match handler.decide(&current, text.last_in_text_node()) {
+                ScriptRewriteAction::Keep => {}
+                ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
+                ScriptRewriteAction::RemoveNode => edits.remove(text),
+            }
+            Ok(())
         }));
     }
 
@@ -719,10 +861,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         origin_host: config.origin_host.clone(),
         document_state: document_state.clone(),
     };
-    let processors = stream_processor_factories
+    let mut processors: Vec<Box<dyn StreamProcessor>> = stream_processor_factories
         .into_iter()
         .map(|factory| factory.create(stream_context.clone()))
         .collect();
+    processors.extend(middleware_processors);
     HtmlWithStreamingProcessors {
         inner: Box::new(inner),
         processors,
@@ -739,8 +882,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 pub mod test_support {
     use std::io::Cursor;
 
-    use super::{HtmlProcessorConfig, create_html_processor};
+    use super::{HtmlProcessorConfig, create_html_processor_with_middleware};
     use crate::integrations::IntegrationRegistry;
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
@@ -758,9 +902,13 @@ pub mod test_support {
     /// changes whenever any browser module does.
     const BUNDLE_HASH: &str = "BUNDLE-HASH";
 
+    /// The path a test page is asked for at, which decides the entry of the
+    /// settings that covers it.
+    pub const REQUEST_PATH: &str = "/";
+
     /// The page a reader of `html` receives from a deployment running
     /// `settings` with `registry`'s modules, read from the origin `chunk_size`
-    /// bytes at a time.
+    /// bytes at a time and asked for at [`REQUEST_PATH`].
     ///
     /// The script bundle's `?v=` hash is replaced by a fixed word, so a
     /// recording changes when a module's page change does and not when a
@@ -784,13 +932,20 @@ pub mod test_support {
             REQUEST_HOST,
             "https",
         );
+        let chain = registry.middleware_chain(
+            &settings.fetch,
+            MiddlewarePhase::Fetch,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
                 input_compression: Compression::None,
                 output_compression: Compression::None,
                 chunk_size,
             },
-            create_html_processor(config),
+            create_html_processor_with_middleware(config, &chain)
+                .expect("should plan the page's middleware"),
         );
         let mut output = Vec::new();
         pipeline
