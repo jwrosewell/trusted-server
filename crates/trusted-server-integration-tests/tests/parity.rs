@@ -29,8 +29,8 @@ use trusted_server_core::test_support::nextjs_auction;
 /// `get_settings()` rejects by design, so all routers are built through
 /// their `routes_with_settings` testing seams from this known-good config.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
-/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
-/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
+/// `Settings::ADMIN_ENDPOINTS` and the default config, so the admin prefix
+/// is auth-gated exactly as in production.
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
@@ -666,14 +666,12 @@ async fn verify_signature_route_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_unauthenticated_parity() {
-    // Both adapters must return 401 for unauthenticated admin requests on the
-    // canonical `/_ts/admin/keys/*` path that production config auth-gates.
-    // The authenticated-path divergence (Axum→501 no-KV, CF→4xx no-KV)
-    // is separate and not covered here.
-    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/rotate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/rotate", "{}").await;
-    let (spin_status, spin_headers) = spin_post_headers("/_ts/admin/keys/rotate", "{}").await;
+async fn admin_prefix_unauthenticated_parity() {
+    // Every adapter must return 401 for an unauthenticated request beneath
+    // the `/_ts/admin` prefix that production config auth-gates.
+    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/anything", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/anything", "{}").await;
+    let (spin_status, spin_headers) = spin_post_headers("/_ts/admin/anything", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -708,7 +706,7 @@ async fn admin_rotate_unauthenticated_parity() {
         .expect("should be valid UTF-8");
     assert_eq!(
         axum_www_auth, cf_www_auth,
-        "WWW-Authenticate header value must match across adapters for /admin/keys/rotate"
+        "WWW-Authenticate header value must match across adapters beneath /_ts/admin"
     );
     assert!(
         axum_www_auth.starts_with("Basic"),
@@ -730,72 +728,10 @@ async fn admin_rotate_unauthenticated_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_deactivate_unauthenticated_parity() {
-    // Mirror of admin_rotate_unauthenticated_parity for the deactivate endpoint.
-    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/deactivate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/deactivate", "{}").await;
-    let (spin_status, spin_headers) = spin_post_headers("/_ts/admin/keys/deactivate", "{}").await;
-
-    assert_eq!(
-        axum_status, 401,
-        "Axum must return 401 for unauthenticated admin/keys/deactivate"
-    );
-    assert_eq!(
-        cf_status, 401,
-        "Cloudflare must return 401 for unauthenticated admin/keys/deactivate"
-    );
-    assert_eq!(
-        spin_status, 401,
-        "Spin must return 401 for unauthenticated admin/keys/deactivate"
-    );
-    assert_eq!(
-        axum_status, cf_status,
-        "Axum and Cloudflare must return the same status for unauthenticated admin/keys/deactivate"
-    );
-    assert_eq!(
-        cf_status, spin_status,
-        "Cloudflare and Spin must return the same status for unauthenticated admin/keys/deactivate"
-    );
-
-    let axum_www_auth = axum_headers
-        .get("www-authenticate")
-        .expect("Axum 401 on admin/keys/deactivate must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    let cf_www_auth = cf_headers
-        .get("www-authenticate")
-        .expect("Cloudflare 401 on admin/keys/deactivate must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    assert_eq!(
-        axum_www_auth, cf_www_auth,
-        "WWW-Authenticate header value must match across adapters for /admin/keys/deactivate"
-    );
-    assert!(
-        axum_www_auth.starts_with("Basic"),
-        "WWW-Authenticate must use Basic scheme: {axum_www_auth:?}"
-    );
-    let spin_www_auth = spin_headers
-        .get("www-authenticate")
-        .expect("Spin 401 on admin/keys/deactivate must include WWW-Authenticate")
-        .to_str()
-        .expect("should be valid UTF-8");
-    assert_eq!(
-        cf_www_auth, spin_www_auth,
-        "WWW-Authenticate value must match: cf={cf_www_auth:?} spin={spin_www_auth:?}"
-    );
-    assert!(
-        spin_www_auth.starts_with("Basic"),
-        "Spin WWW-Authenticate must use Basic scheme: {spin_www_auth:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spin_legacy_admin_aliases_are_denied_locally_not_proxied() {
+async fn spin_key_aliases_are_answered_here_and_never_proxied() {
     // The production handler regex `^/_ts/admin` only matches the canonical
-    // `/_ts/admin/keys/*` paths. Legacy aliases must therefore fail closed with a
-    // local 404 instead of reaching either the admin handlers or the publisher
-    // fallback.
+    // `/_ts/admin/keys/*` paths. The aliases outside `/_ts` must therefore be
+    // answered here with 404 instead of reaching the publisher fallback.
     for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         let (canonical_status, _) = spin_post_headers(&format!("/_ts{alias}"), "{}").await;
         assert_eq!(
@@ -1020,64 +956,18 @@ async fn unknown_route_returns_same_status_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_admin_aliases_are_denied_locally_not_proxied() {
+async fn key_aliases_are_answered_here_and_never_proxied() {
     // The production handler regex `^/_ts/admin` only matches the canonical
-    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases are not
-    // auth-gated. They must be denied locally with 404 — never routed to the key
-    // handlers (which would execute admin operations), and never left unrouted to
-    // fall through to the publisher fallback, which forwards the request
-    // (including any `Authorization` header and key-management body) to the origin
-    // and leaks admin credentials.
+    // `/_ts/admin/keys/*` paths, so the `/admin/keys/*` aliases are not
+    // auth-gated. They must be answered here with 404 and never reach the
+    // publisher fallback, which forwards the request (including any
+    // `Authorization` header and key-management body) to the origin and leaks
+    // admin credentials.
     //
-    // Primary guard: assert the route tables directly. The legacy aliases must
-    // be registered (to the local deny) so they can never reach the publisher
-    // fallback as an unrouted path.
-    let cf_registered: Vec<(String, String)> = cf_router()
-        .routes()
-        .iter()
-        .map(|route| (route.method().to_string(), route.path().to_string()))
-        .collect();
-    let spin_registered: Vec<(String, String)> = spin_router()
-        .routes()
-        .iter()
-        .map(|route| (route.method().to_string(), route.path().to_string()))
-        .collect();
-    let cf_is_registered =
-        |method: &str, path: &str| cf_registered.iter().any(|(m, p)| m == method && p == path);
-    let spin_is_registered = |method: &str, path: &str| {
-        spin_registered
-            .iter()
-            .any(|(m, p)| m == method && p == path)
-    };
-
-    for path in ["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"] {
-        assert!(
-            cf_is_registered("POST", path),
-            "Cloudflare POST {path} must be a registered route"
-        );
-        assert!(
-            spin_is_registered("POST", path),
-            "Spin POST {path} must be a registered route"
-        );
-    }
-    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
-            assert!(
-                cf_is_registered(method, path),
-                "Cloudflare {method} {path} must be a registered route"
-            );
-            assert!(
-                spin_is_registered(method, path),
-                "Spin {method} {path} must be a registered route"
-            );
-        }
-    }
-
-    // Secondary guard: confirm runtime behavior. Canonical paths challenge
-    // unauthenticated callers (401). Legacy aliases are denied locally with 404
-    // and carry no auth challenge — a reintroduced key handler at these ungated
-    // paths would not return 404, and the publisher fallback would not either, so
-    // 404 proves the local deny ran.
+    // Canonical paths challenge unauthenticated callers (401). The aliases are
+    // answered here with 404 and carry no auth challenge. A key handler at
+    // these ungated paths would not return 404, and the publisher fallback
+    // would not either, so 404 proves the request was answered here.
     for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
         assert_eq!(

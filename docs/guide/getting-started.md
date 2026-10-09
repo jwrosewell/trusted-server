@@ -130,7 +130,7 @@ values in the TOML config, config-store blob, or a source-controlled environment
 file.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
-> geo lookup, config/secret-store writes, or admin key-management routes.
+> geo lookup, or config/secret-store writes.
 > See [Architecture](/guide/architecture) for the full list.
 
 ### Build the Project

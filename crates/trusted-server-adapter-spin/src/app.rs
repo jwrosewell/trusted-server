@@ -377,7 +377,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 15] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -386,11 +386,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
         (CONFIG_PAGE_PATH, &[Method::GET]),
         (CONFIG_JSON_PATH, &[Method::GET]),
         (DATA_PAGE_PATH, &[Method::GET]),
-        ("/_ts/admin/keys/rotate", &[Method::POST]),
-        ("/_ts/admin/keys/deactivate", &[Method::POST]),
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
-        ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
-        ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -608,20 +604,6 @@ fn cache_purge_not_supported() -> Response {
     response
 }
 
-fn admin_key_management_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin key management is not supported on Fermyon Spin.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -634,23 +616,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the Spin adapter.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback, which would forward the caller's `Authorization` header
-/// and key-management payload to the origin.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -847,10 +812,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
             }
-        };
-
-        let admin_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
         let cache_purge_unsupported_handler =
@@ -1089,8 +1050,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             dispatch(s, ctx)
         };
-        let legacy_admin_deny =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
         let mut builder = RouterService::builder()
             // Outermost middleware: strips the configured trusted-client-IP
@@ -1118,17 +1077,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(CONFIG_PAGE_PATH, config_handler.clone())
             .get(CONFIG_JSON_PATH, config_handler)
             .get(DATA_PAGE_PATH, data_handler)
-            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
-            // and the production basic-auth handler regex (`^/_ts/admin`), so they
-            // are auth-gated under a production-shaped config.
-            //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered below
-            // to a local 404 for every publisher-fallback method: the production
-            // handler regex `^/_ts/admin` does not match them, and letting them
-            // fall through to the publisher fallback would forward admin
-            // credentials and key-management payloads to the origin.
-            .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
-            .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -1155,11 +1103,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 method.clone(),
                 cache_purge_unsupported_handler,
             );
-        }
-
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
-            builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
         }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is

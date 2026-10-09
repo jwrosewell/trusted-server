@@ -38,8 +38,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
@@ -52,8 +50,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/permissions.json`                | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/permissions`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
-| normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
 | normal  | `/auction`                             | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/click`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -981,109 +977,11 @@ curl -X POST https://edge.example.com/verify-signature \
 
 ---
 
-### POST /\_ts/admin/keys/rotate
+### Key rotation
 
-Generates and activates a new signing key.
-
-**Authentication:** Requires basic auth (configured via `handlers` in `trusted-server.toml`)
-
-**Contract:** Fastly implements this route; Axum, Cloudflare, and Spin return
-`501`. Startup requires complete Basic-auth coverage of `/_ts/admin`. The body
-is empty or JSON `{ "kid": "..." }`, limited to 4 KiB. A supplied KID must be
-1–128 characters, use ASCII alphanumerics plus `-_.:`, and start with a
-lowercase ASCII letter. Success returns `200`; invalid KIDs return structured
-`400`; store/rotation failures return structured `500`. Successful and failure
-bodies use the same schema and set `success` accordingly. The handler defines
-no dedicated cache, CORS, or rate-limit policy.
-
-**Request Body (Optional):**
-
-```json
-{
-  "kid": "custom-key-id"
-}
-```
-
-If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Key rotated successfully",
-  "new_kid": "ts-2025-01-15-A",
-  "previous_kid": "ts-2025-01-14-A",
-  "active_kids": ["ts-2025-01-15-A", "ts-2025-01-14-A"],
-  "jwk": { "kty": "OKP", "crv": "Ed25519", "kid": "ts-2025-01-15-A" }
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password \
-  -H "Content-Type: application/json"
-```
-
-**Behavior:**
-
-- Keeps both new and previous key active
-- Updates `current-kid` to new key
-- Preserves old key for graceful transition
-
-See [Key Rotation Guide](./key-rotation.md) for workflow details.
-
----
-
-### POST /\_ts/admin/keys/deactivate
-
-Deactivates or deletes a signing key.
-
-**Authentication:** Requires basic auth
-
-**Contract:** Fastly implements this route; Axum, Cloudflare, and Spin return
-`501`. The JSON body is limited to 4 KiB. Deactivation accepts legacy KIDs that
-satisfy the 1–128 character and safe-character rules but do not satisfy the
-new-key lowercase-leading rule. Success returns `200`; invalid KIDs return a
-structured `400`; storage failures return a structured `500`. The handler
-defines no dedicated cache, CORS, or rate-limit policy.
-
-**Request Body:**
-
-```json
-{
-  "kid": "ts-2025-01-14-A",
-  "delete": false
-}
-```
-
-| Field    | Type    | Required | Description                                       |
-| -------- | ------- | -------- | ------------------------------------------------- |
-| `kid`    | string  | Yes      | Key ID to deactivate                              |
-| `delete` | boolean | No       | If true, permanently removes key (default: false) |
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Key deactivated successfully",
-  "deactivated_kid": "ts-2025-01-14-A",
-  "deleted": false,
-  "remaining_active_kids": ["ts-2025-01-15-A"]
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
-  -u admin:password \
-  -H "Content-Type: application/json" \
-  -d '{"kid":"ts-2025-01-14-A","delete":true}'
-```
+Key rotation has no HTTP route. An operator rotates and retires keys with
+`ts keys rotate` and `ts keys deactivate`, which run the rotation library in
+core against the signing stores. See [Key Rotation](./key-rotation.md).
 
 ---
 
@@ -1094,13 +992,6 @@ The whole `/_ts/admin` prefix is closed to the publisher fallback. A request ben
 Configure a handler that covers the entire `/_ts/admin` namespace, because startup rejects configurations that do not protect every admin route. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge.
 
 What is held against a reader's own Edge Cookie is shown to that reader at [`GET /_ts/data`](#get-ts-data).
-
-### Legacy /admin/keys/rotate and /admin/keys/deactivate aliases
-
-All seven fallback methods return local `404 text/plain`. These retired aliases
-accept no schema, invoke no key operation, forward nothing to the publisher,
-and define no cache, CORS, or rate-limit policy. Example: `curl -i
-https://edge.example.com/admin/keys/rotate` must not reach the origin.
 
 ---
 
@@ -1411,13 +1302,14 @@ Basic Authentication password under `admin_password`.
 **Usage:**
 
 ```bash
-curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
+curl -u 'admin:<resolved-admin-password>' -X POST \
+  -H 'Content-Type: application/json' -d '{"scope":"all"}' \
+  https://edge.example.com/_ts/admin/cache/purge
 ```
 
 **Protected Endpoints:**
 
-- `/_ts/admin/keys/rotate`
-- `/_ts/admin/keys/deactivate`
+- `/_ts/admin/cache/purge`
 - Any paths matching configured `handlers` patterns
 
 The EC partner APIs use their own Bearer-token contract. Signed first-party

@@ -47,9 +47,8 @@ config, local-push output, bodies, headers, and logs.
 
 ## Runtime boundaries
 
-Key rotation is registered but returns a not-supported response because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
+Axum sanitizes forwarded client-IP headers but does not resolve
+`[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

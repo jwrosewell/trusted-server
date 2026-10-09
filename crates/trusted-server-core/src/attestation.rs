@@ -64,8 +64,6 @@ pub const RESERVED_PATHS: &[&str] = &[
     DATA_PAGE_PATH,
     PAGE_BIDS_PATH,
     PAGE_BIDS_LEGACY_PATH,
-    "/_ts/admin/keys/rotate",
-    "/_ts/admin/keys/deactivate",
     "/_ts/admin/cache/purge",
     "/_ts/api/v1/batch-sync",
     "/_ts/api/v1/identify",

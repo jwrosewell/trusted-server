@@ -273,16 +273,15 @@ async fn every_route_prepares_the_request_exactly_once() {
     let settings = settings_with(PROBE_BLOCK);
     let mut service = service_with(settings, &[seam_probe::builder()]);
 
-    // `/admin/keys/rotate` is a named route (the legacy alias denied locally
-    // with a 404), reached through `named_route_handler`, and it is not
-    // covered by the `^/_ts/admin` auth handler, so the request reaches the
-    // preparer rather than being turned back with a 401.
-    let named = get_counted(&mut service, "/admin/keys/rotate", "named-route").await;
+    // `/first-party/proxy` is a named route, reached through
+    // `named_route_handler`, whose handler refuses a request naming no target,
+    // so the request reaches the preparer and no backend.
+    let named = get_counted(&mut service, "/first-party/proxy", "named-route").await;
 
     assert_eq!(
         named.status().as_u16(),
-        404,
-        "the named route should serve the local deny, not fall through to the fallback"
+        502,
+        "the named route should refuse a request that names no target"
     );
     assert_eq!(
         seam_probe::prepare_runs_for("named-route"),

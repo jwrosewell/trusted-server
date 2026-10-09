@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Breaking:** `POST /_ts/admin/keys/rotate` and `POST /_ts/admin/keys/deactivate` are removed. They let anyone holding one shared password replace the keys the service signs with, over the publisher's own domain. Rotate and retire keys with `ts keys rotate` and `ts keys deactivate`, which write the two signing stores through the `fastly` CLI with an operator's own token. A request to either removed path, or to the `/admin/keys/rotate` and `/admin/keys/deactivate` aliases, is answered `404` by the server itself and is never forwarded to the origin.
 - **Breaking:** `GET /_ts/admin/ec`, `GET /_ts/admin/ec/{id}` and `GET /_ts/admin/eids` are removed. They read any reader's identity graph record, and the cookies of whoever called them, on the publisher's own domain behind a shared password. `GET /_ts/data` shows a reader what is held against that reader's own Edge Cookie. A request to one of the removed paths is answered `404` by the server itself and is never forwarded to the origin, as for any other path beneath `/_ts/admin`.
 
 ### Security

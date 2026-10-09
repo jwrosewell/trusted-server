@@ -141,13 +141,13 @@ async fn finalize_middleware_injects_geo_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_middleware_runs_in_chain_for_protected_routes() {
     // Verifies that AuthMiddleware is wired by asserting the 401 + WWW-Authenticate
-    // challenge on a protected route (/_ts/admin/keys/rotate). Only AuthMiddleware
+    // challenge on a protected path (/_ts/admin/anything). Only AuthMiddleware
     // short-circuits with this response — FinalizeResponseMiddleware alone would not.
     let router = test_router();
 
     let req = request_builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -166,15 +166,18 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
-    // Regression for the credential-leak finding: the production basic-auth regex
-    // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
-    // auth-gated. Any publisher-fallback method carrying an `Authorization`
-    // header must be denied locally with 404, never proxied to the publisher
-    // origin (which would leak the admin credentials and key body). A
-    // publisher-fallback proxy without a backend would surface as a 5xx, so 404
-    // proves the local deny ran.
-    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+async fn key_administration_paths_are_answered_here_and_never_proxied() {
+    // A request to a key administration path carries an operator's
+    // credentials and a key payload. Every publisher-fallback method must be
+    // answered here with 404 and never proxied to the publisher origin, which
+    // would be handed both. A publisher-fallback proxy without a backend would
+    // surface as a 5xx, so a 404 proves the request was answered here.
+    for path in [
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+    ] {
         for method in LEGACY_ADMIN_DENY_METHODS {
             let router = test_router();
             let req = request_builder()
@@ -183,14 +186,14 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
                 .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
                 .header("content-type", "application/json")
                 .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
-                .expect("should build authorized legacy-alias request");
+                .expect("should build authorized key administration request");
 
             let resp = route(router, req).await;
 
             assert_eq!(
                 resp.status().as_u16(),
                 404,
-                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                "{method} {path} with Authorization must be answered here (404), not proxied to publisher"
             );
         }
     }
@@ -269,8 +272,6 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/config"),
         ("GET", "/_ts/config.json"),
         ("GET", "/_ts/data"),
-        ("POST", "/_ts/admin/keys/rotate"),
-        ("POST", "/_ts/admin/keys/deactivate"),
         ("POST", "/auction"),
         // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
         // paths are spelled out as literals rather than referencing
@@ -293,43 +294,11 @@ fn all_explicit_routes_are_registered() {
     for (method, path) in expected {
         assert_route_registered(method, path);
     }
-
-    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            assert_route_registered(method, path);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Basic-auth parity tests
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_routes_return_501() {
-    for (path, body) in [
-        ("/_ts/admin/keys/rotate", "{}"),
-        (
-            "/_ts/admin/keys/deactivate",
-            r#"{"kid":"test-key","delete":false}"#,
-        ),
-    ] {
-        let req = request_builder()
-            .method("POST")
-            .uri(path)
-            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header("content-type", "application/json")
-            .body(edgezero_core::body::Body::from(body))
-            .expect("should build request");
-        let resp = route(test_router(), req).await;
-
-        assert_eq!(
-            resp.status().as_u16(),
-            501,
-            "{path} should report that Cloudflare key management is unsupported"
-        );
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_authenticated_request_to_a_closed_path_is_answered_here() {
@@ -388,7 +357,7 @@ async fn admin_route_without_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -405,7 +374,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -438,7 +407,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .header("authorization", format!("Basic {creds}"))
         .body(edgezero_core::body::Body::from("{}"))
@@ -578,88 +547,6 @@ async fn auction_endpoint_does_not_require_auth() {
         resp.status().as_u16(),
         401,
         "/auction must not apply admin basic-auth gate"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Admin key route full path coverage
-// ---------------------------------------------------------------------------
-
-// Exercises the auth-fail path with a realistic key body (complements the
-// generic `admin_route_without_credentials_returns_401` above).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_key_auth_fail_returns_401() {
-    let router = test_router();
-    let req = request_builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = route(router, req).await;
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin/keys/rotate without credentials must return 401"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_deactivate_key_auth_fail_returns_401() {
-    let router = test_router();
-    let req = request_builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = route(router, req).await;
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin/keys/deactivate without credentials must return 401"
-    );
-}
-
-#[tokio::test]
-async fn legacy_admin_rotate_alias_returns_404() {
-    // The legacy non-`/_ts` alias is denied locally rather than routed to the
-    // admin handler or publisher fallback.
-    let router = make_router();
-
-    let req = request_builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-
-    let resp = route(router, req).await;
-
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "legacy admin key rotation alias must return local 404"
-    );
-}
-
-#[tokio::test]
-async fn legacy_admin_deactivate_alias_returns_404() {
-    let router = make_router();
-
-    let req = request_builder()
-        .method("POST")
-        .uri("/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-
-    let resp = route(router, req).await;
-
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "legacy admin key deactivation alias must return local 404"
     );
 }
 

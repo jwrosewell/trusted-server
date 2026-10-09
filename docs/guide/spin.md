@@ -51,10 +51,10 @@ manifest, SQLite store, response captures, and logs.
 
 Use the same store mapping and encoded variables in the deployment provider;
 empty variable defaults fail closed. Spin's request-time store registry is
-currently unwired, so EC KV lookup, request-signing key variables, and key
-rotation are unavailable. Forwarded client-IP headers are sanitized, and Spin
-derives its runtime authority, scheme, and client-address headers in the
-innermost normalization layer.
+currently unwired, so EC KV lookup and request-signing key variables are
+unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
+runtime authority, scheme, and client-address headers in the innermost
+normalization layer.
 
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an

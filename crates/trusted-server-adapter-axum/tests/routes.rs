@@ -127,10 +127,6 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/config"),
         ("GET", "/_ts/config.json"),
         ("GET", "/_ts/data"),
-        ("POST", "/_ts/admin/keys/rotate"),
-        ("POST", "/_ts/admin/keys/deactivate"),
-        ("POST", "/admin/keys/rotate"),
-        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
         // paths are spelled out as literals rather than referencing
@@ -152,29 +148,6 @@ fn all_explicit_routes_are_registered() {
 
     for (method, path) in expected {
         assert_route_registered(method, path);
-    }
-}
-
-/// Verify the legacy non-`/_ts` admin aliases ARE registered — to the local
-/// deny handler — matching the Fastly and Cloudflare adapters.
-///
-/// The production basic-auth handler regex (`^/_ts/admin`) does not match
-/// `/admin/keys/*`, so these aliases are not auth-gated. Leaving them unrouted
-/// would let them fall through to the publisher fallback, which forwards the
-/// request (including `Authorization` and key body) to the origin, leaking admin
-/// credentials. Registering them to a local 404 deny fails closed instead. This
-/// guard pins the cross-adapter agreement so the divergence cannot silently
-/// reappear.
-#[test]
-fn legacy_admin_aliases_are_registered_to_local_deny() {
-    let routes = registered_routes();
-    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            assert!(
-                routes.iter().any(|(m, p)| m == method && p == path),
-                "legacy {method} {path} must be registered (to the local deny) so it never reaches the publisher fallback; registered routes: {routes:?}"
-            );
-        }
     }
 }
 
@@ -342,7 +315,7 @@ async fn admin_route_without_credentials_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .body(AxumBody::from("{}"))
         .expect("should build request");
@@ -419,15 +392,18 @@ async fn an_authenticated_request_to_a_closed_path_is_answered_here() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
-    // Regression for the credential-leak finding: the production basic-auth regex
-    // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
-    // auth-gated. Any publisher-fallback method carrying an `Authorization`
-    // header must be denied locally with 404, never proxied to the publisher
-    // origin (which would leak the admin credentials and key body). A
-    // publisher-fallback proxy without a backend would surface as a 5xx, so 404
-    // proves the local deny ran.
-    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+async fn key_administration_paths_are_answered_here_and_never_proxied() {
+    // A request to a key administration path carries an operator's
+    // credentials and a key payload. Every publisher-fallback method must be
+    // answered here with 404 and never proxied to the publisher origin, which
+    // would be handed both. A publisher-fallback proxy without a backend would
+    // surface as a 5xx, so a 404 proves the request was answered here.
+    for path in [
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+    ] {
         for method in LEGACY_ADMIN_DENY_METHODS {
             let mut svc = make_service();
             let req = Request::builder()
@@ -436,7 +412,7 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
                 .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
                 .header("content-type", "application/json")
                 .body(AxumBody::from("{\"key_id\":\"leak-me\"}"))
-                .expect("should build authorized legacy-alias request");
+                .expect("should build authorized key administration request");
             let resp = svc
                 .ready()
                 .await
@@ -447,7 +423,7 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
             assert_eq!(
                 resp.status().as_u16(),
                 404,
-                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                "{method} {path} with Authorization must be answered here (404), not proxied to publisher"
             );
         }
     }
@@ -458,7 +434,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .body(AxumBody::from("{}"))
         .expect("should build request");
@@ -497,7 +473,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/_ts/admin/keys/rotate")
+        .uri("/_ts/admin/anything")
         .header("content-type", "application/json")
         .header("authorization", format!("Basic {creds}"))
         .body(AxumBody::from("{}"))
@@ -680,84 +656,6 @@ async fn auction_endpoint_does_not_require_auth() {
         resp.status().as_u16(),
         401,
         "/auction must not apply admin basic-auth gate"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_route_returns_non_404_non_5xx() {
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    let status = resp.status().as_u16();
-
-    assert_ne!(status, 404, "admin route must be routed");
-    // The auth gate short-circuits with 401 before the handler; only an
-    // unhandled 500 indicates a panic or missing handler.
-    assert_ne!(status, 500, "admin route must not panic: got {status}");
-}
-
-// ---------------------------------------------------------------------------
-// Admin key route full path coverage
-// ---------------------------------------------------------------------------
-
-// Exercises the auth-fail path with a realistic key body (complements the
-// generic `admin_route_without_credentials_returns_401` above).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_key_auth_fail_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin/keys/rotate without credentials must return 401"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_deactivate_key_auth_fail_returns_401() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/_ts/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_eq!(
-        resp.status().as_u16(),
-        401,
-        "admin/keys/deactivate without credentials must return 401"
     );
 }
 

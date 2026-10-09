@@ -4313,11 +4313,7 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
-        "/_ts/admin/keys/rotate",
-        "/_ts/admin/keys/deactivate",
-        "/_ts/admin/cache/purge",
-    ];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/_ts/admin/cache/purge"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -9606,11 +9602,7 @@ source_domain = "partner.example.com"
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec![
-                "/_ts/admin/keys/rotate",
-                "/_ts/admin/keys/deactivate",
-                "/_ts/admin/cache/purge",
-            ],
+            vec!["/_ts/admin/cache/purge"],
             "should report every admin endpoint as uncovered"
         );
     }
@@ -9632,7 +9624,7 @@ source_domain = "partner.example.com"
         let toml_str = settings_str_without_admin_handler()
             + r#"
             [[handlers]]
-            path = "^/_ts/admin/keys/rotate$"
+            path = "^/_ts/admin/reports$"
             username = "admin"
             password = "secret"
             "#;
@@ -9644,8 +9636,8 @@ source_domain = "partner.example.com"
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate", "/_ts/admin/cache/purge"],
-            "should detect the admin endpoints not covered by the narrow handler"
+            vec!["/_ts/admin/cache/purge"],
+            "should detect the admin endpoint not covered by the narrow handler"
         );
     }
 

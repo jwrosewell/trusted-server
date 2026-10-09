@@ -20,8 +20,6 @@
 //! |--------|-------------|---------|
 //! | GET | `/.well-known/trusted-server.json` | [`handle_trusted_server_discovery`] |
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
-//! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
-//! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -146,8 +144,7 @@ use trusted_server_core::publisher::{
     publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
@@ -868,12 +865,9 @@ async fn run_named_route(
         NamedRouteHandler::VerifySignature => {
             handle_verify_signature(&state.settings, services, req)
         }
-        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
-        NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
         }
-        NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
             unreachable!("batch-sync should be handled by run_batch_sync")
@@ -1274,23 +1268,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the `EdgeZero` path.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback — which would forward the caller's `Authorization` header
-/// and key-management payload to the origin, leaking admin credentials.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = StatusCode::NOT_FOUND;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 // ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
@@ -1332,12 +1309,7 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
-    RotateKey,
-    DeactivateKey,
     AdminCachePurge,
-    /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
-    /// reach the publisher fallback (which would leak admin credentials).
-    LegacyAdminDenied,
     BatchSync,
     Identify,
     SetTester,
@@ -1362,9 +1334,6 @@ struct NamedRoute {
 
 /// Every method an admin route must claim to keep non-primary methods from falling
 /// through to the publisher with the `Authorization` header still attached.
-///
-/// Named for the legacy `/admin/*` aliases it was introduced for, and reused by every
-/// route with the same requirement here and in the Axum and Spin adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -1386,16 +1355,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::VerifySignature,
     },
-    NamedRoute {
-        path: "/_ts/admin/keys/rotate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::RotateKey,
-    },
-    NamedRoute {
-        path: "/_ts/admin/keys/deactivate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::DeactivateKey,
-    },
     // Every method is claimed, not just POST. A method this route did not claim would
     // fall through to the publisher, and `enforce_basic_auth` leaves the `Authorization`
     // header in place, so a GET would ship the shared admin credential to the origin.
@@ -1404,22 +1363,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/cache/purge",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::AdminCachePurge,
-    },
-    // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
-    // 404 instead of executing key operations: the production basic-auth handler
-    // regex `^/_ts/admin` does not match them, and letting them fall through to
-    // publisher fallback for any fallback method would forward the caller's
-    // `Authorization` header and key-management payload to the origin, leaking
-    // admin credentials.
-    NamedRoute {
-        path: "/admin/keys/rotate",
-        primary_methods: LEGACY_ADMIN_DENY_METHODS,
-        handler: NamedRouteHandler::LegacyAdminDenied,
-    },
-    NamedRoute {
-        path: "/admin/keys/deactivate",
-        primary_methods: LEGACY_ADMIN_DENY_METHODS,
-        handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
@@ -2169,7 +2112,7 @@ mod tests {
         // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
         // short-circuits without calling any Fastly ABI.
         let router = test_router();
-        let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
+        let req = empty_request(Method::POST, "/_ts/admin/anything");
 
         let response = route(&router, req);
 
@@ -2186,69 +2129,6 @@ mod tests {
             Some("false"),
             "FinalizeResponseMiddleware must run even for auth-rejected responses"
         );
-    }
-
-    #[test]
-    fn legacy_admin_aliases_route_to_local_deny_not_key_handlers() {
-        // Security guard for the legacy non-`/_ts` admin aliases. They must be
-        // registered to the local `LegacyAdminDenied` 404 handler — not the
-        // rotate/deactivate key handlers, and not left unrouted. Leaving them
-        // unrouted would fall through to the publisher fallback, which forwards
-        // the request (including the `Authorization` header and key-management
-        // payload) to the origin, leaking admin credentials. Mapping them to the
-        // key handlers would expose key operations, since the production
-        // basic-auth regex `^/_ts/admin` does not match `/admin/keys/*`.
-        let handler_for = |path: &str| {
-            NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .map(|route| route.handler)
-        };
-        let methods_for = |path: &str| {
-            NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .map(|route| route.primary_methods)
-                .unwrap_or(&[])
-        };
-
-        assert!(
-            matches!(
-                handler_for("/_ts/admin/keys/rotate"),
-                Some(NamedRouteHandler::RotateKey)
-            ),
-            "canonical /_ts/admin/keys/rotate must map to the rotate handler"
-        );
-        assert!(
-            matches!(
-                handler_for("/_ts/admin/keys/deactivate"),
-                Some(NamedRouteHandler::DeactivateKey)
-            ),
-            "canonical /_ts/admin/keys/deactivate must map to the deactivate handler"
-        );
-        assert!(
-            matches!(
-                handler_for("/admin/keys/rotate"),
-                Some(NamedRouteHandler::LegacyAdminDenied)
-            ),
-            "legacy /admin/keys/rotate must map to the local deny handler, not the key handler"
-        );
-        assert!(
-            matches!(
-                handler_for("/admin/keys/deactivate"),
-                Some(NamedRouteHandler::LegacyAdminDenied)
-            ),
-            "legacy /admin/keys/deactivate must map to the local deny handler, not the key handler"
-        );
-
-        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-            for method in super::publisher_fallback_methods() {
-                assert!(
-                    methods_for(path).contains(&method),
-                    "legacy {method} {path} must route to the local deny handler, not publisher fallback"
-                );
-            }
-        }
     }
 
     #[test]
@@ -2328,15 +2208,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
-        // Regression for the credential-leak finding: with a production-shaped
-        // config (only `^/_ts/admin` is auth-gated, so `/admin/keys/*` is NOT
-        // matched by any handler), any publisher-fallback method to a legacy
-        // alias carrying an `Authorization` header must be denied locally with
-        // 404 — never proxied to the publisher origin (which would leak the
-        // admin credentials and the key-management body). A publisher-fallback
-        // proxy without a backend would surface as a 5xx, so a 404 proves the
-        // deny route ran instead.
+    fn key_administration_paths_are_answered_here_and_never_proxied() {
+        // A request to a key administration path carries an operator's
+        // credentials and a key payload. Every publisher-fallback method must
+        // be answered here with 404 and never proxied to the publisher origin,
+        // which would be handed both. A publisher-fallback proxy without a
+        // backend would surface as a 5xx, so a 404 proves the request was
+        // answered here.
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
@@ -2364,21 +2242,26 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for path in [
+            "/_ts/admin/keys/rotate",
+            "/_ts/admin/keys/deactivate",
+            "/admin/keys/rotate",
+            "/admin/keys/deactivate",
+        ] {
             for method in super::publisher_fallback_methods() {
                 let req = request_builder()
                     .method(method.clone())
                     .uri(format!("https://test-publisher.com{path}"))
                     .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
                     .body(Body::from("{\"key_id\":\"leak-me\"}"))
-                    .expect("should build authorized legacy-alias request");
+                    .expect("should build authorized key administration request");
 
                 let response = route(&router, req);
 
                 assert_eq!(
                     response.status(),
                     StatusCode::NOT_FOUND,
-                    "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                    "{method} {path} with Authorization must be answered here (404), not proxied to publisher"
                 );
             }
         }

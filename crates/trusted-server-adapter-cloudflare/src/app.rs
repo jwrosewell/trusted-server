@@ -491,20 +491,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
-fn admin_key_management_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin key management is not supported on Cloudflare Workers.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 fn cache_purge_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
         "Template cache purge is not supported on Cloudflare Workers.\n\
@@ -512,23 +498,6 @@ fn cache_purge_not_supported() -> Response {
     );
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the Cloudflare adapter.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback — which would forward the caller's `Authorization` header
-/// and key-management payload to the origin, leaking admin credentials.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -800,22 +769,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_verify_signature(&s.settings, &services, req)
                 }),
             )
-            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
-            // and the production basic-auth handler regex (`^/_ts/admin`), so they
-            // are auth-gated under a production-shaped config.
-            //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered
-            // below to a local 404 for every publisher-fallback method: the
-            // production handler regex `^/_ts/admin` does not match them, and
-            // letting them fall through would forward the caller's
-            // `Authorization` header and key-management payload to the origin,
-            // leaking admin credentials.
-            .post("/_ts/admin/keys/rotate", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_key_management_not_supported())
-            })
-            .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_key_management_not_supported())
-            })
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -939,19 +892,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 method,
                 cache_purge_unsupported.clone(),
             );
-        }
-
-        let legacy_admin_deny =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(legacy_admin_alias_denied())
-            });
-        for method in publisher_fallback_methods() {
-            router = router.route(
-                "/admin/keys/rotate",
-                method.clone(),
-                legacy_admin_deny.clone(),
-            );
-            router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
         }
 
         // The attestation pages answer at the address the settings choose, so
