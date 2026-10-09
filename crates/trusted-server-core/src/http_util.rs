@@ -500,6 +500,42 @@ pub fn enforce_max_body_size(
     Ok(())
 }
 
+/// The prefix of every path this server answers itself.
+pub const ROUTE_NAMESPACE: &str = "/_ts";
+
+/// Response headers that describe the deployment and not the page.
+///
+/// `x-served-by` names the node that answered, and `x-cache` and
+/// `x-cache-hits` say how a cache treated the request. They arrive on a
+/// response from the publisher's origin or from a cache on the way to it. On
+/// a publisher's page they tell a reader nothing, and tell something probing
+/// the site how it is built.
+const DIAGNOSTIC_HEADERS: &[&str] = &["x-cache", "x-cache-hits", "x-served-by"];
+
+/// Removes the diagnostic headers from a response, unless the request was
+/// for a path in `namespace`, which is where a deployment is asked about
+/// itself.
+///
+/// An adapter calls this before it finalizes a response, so a header that
+/// finalizing writes is not removed, an operator's `[response_headers]`
+/// among them.
+///
+/// `namespace` is a parameter so that a test can prove the boundary.
+pub fn strip_diagnostic_headers<T>(path: &str, namespace: &str, response: &mut Response<T>) {
+    // A path that only starts with the namespace's text is not in it. `/_tsx`
+    // is a publisher's page.
+    let in_namespace = path == namespace
+        || path
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('/'));
+    if in_namespace {
+        return;
+    }
+    for name in DIAGNOSTIC_HEADERS {
+        response.headers_mut().remove(*name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,5 +1089,99 @@ mod tests {
             is_navigation_request(&req),
             "should match text/html case-insensitively in fallback"
         );
+    }
+
+    /// The three names written out, so that a change to the list is a change
+    /// to a test.
+    const STRIPPED: [&str; 3] = ["x-cache", "x-cache-hits", "x-served-by"];
+
+    fn response_with(names: &[&'static str]) -> Response<()> {
+        let mut response = Response::new(());
+        for name in names {
+            response
+                .headers_mut()
+                .insert(*name, HeaderValue::from_static("value"));
+        }
+        response
+    }
+
+    /// Everything a publisher's site serves loses them, which is all a reader
+    /// ever sees.
+    #[test]
+    fn a_publisher_page_loses_every_diagnostic_header() {
+        let mut response = response_with(&STRIPPED);
+
+        strip_diagnostic_headers("/articles/an-article", ROUTE_NAMESPACE, &mut response);
+
+        for name in STRIPPED {
+            assert!(
+                response.headers().get(name).is_none(),
+                "{name} should not reach a reader"
+            );
+        }
+    }
+
+    /// The server's own paths keep them, because that is where a deployment
+    /// is asked about itself.
+    #[test]
+    fn the_servers_own_namespace_keeps_them() {
+        for path in ["/_ts", "/_ts/permissions", "/_ts/debug/ja4"] {
+            let mut response = response_with(&STRIPPED);
+
+            strip_diagnostic_headers(path, ROUTE_NAMESPACE, &mut response);
+
+            for name in STRIPPED {
+                assert!(
+                    response.headers().get(name).is_some(),
+                    "{path} should keep {name}"
+                );
+            }
+        }
+    }
+
+    /// A header outside the list is not this function's to remove, the ones
+    /// an adapter writes when it finalizes a response among them.
+    #[test]
+    fn a_header_outside_the_list_is_left_alone() {
+        let kept = ["x-ts-version", "x-geo-info-available", "cache-control"];
+        let mut response = response_with(&kept);
+
+        strip_diagnostic_headers("/articles/an-article", ROUTE_NAMESPACE, &mut response);
+
+        for name in kept {
+            assert!(
+                response.headers().get(name).is_some(),
+                "{name} should be left alone"
+            );
+        }
+    }
+
+    /// A prefix match would let a publisher's page keep the headers by its
+    /// name alone, so `/_tsx` and `/_ts-archive` are stripped like any other
+    /// page.
+    #[test]
+    fn a_path_that_only_starts_with_the_namespace_is_not_in_it() {
+        for path in ["/_tsx", "/_ts-archive", "/_tsfoo/bar"] {
+            let mut response = response_with(&["x-served-by"]);
+
+            strip_diagnostic_headers(path, ROUTE_NAMESPACE, &mut response);
+
+            assert!(
+                response.headers().get("x-served-by").is_none(),
+                "{path} is a publisher's page"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_is_the_namespace_passed_in() {
+        let mut kept = response_with(&["x-served-by"]);
+        let mut stripped = response_with(&["x-served-by"]);
+
+        strip_diagnostic_headers("/_other/permissions", "/_other", &mut kept);
+        strip_diagnostic_headers("/_ts/permissions", "/_other", &mut stripped);
+
+        assert!(kept.headers().get("x-served-by").is_some());
+        assert!(stripped.headers().get("x-served-by").is_none());
     }
 }
