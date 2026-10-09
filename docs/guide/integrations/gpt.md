@@ -25,7 +25,7 @@ All of these are served from `securepubads.g.doubleclick.net`.
   Publisher HTML
   │
   ├─ <script src="securepubads.g.doubleclick.net/tag/js/gpt.js">
-  │   ↓ (attribute rewriter)
+  │   ↓ (middleware)
   │   <script src="publisher.com/integrations/gpt/script">
   │
   ├─ Server fetches gpt.js from Google, serves it verbatim

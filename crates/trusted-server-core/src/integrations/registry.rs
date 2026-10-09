@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -22,9 +22,9 @@ use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntri
 use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
-use crate::streaming_processor::StreamProcessor;
 
-/// Action returned by attribute rewriters to describe how the runtime should mutate the element.
+/// What a middleware's element handler decides about one attribute of an
+/// element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeRewriteAction {
     /// Leave the attribute and element untouched.
@@ -52,15 +52,8 @@ impl AttributeRewriteAction {
     }
 }
 
-/// Outcome returned by the registry after running every matching attribute rewriter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttributeRewriteOutcome {
-    Unchanged,
-    Replaced(String),
-    RemoveElement,
-}
-
-/// Action returned by inline script rewriters to describe how to mutate the node.
+/// What a middleware's text handler decides about one chunk of the text
+/// inside an element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptRewriteAction {
     Keep,
@@ -83,28 +76,6 @@ impl ScriptRewriteAction {
     pub fn remove_node() -> Self {
         Self::RemoveNode
     }
-}
-
-/// Context provided to integration HTML attribute rewriters.
-#[derive(Debug)]
-pub struct IntegrationAttributeContext<'a> {
-    pub attribute_name: &'a str,
-    pub element_name: &'a str,
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-}
-
-/// Context passed to script/text rewriters for inline HTML handling.
-#[derive(Debug)]
-pub struct IntegrationScriptContext<'a> {
-    pub selector: &'a str,
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-    pub is_last_in_text_node: bool,
-    pub max_buffered_script_bytes: usize,
-    pub document_state: &'a IntegrationDocumentState,
 }
 
 type IntegrationDocumentStateMap = BTreeMap<(&'static str, TypeId), Arc<dyn Any + Send + Sync>>;
@@ -196,20 +167,20 @@ impl IntegrationDocumentState {
     }
 }
 
-/// Values a module's request hooks leave for its own page hooks, for one
-/// request.
+/// Values a module's request hooks leave for its own serve middleware, for
+/// one request.
 ///
 /// A request preparer or a request filter leaves a value under its
-/// integration id with [`IntegrationRequestState::insert`]. When the request
-/// produces an HTML document for that one reader, every value is copied into
-/// the document's [`IntegrationDocumentState`] before parsing starts, so the
-/// module's head injector, rewriters and stream processors read it there, and
-/// the same values are handed to the module's response finalizer.
+/// integration id with [`IntegrationRequestState::insert`]. Where the
+/// request's reader is served an HTML document, every value is copied into
+/// the [`IntegrationDocumentState`] the `[[serve]]` entry's middleware share,
+/// so the module's serve middleware reads it there, and the same values are
+/// handed to the module's response finalizer.
 ///
 /// A request that carries any value keeps to the origin path. Its document is
 /// never read from a shared template and never stored as one, and an HTML
-/// response with a body is sent `private, no-store`. A document built to be
-/// shared starts with none of these values.
+/// response with a body is sent `private, no-store`. A fetch middleware is
+/// handed none of these values.
 #[derive(Clone, Default)]
 pub struct IntegrationRequestState {
     values: IntegrationDocumentStateMap,
@@ -224,8 +195,8 @@ impl std::fmt::Debug for IntegrationRequestState {
 }
 
 impl IntegrationRequestState {
-    /// Leaves `value` on `request` for the page hooks of `integration_id`,
-    /// in place of a value of the same type left earlier.
+    /// Leaves `value` on `request` for the serve middleware of
+    /// `integration_id`, in place of a value of the same type left earlier.
     pub fn insert<T>(request: &mut Request<EdgeBody>, integration_id: &'static str, value: T)
     where
         T: Any + Send + Sync + 'static,
@@ -238,8 +209,8 @@ impl IntegrationRequestState {
         request.extensions_mut().insert(state);
     }
 
-    /// Holds `value` for the page hooks of `integration_id`, in place of a
-    /// value of the same type held earlier.
+    /// Holds `value` for the serve middleware of `integration_id`, in place
+    /// of a value of the same type held earlier.
     pub fn set<T>(&mut self, integration_id: &'static str, value: T)
     where
         T: Any + Send + Sync + 'static,
@@ -291,38 +262,6 @@ impl IntegrationRequestState {
         for (key, value) in &self.values {
             guard.insert(*key, Arc::clone(value));
         }
-    }
-}
-
-/// Per-document buffer for script text fragments split across chunks.
-///
-/// `lol_html` can deliver one text node as several chunks, so a rewriter that
-/// needs the whole script must accumulate until `is_last_in_text_node`.
-///
-/// This lives in [`IntegrationDocumentState`] rather than on the rewriter.
-/// Rewriters are registered once as `Arc<dyn IntegrationScriptRewriter>` and
-/// live as long as the [`IntegrationRegistry`], so a buffer owned by a
-/// rewriter is shared by every document that registry serves. A document whose
-/// stream ends before the final fragment — client disconnect, origin error,
-/// truncated body — leaves its partial script in that buffer, and the next
-/// document prepends the residue to its own accumulation. That corrupts the
-/// response and can disclose the previous document's content.
-///
-/// Keyed per integration id, so each integration gets its own buffer, and
-/// dropped with the document state at end of document.
-#[derive(Debug, Default)]
-pub struct ScriptTextAccumulator {
-    buffer: Mutex<String>,
-}
-
-impl ScriptTextAccumulator {
-    /// Locks the buffer.
-    ///
-    /// Recovers from poisoning rather than panicking: a poisoned buffer holds
-    /// at worst a partial script, and the caller's `is_last_in_text_node`
-    /// handling already tolerates unexpected contents.
-    pub fn buffer(&self) -> MutexGuard<'_, String> {
-        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -676,83 +615,6 @@ fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation
     }
 }
 
-/// Trait for integration-provided HTML attribute rewrite hooks.
-pub trait IntegrationAttributeRewriter: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// Return true when this rewriter wants to inspect a given attribute.
-    fn handles_attribute(&self, attribute: &str) -> bool;
-    /// Attempt to rewrite the attribute value. Return `AttributeRewriteAction::Replace`
-    /// to update the attribute, `Keep` to leave it untouched, or `RemoveElement` to drop the node.
-    fn rewrite(
-        &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction;
-}
-
-/// Trait for integration-provided inline script/text rewrite hooks.
-pub trait IntegrationScriptRewriter: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
-    fn selector(&self) -> &'static str;
-    /// Attempt to rewrite the inline text content for the selector.
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
-}
-
-/// Context for HTML post-processors.
-#[derive(Debug)]
-pub struct IntegrationHtmlContext<'a> {
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-    pub document_state: &'a IntegrationDocumentState,
-}
-
-/// Owned request data supplied when an integration creates an HTML stream processor.
-#[derive(Clone)]
-pub struct IntegrationHtmlStreamContext {
-    /// Publisher-facing host used for rewritten URLs.
-    pub request_host: String,
-    /// Publisher-facing scheme used for rewritten URLs.
-    pub request_scheme: String,
-    /// Origin host whose URLs may be rewritten.
-    pub origin_host: String,
-    /// Request-local state shared with the document's integration rewriters.
-    pub document_state: IntegrationDocumentState,
-}
-
-/// Creates one mutable HTML output processor for each document.
-pub trait IntegrationHtmlStreamProcessorFactory: Send + Sync {
-    /// Identifier for logging and diagnostics.
-    fn integration_id(&self) -> &'static str;
-
-    /// Create a request-local streaming processor.
-    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor>;
-}
-
-/// Trait for integration-provided HTML head injections.
-pub trait IntegrationHeadInjector: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// Return HTML snippets to insert at the start of `<head>`.
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
-
-    /// Return HTML snippets to insert straight after the main script bundle
-    /// and before any deferred one, for a script that needs the bundle to
-    /// have run and has to run before the page's own scripts.
-    fn after_bundle_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Return attributes to add to the publisher TSJS bundle tag.
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        Vec::new()
-    }
-}
-
 /// A browser module a registration carries, for a module built outside
 /// `trusted-server-js`. The crate embeds its built IIFE with `include_str!`
 /// and states its SHA-256 as a literal next to it; the registry verifies the
@@ -778,10 +640,6 @@ pub struct IntegrationRegistration {
     /// integration injects the tag itself when it decides to.
     pub js_standalone: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
-    pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-    pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
-    pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     /// The page changes this registration supplies, see [`crate::middleware`].
     ///
@@ -835,10 +693,6 @@ impl IntegrationRegistrationBuilder {
                 js_module: None,
                 js_standalone: false,
                 proxies: Vec::new(),
-                attribute_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
                 bundle_tag_attributes: Vec::new(),
@@ -852,36 +706,6 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_proxy(mut self, proxy: Arc<dyn IntegrationProxy>) -> Self {
         self.registration.proxies.push(proxy);
-        self
-    }
-
-    #[must_use]
-    pub fn with_attribute_rewriter(
-        mut self,
-        rewriter: Arc<dyn IntegrationAttributeRewriter>,
-    ) -> Self {
-        self.registration.attribute_rewriters.push(rewriter);
-        self
-    }
-
-    #[must_use]
-    pub fn with_script_rewriter(mut self, rewriter: Arc<dyn IntegrationScriptRewriter>) -> Self {
-        self.registration.script_rewriters.push(rewriter);
-        self
-    }
-
-    #[must_use]
-    pub fn with_html_stream_processor(
-        mut self,
-        processor: Arc<dyn IntegrationHtmlStreamProcessorFactory>,
-    ) -> Self {
-        self.registration.html_stream_processors.push(processor);
-        self
-    }
-
-    #[must_use]
-    pub fn with_head_injector(mut self, injector: Arc<dyn IntegrationHeadInjector>) -> Self {
-        self.registration.head_injectors.push(injector);
         self
     }
 
@@ -1030,10 +854,6 @@ struct IntegrationRegistryInner {
     // Modules carried by their registrations, verified against their
     // declared hash at construction.
     carried_js: Vec<(&'static str, CarriedJsModule)>,
-    html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-    script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
-    head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     // The middleware the running registrations supply, each against the
     // integration that supplied it, in registration order.
@@ -1088,10 +908,6 @@ impl Default for IntegrationRegistryInner {
             disabled_js_ids: Vec::new(),
             standalone_js_ids: Vec::new(),
             carried_js: Vec::new(),
-            html_rewriters: Vec::new(),
-            script_rewriters: Vec::new(),
-            html_stream_processors: Vec::new(),
-            head_injectors: Vec::new(),
             request_filters: Vec::new(),
             middleware: Vec::new(),
             bundle_tag_attributes: Vec::new(),
@@ -1414,9 +1230,8 @@ fn resolve_geo_module(
 pub struct IntegrationMetadata {
     pub id: &'static str,
     pub routes: Vec<IntegrationEndpoint>,
-    pub attribute_rewriters: usize,
-    pub script_selectors: Vec<&'static str>,
-    pub head_injectors: usize,
+    /// The names of the middleware the integration supplies.
+    pub middleware: Vec<&'static str>,
     pub request_filters: usize,
 }
 
@@ -1425,9 +1240,7 @@ impl IntegrationMetadata {
         Self {
             id,
             routes: Vec::new(),
-            attribute_rewriters: 0,
-            script_selectors: Vec::new(),
-            head_injectors: 0,
+            middleware: Vec::new(),
             request_filters: 0,
         }
     }
@@ -1817,14 +1630,6 @@ impl IntegrationRegistry {
                     inner.routes.push((route, registration.integration_id));
                 }
             }
-            inner
-                .html_rewriters
-                .extend(registration.attribute_rewriters);
-            inner.script_rewriters.extend(registration.script_rewriters);
-            inner
-                .html_stream_processors
-                .extend(registration.html_stream_processors);
-            inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
             for middleware in registration.middleware {
                 inner
@@ -2195,92 +2000,12 @@ impl IntegrationRegistry {
         }
     }
 
-    /// Give integrations a chance to rewrite HTML attributes.
-    #[must_use]
-    pub fn rewrite_attribute(
-        &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteOutcome {
-        let mut current = attr_value.to_owned();
-        let mut changed = false;
-        for rewriter in &self.inner.html_rewriters {
-            if !rewriter.handles_attribute(attr_name) {
-                continue;
-            }
-            match rewriter.rewrite(attr_name, &current, ctx) {
-                AttributeRewriteAction::Keep => {}
-                AttributeRewriteAction::Replace(next_value) => {
-                    current = next_value;
-                    changed = true;
-                }
-                AttributeRewriteAction::RemoveElement => {
-                    return AttributeRewriteOutcome::RemoveElement;
-                }
-            }
-        }
-
-        if changed {
-            AttributeRewriteOutcome::Replaced(current)
-        } else {
-            AttributeRewriteOutcome::Unchanged
-        }
-    }
-
-    /// Expose registered script/text rewriters for HTML processing.
-    #[must_use]
-    pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
-        self.inner.script_rewriters.clone()
-    }
-
-    /// Expose registered per-document HTML stream processor factories.
-    #[must_use]
-    pub fn html_stream_processor_factories(
-        &self,
-    ) -> Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>> {
-        self.inner.html_stream_processors.clone()
-    }
-
-    /// Collect HTML snippets for insertion at the start of `<head>`.
-    #[must_use]
-    pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        let mut inserts = Vec::new();
-        for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts(ctx);
-            if !next.is_empty() {
-                inserts.append(&mut next);
-            }
-        }
-        inserts
-    }
-
-    /// Collect HTML snippets for insertion straight after the main script
-    /// bundle.
-    #[must_use]
-    pub fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        self.inner
-            .head_injectors
-            .iter()
-            .flat_map(|injector| injector.after_bundle_inserts(ctx))
-            .collect()
-    }
-
-    /// Collect static attributes for the publisher TSJS bundle tag, being
-    /// those the head injectors ask for and then those the registrations
-    /// state, each keeping the first value a name is given.
+    /// Collect the attributes the registrations put on the publisher TSJS
+    /// bundle tag, each keeping the first value a name is given.
     #[must_use]
     pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        let from_injectors = self.inner.head_injectors.iter().flat_map(|injector| {
-            injector
-                .tsjs_script_tag_attributes()
-                .into_iter()
-                .map(|attribute| (injector.integration_id(), attribute))
-        });
         let mut attributes: Vec<(&'static str, &'static str)> = Vec::new();
-        for (integration, attribute) in
-            from_injectors.chain(self.inner.bundle_tag_attributes.iter().copied())
-        {
+        for (integration, attribute) in self.inner.bundle_tag_attributes.iter().copied() {
             let existing = attributes
                 .iter()
                 .find(|(name, _)| *name == attribute.0)
@@ -2297,7 +2022,7 @@ impl IntegrationRegistry {
         attributes
     }
 
-    /// Provide a snapshot of registered integrations and their hooks.
+    /// Provide a snapshot of registered integrations and what each supplies.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
@@ -2317,25 +2042,11 @@ impl IntegrationRegistry {
             ));
         }
 
-        for rewriter in &self.inner.html_rewriters {
+        for (integration_id, middleware) in &self.inner.middleware {
             let entry = map
-                .entry(rewriter.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(rewriter.integration_id()));
-            entry.attribute_rewriters += 1;
-        }
-
-        for rewriter in &self.inner.script_rewriters {
-            let entry = map
-                .entry(rewriter.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(rewriter.integration_id()));
-            entry.script_selectors.push(rewriter.selector());
-        }
-
-        for injector in &self.inner.head_injectors {
-            let entry = map
-                .entry(injector.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(injector.integration_id()));
-            entry.head_injectors += 1;
+                .entry(*integration_id)
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
+            entry.middleware.push(middleware.middleware_id());
         }
 
         for filter in &self.inner.request_filters {
@@ -2532,95 +2243,6 @@ impl IntegrationRegistry {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub fn from_rewriters(
-        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                builder_ids: Vec::new(),
-                running_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
-                request_filters: Vec::new(),
-                middleware: Vec::new(),
-                bundle_tag_attributes: Vec::new(),
-                request_preparers: Vec::new(),
-                response_finalizers: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-                extra_js_module_ids: Vec::new(),
-                standalone_js_ids: Vec::new(),
-                carried_js: Vec::new(),
-                geo_modules: Vec::new(),
-                ec_modules: Vec::new(),
-                device_modules: Vec::new(),
-                builder_modules: Vec::new(),
-                geo_module: None,
-                ec_module: None,
-                device_module: None,
-            }),
-            plan: None,
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn from_rewriters_with_head_injectors(
-        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-        head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                builder_ids: Vec::new(),
-                running_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_stream_processors: Vec::new(),
-                head_injectors,
-                request_filters: Vec::new(),
-                middleware: Vec::new(),
-                bundle_tag_attributes: Vec::new(),
-                request_preparers: Vec::new(),
-                response_finalizers: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-                extra_js_module_ids: Vec::new(),
-                standalone_js_ids: Vec::new(),
-                carried_js: Vec::new(),
-                geo_modules: Vec::new(),
-                ec_modules: Vec::new(),
-                device_modules: Vec::new(),
-                builder_modules: Vec::new(),
-                geo_module: None,
-                ec_module: None,
-                device_module: None,
-            }),
-            plan: None,
-        }
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
@@ -2636,10 +2258,6 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
                 running_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters,
                 middleware: Vec::new(),
                 bundle_tag_attributes: Vec::new(),
@@ -2717,10 +2335,6 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
                 running_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
                 bundle_tag_attributes: Vec::new(),
@@ -3764,79 +3378,6 @@ mod tests {
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
-    struct DefaultMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for DefaultMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "default-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    struct StaticMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for StaticMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "static-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-            ]
-        }
-    }
-
-    struct ConflictingMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for ConflictingMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "conflicting-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-            vec![
-                ("data-ts-gam-attribution", "false"),
-                ("data-third-attribute", "third"),
-            ]
-        }
-    }
-
-    #[test]
-    fn tsjs_script_tag_attributes_preserve_registration_order_and_default_empty() {
-        let registry = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![
-                Arc::new(DefaultMetadataHeadInjector),
-                Arc::new(StaticMetadataHeadInjector),
-                Arc::new(ConflictingMetadataHeadInjector),
-            ],
-        );
-
-        assert_eq!(
-            registry.tsjs_script_tag_attributes(),
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-                ("data-third-attribute", "third"),
-            ],
-            "should keep the first value for duplicate names and preserve attribute order"
-        );
-    }
-
     // Mock integration proxy for testing
     struct MockProxy;
 
@@ -3974,76 +3515,6 @@ mod tests {
             label.as_str(),
             "first",
             "should return inserted string state"
-        );
-    }
-
-    struct CountingStreamFactory(&'static str);
-
-    impl IntegrationHtmlStreamProcessorFactory for CountingStreamFactory {
-        fn integration_id(&self) -> &'static str {
-            self.0
-        }
-
-        fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
-            struct CountingStreamProcessor(usize);
-
-            impl StreamProcessor for CountingStreamProcessor {
-                fn process_chunk(
-                    &mut self,
-                    chunk: &[u8],
-                    _is_last: bool,
-                ) -> std::io::Result<Vec<u8>> {
-                    self.0 += 1;
-                    let mut output = self.0.to_string().into_bytes();
-                    output.extend_from_slice(chunk);
-                    Ok(output)
-                }
-            }
-
-            Box::new(CountingStreamProcessor(0))
-        }
-    }
-
-    #[test]
-    fn html_stream_factories_preserve_order_and_create_isolated_sessions() {
-        let registration = IntegrationRegistration::builder("test")
-            .with_html_stream_processor(Arc::new(CountingStreamFactory("first")))
-            .with_html_stream_processor(Arc::new(CountingStreamFactory("second")))
-            .build();
-        let identifiers: Vec<_> = registration
-            .html_stream_processors
-            .iter()
-            .map(|factory| factory.integration_id())
-            .collect();
-        assert_eq!(
-            identifiers,
-            ["first", "second"],
-            "should preserve factory registration order",
-        );
-
-        let context = IntegrationHtmlStreamContext {
-            request_host: "proxy.example.com".to_owned(),
-            request_scheme: "https".to_owned(),
-            origin_host: "origin.example.com".to_owned(),
-            document_state: IntegrationDocumentState::default(),
-        };
-        let factory = &registration.html_stream_processors[0];
-        let mut first = factory.create(context.clone());
-        let mut second = factory.create(context);
-
-        assert_eq!(
-            first
-                .process_chunk(b"a", false)
-                .expect("should process first session"),
-            b"1a",
-            "should initialize the first session counter",
-        );
-        assert_eq!(
-            second
-                .process_chunk(b"b", true)
-                .expect("should process second session"),
-            b"1b",
-            "should initialize an independent second session counter",
         );
     }
 
@@ -5433,33 +4904,20 @@ mod tests {
         );
     }
 
-    /// Writes one fixed insert, so a test can read the order hooks ran in.
-    struct FixedHeadInsert {
-        id: &'static str,
-        insert: &'static str,
-    }
-
-    impl IntegrationHeadInjector for FixedHeadInsert {
-        fn integration_id(&self) -> &'static str {
-            self.id
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            vec![self.insert.to_owned()]
-        }
-    }
-
-    const SECTION_INSERT: &str = "<!--from the section-->";
-    const PLAN_INSERT: &str = "<!--from the plan-->";
+    // Each probe supplies a middleware that changes nothing, so a test can
+    // read the order registrations were made in from the names the registry
+    // lists.
+    const SECTION_MIDDLEWARE: &str = "testing.probe-section";
+    const PLAN_MIDDLEWARE: &str = "testing.probe-plan";
 
     fn section_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("probe-section")
-                .with_head_injector(Arc::new(FixedHeadInsert {
-                    id: "probe-section",
-                    insert: SECTION_INSERT,
+                .with_middleware(Arc::new(Named {
+                    id: SECTION_MIDDLEWARE,
+                    phases: FETCH_ONLY,
                 }))
                 .build(),
         ))
@@ -5473,9 +4931,9 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(plan.enabled().then(|| {
             IntegrationRegistration::builder("probe-plan")
-                .with_head_injector(Arc::new(FixedHeadInsert {
-                    id: "probe-plan",
-                    insert: PLAN_INSERT,
+                .with_middleware(Arc::new(Named {
+                    id: PLAN_MIDDLEWARE,
+                    phases: FETCH_ONLY,
                 }))
                 .build()
         }))
@@ -5503,17 +4961,11 @@ mod tests {
             .with_module_name("testing.probe-plan")
             .with_plan_registration(plan_probe_registration),
         ];
-        let probe_inserts = |registry: &IntegrationRegistry| {
-            let document_state = IntegrationDocumentState::default();
+        let probe_middleware = |registry: &IntegrationRegistry| {
             registry
-                .head_inserts(&IntegrationHtmlContext {
-                    request_host: "publisher.example.com",
-                    request_scheme: "https",
-                    origin_host: "origin.example.com",
-                    document_state: &document_state,
-                })
+                .middleware_ids()
                 .into_iter()
-                .filter(|insert| insert == SECTION_INSERT || insert == PLAN_INSERT)
+                .filter(|name| *name == SECTION_MIDDLEWARE || *name == PLAN_MIDDLEWARE)
                 .collect::<Vec<_>>()
         };
 
@@ -5524,7 +4976,7 @@ mod tests {
             !registry.integration_runs("probe-plan"),
             "should register nothing where the function finds nothing in the plan"
         );
-        assert_eq!(probe_inserts(&registry), vec![SECTION_INSERT]);
+        assert_eq!(probe_middleware(&registry), vec![SECTION_MIDDLEWARE]);
 
         settings.auction.enabled = true;
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -5534,9 +4986,9 @@ mod tests {
             "should register from the plan a module no section selects"
         );
         assert_eq!(
-            probe_inserts(&registry),
-            vec![PLAN_INSERT, SECTION_INSERT],
-            "should run the hooks of what the plan registered ahead of a section's module"
+            probe_middleware(&registry),
+            vec![PLAN_MIDDLEWARE, SECTION_MIDDLEWARE],
+            "should register what the plan supplies ahead of a section's module"
         );
     }
 

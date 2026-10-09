@@ -1330,8 +1330,8 @@ struct HtmlStreamProcessorParams<'a> {
     permissions_script: Option<String>,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-    /// What modules left on the request for their page hooks. See
-    /// [`template_request_state`].
+    /// What modules left on the request, which the `[[serve]]` entry's
+    /// middleware read where that entry runs on this pass.
     request_state: IntegrationRequestState,
     /// Whether a shared template was authorized for this response.
     ///
@@ -1342,25 +1342,6 @@ struct HtmlStreamProcessorParams<'a> {
     csp_nonce_observed: Option<Arc<AtomicBool>>,
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
-}
-
-/// The request state a document's page hooks may read.
-///
-/// What a module leaves on a request is made for that one request, so it
-/// must not reach a template that is stored and served to other readers.
-///
-/// [`handle_publisher_request`] already keeps a request that carries any off
-/// the shared template path, so a shared mode never sees one today. This
-/// makes the same guarantee where the document is built, so that neither
-/// place depends on the other.
-pub(crate) fn template_request_state(
-    mode: AssemblyMode,
-    request_state: IntegrationRequestState,
-) -> IntegrationRequestState {
-    match mode {
-        AssemblyMode::Inline => request_state,
-        AssemblyMode::Esi => IntegrationRequestState::default(),
-    }
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1538,8 +1519,6 @@ fn create_html_stream_processor(
         _ => body_close_injection(assembly_mode, params.ad_slots_script.is_some()),
     };
 
-    let request_state = template_request_state(assembly_mode, params.request_state);
-
     // Only a response that can be stored has a consumer for the observation, so the
     // handlers are not registered for ordinary inline traffic.
     let csp_nonce_observed = params
@@ -1550,12 +1529,13 @@ fn create_html_stream_processor(
     let config = config
         .with_permissions_script(params.permissions_script)
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
-        .with_request_state(request_state)
+        .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed);
 
     // The middleware of the first [[fetch]] entry covering this path. What
-    // they leave is what a shared template stores.
+    // they leave is what a shared template stores, and they are handed
+    // nothing the request left.
     let fetch = params.integration_registry.middleware_chain(
         &params.settings.fetch,
         MiddlewarePhase::Fetch,
@@ -1564,7 +1544,9 @@ fn create_html_stream_processor(
     );
     // A response that may be stored leaves this processor as the template
     // every reader shares, so its [[serve]] entry runs on each reader's copy
-    // once that copy is assembled. See `run_serve_pass`.
+    // once that copy is assembled. See `run_serve_pass`. What the request
+    // left reaches a document through that entry alone, so none of it reaches
+    // a template.
     let serve = (!params.shared_template_authorized).then(|| {
         params.integration_registry.middleware_chain(
             &params.settings.serve,
@@ -1844,7 +1826,8 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
-    /// What modules left on the request for their page hooks.
+    /// What modules left on the request, for their serve middleware and
+    /// their response finalizers.
     pub(crate) request_state: IntegrationRequestState,
     /// Set by the transform when the document carries a response-bound CSP nonce.
     ///
@@ -9630,14 +9613,11 @@ mod tests {
             let ad_slots_script =
                 template_ad_slots_script(mode, shape.ad_stack_ran, &settings, &slots, "/");
             let body_close = body_close_injection(mode, ad_slots_script.is_some());
-            let request_state = template_request_state(
-                mode,
-                if shape.module_state_left {
-                    request_fixture::marked()
-                } else {
-                    IntegrationRequestState::default()
-                },
-            );
+            let request_state = if shape.module_state_left {
+                request_fixture::marked()
+            } else {
+                IntegrationRequestState::default()
+            };
 
             let ad_bids_state =
                 std::sync::Arc::new(std::sync::Mutex::new(shape.bids_available.then(|| {
@@ -10914,8 +10894,9 @@ mod tests {
             request
         }
 
-        /// A navigation a module left state on for its page hooks, the way a
-        /// real one arrives: on the request, left by a preparer or a filter.
+        /// A navigation a module left state on for its serve middleware, the
+        /// way a real one arrives: on the request, left by a preparer or a
+        /// filter.
         fn marked_navigation_request() -> Request<EdgeBody> {
             let mut request = navigation_request();
             crate::integrations::registry_test_support::request_fixture::mark(&mut request);

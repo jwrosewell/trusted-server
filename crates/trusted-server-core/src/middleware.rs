@@ -1,12 +1,12 @@
 //! Page changes, which a module makes to a document on its way to a reader.
 //!
-//! A middleware is a page change the settings place. A module registers the
-//! ones it supplies, and one runs only where an entry in the settings names
-//! it. Each phase has its own ordered list of entries. An entry covers one
-//! media type, optionally only the requests under a path prefix, and names
-//! the middleware to run in order. A response takes the first entry that
-//! covers it, and each middleware is handed the document as the ones before
-//! it left it.
+//! A module changes a page through a middleware and in no other way. It
+//! registers the ones it supplies, and one runs only where an entry in the
+//! settings names it. Each phase has its own ordered list of entries. An
+//! entry covers one media type, optionally only the requests under a path
+//! prefix, and names the middleware to run in order. A response takes the
+//! first entry that covers it, and each middleware is handed the document as
+//! the ones before it left it.
 //!
 //! ```toml
 //! [[fetch]]

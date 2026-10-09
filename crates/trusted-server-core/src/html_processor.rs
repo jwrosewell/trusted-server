@@ -14,9 +14,8 @@ use lol_html::{
 };
 
 use crate::integrations::{
-    AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
-    IntegrationDocumentState, IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState,
-    IntegrationScriptContext, ScriptRewriteAction,
+    AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState,
+    ScriptRewriteAction,
 };
 use crate::middleware::{
     ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan,
@@ -100,10 +99,10 @@ pub struct HtmlProcessorConfig {
     /// Maximum bytes an integration may retain while processing one script or
     /// unresolved streaming group.
     pub max_buffered_body_bytes: usize,
-    /// What modules left on the request for their page hooks, copied into the
-    /// document's state before parsing starts. Empty for a document that may
-    /// be stored and served to other readers, where nothing made for one
-    /// request may appear.
+    /// What modules left on the request, which the serve chain is handed
+    /// where it runs on the same pass as the fetch chain. The fetch chain is
+    /// handed none of it, because what that chain writes may be stored and
+    /// served to other readers.
     pub request_state: IntegrationRequestState,
     /// What the `</body>` seam injects. Decided by the caller rather than inferred
     /// from [`Self::ad_slots_script`].
@@ -180,7 +179,7 @@ impl HtmlProcessorConfig {
         self
     }
 
-    /// Attach what modules left on the request for their page hooks.
+    /// Attach what modules left on the request, for the serve chain.
     #[must_use]
     pub fn with_request_state(mut self, request_state: IntegrationRequestState) -> Self {
         self.request_state = request_state;
@@ -234,7 +233,8 @@ impl TextEdits {
     }
 }
 
-/// Create an HTML processor with URL replacement and integration hooks.
+/// Create an HTML processor that moves the origin's address to the
+/// publisher's and writes the script bundle, with no middleware.
 ///
 /// # Panics
 ///
@@ -257,11 +257,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 /// request left, because what that chain writes may be stored and served to
 /// other readers.
 ///
-/// A fetch middleware's head markup follows the hooks' own. Its element
-/// handlers are asked after core has moved the origin's address in an
-/// attribute and after the hooks. Its text handlers are handed a chunk as the
-/// hooks and the handlers before them left it, and its stream processors run
-/// after the hooks' own.
+/// A fetch middleware's element handlers are asked after core has moved
+/// the origin's address in an attribute. Its text handlers are handed a chunk
+/// as the handlers before them left it, and its stream processor is handed
+/// what the one before it produced.
 ///
 /// # Errors
 ///
@@ -478,10 +477,6 @@ fn build_html_processor(
         text_handlers: middleware_text_handlers,
         processors: middleware_processors,
     } = plan;
-    let stream_processor_factories = config.integrations.html_stream_processor_factories();
-    let document_state = IntegrationDocumentState::default();
-    config.request_state.seed(&document_state);
-
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
         origin_host: String,
@@ -548,7 +543,6 @@ fn build_html_processor(
     let injected_tsjs = Rc::new(Cell::new(false));
     let injected_bids = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
-    let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
     let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
@@ -579,8 +573,6 @@ fn build_html_processor(
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
             let integrations = integration_registry.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let permissions_script = permissions_script.clone();
             move |el| {
@@ -596,17 +588,9 @@ fn build_html_processor(
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
                     }
-                    let ctx = IntegrationHtmlContext {
-                        request_host: &patterns.request_host,
-                        request_scheme: &patterns.request_scheme,
-                        origin_host: &patterns.origin_host,
-                        document_state: &document_state,
-                    };
-                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
-                    // so it's available when the bundle's auto-init code reads it.
-                    for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
-                    }
+                    // What the middleware write ahead of the bundle, such as
+                    // a module's configuration, which is then in place when
+                    // the bundle's own start-up code reads it.
                     for insert in &middleware_head_inserts {
                         snippet.push_str(insert);
                     }
@@ -617,11 +601,8 @@ fn build_html_processor(
                         &immediate_parts,
                         &script_attributes,
                     ));
-                    // What an integration loads after the bundle and ahead of
+                    // What a middleware loads after the bundle and ahead of
                     // the page's own scripts in the origin head.
-                    for insert in integrations.after_bundle_inserts(&ctx) {
-                        snippet.push_str(&insert);
-                    }
                     for insert in &middleware_after_bundle_inserts {
                         snippet.push_str(insert);
                     }
@@ -702,39 +683,11 @@ fn build_html_processor(
         // Replace URLs in href attributes
         element!("[href]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut href) = el.get_attribute("href") {
-                    let original_href = href.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&href) {
-                        href = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "href",
-                        &href,
-                        &IntegrationAttributeContext {
-                            attribute_name: "href",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_href) => {
-                            href = integration_href;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if href != original_href {
-                        el.set_attribute("href", &href)?;
-                    }
+                if let Some(href) = el.get_attribute("href")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&href)
+                {
+                    el.set_attribute("href", &rewritten)?;
                 }
                 Ok(())
             }
@@ -742,38 +695,11 @@ fn build_html_processor(
         // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut src) = el.get_attribute("src") {
-                    let original_src = src.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&src) {
-                        src = rewritten;
-                    }
-                    match integrations.rewrite_attribute(
-                        "src",
-                        &src,
-                        &IntegrationAttributeContext {
-                            attribute_name: "src",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_src) => {
-                            src = integration_src;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if src != original_src {
-                        el.set_attribute("src", &src)?;
-                    }
+                if let Some(src) = el.get_attribute("src")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&src)
+                {
+                    el.set_attribute("src", &rewritten)?;
                 }
                 Ok(())
             }
@@ -781,39 +707,11 @@ fn build_html_processor(
         // Replace URLs in action attributes
         element!("[action]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut action) = el.get_attribute("action") {
-                    let original_action = action.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&action) {
-                        action = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "action",
-                        &action,
-                        &IntegrationAttributeContext {
-                            attribute_name: "action",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_action) => {
-                            action = integration_action;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if action != original_action {
-                        el.set_attribute("action", &action)?;
-                    }
+                if let Some(action) = el.get_attribute("action")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&action)
+                {
+                    el.set_attribute("action", &rewritten)?;
                 }
                 Ok(())
             }
@@ -821,12 +719,9 @@ fn build_html_processor(
         // Replace URLs in srcset attributes (for responsive images)
         element!("[srcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut srcset) = el.get_attribute("srcset") {
-                    let original_srcset = srcset.clone();
-                    let element_name = el.tag_name();
-                    let new_srcset = srcset
+                if let Some(srcset) = el.get_attribute("srcset") {
+                    let rewritten = srcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
                         .replace(
@@ -834,33 +729,8 @@ fn build_html_processor(
                             &patterns.protocol_relative_replacement(),
                         )
                         .replace(&patterns.origin_host, &patterns.request_host);
-                    if new_srcset != srcset {
-                        srcset = new_srcset;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "srcset",
-                        &srcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "srcset",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_srcset) => {
-                            srcset = integration_srcset;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if srcset != original_srcset {
-                        el.set_attribute("srcset", &srcset)?;
+                    if rewritten != srcset {
+                        el.set_attribute("srcset", &rewritten)?;
                     }
                 }
                 Ok(())
@@ -869,45 +739,17 @@ fn build_html_processor(
         // Replace URLs in imagesrcset attributes (for link preload)
         element!("[imagesrcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
-                    let original_imagesrcset = imagesrcset.clone();
-                    let element_name = el.tag_name();
-                    let new_imagesrcset = imagesrcset
+                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
+                    let rewritten = imagesrcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
                         .replace(
                             &patterns.protocol_relative_origin(),
                             &patterns.protocol_relative_replacement(),
                         );
-                    if new_imagesrcset != imagesrcset {
-                        imagesrcset = new_imagesrcset;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "imagesrcset",
-                        &imagesrcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "imagesrcset",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_imagesrcset) => {
-                            imagesrcset = integration_imagesrcset;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if imagesrcset != original_imagesrcset {
-                        el.set_attribute("imagesrcset", &imagesrcset)?;
+                    if rewritten != imagesrcset {
+                        el.set_attribute("imagesrcset", &rewritten)?;
                     }
                 }
                 Ok(())
@@ -946,45 +788,12 @@ fn build_html_processor(
         }));
     }
 
-    // Shared by every text handler below, the hooks' and the middleware's,
-    // so each is handed a chunk as the one before it left it.
+    // Shared by every text handler, so each is handed a chunk as the one
+    // before it left it.
     let edits = Rc::new(TextEdits::default());
 
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        let document_state = document_state.clone();
-        let edits = Rc::clone(&edits);
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
-            let edits = Rc::clone(&edits);
-            move |text| {
-                let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
-                    is_last_in_text_node: text.last_in_text_node(),
-                    max_buffered_script_bytes: config.max_buffered_body_bytes,
-                    document_state: &document_state,
-                };
-                let current = edits.current(text);
-                match rewriter.rewrite(&current, &ctx) {
-                    ScriptRewriteAction::Keep => {}
-                    ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
-                    ScriptRewriteAction::RemoveNode => edits.remove(text),
-                }
-                Ok(())
-            }
-        }));
-    }
-
-    // Registered after core's own handlers and the hooks', so an element
-    // handler judges an address as it will be served and a text handler is
-    // handed a script as the hooks left it.
+    // Registered after core's own handlers, so an element handler judges an
+    // address as it will be served.
     element_content_handlers.extend(middleware_content_handlers(
         middleware_element_handlers,
         middleware_text_handlers,
@@ -999,20 +808,9 @@ fn build_html_processor(
 
     let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
-    let stream_context = crate::integrations::IntegrationHtmlStreamContext {
-        request_host: config.request_host.clone(),
-        request_scheme: config.request_scheme.clone(),
-        origin_host: config.origin_host.clone(),
-        document_state: document_state.clone(),
-    };
-    let mut processors: Vec<Box<dyn StreamProcessor>> = stream_processor_factories
-        .into_iter()
-        .map(|factory| factory.create(stream_context.clone()))
-        .collect();
-    processors.extend(middleware_processors);
     HtmlWithStreamingProcessors {
         inner: Box::new(inner),
-        processors,
+        processors: middleware_processors,
     }
 }
 
@@ -1300,10 +1098,6 @@ passphrase = "page-recording-passphrase-32-bytes"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::{
-        AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
-    };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -1329,131 +1123,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             request_state: IntegrationRequestState::default(),
         }
-    }
-
-    #[test]
-    fn integration_attribute_rewriter_can_remove_elements() {
-        struct RemovingLinkRewriter;
-
-        impl IntegrationAttributeRewriter for RemovingLinkRewriter {
-            fn integration_id(&self) -> &'static str {
-                "removing"
-            }
-
-            fn handles_attribute(&self, attribute: &str) -> bool {
-                attribute == "href"
-            }
-
-            fn rewrite(
-                &self,
-                _attr_name: &str,
-                attr_value: &str,
-                _ctx: &IntegrationAttributeContext<'_>,
-            ) -> AttributeRewriteAction {
-                if attr_value.contains("remove-me") {
-                    AttributeRewriteAction::remove_element()
-                } else {
-                    AttributeRewriteAction::keep()
-                }
-            }
-        }
-
-        let html = r#"<html><body>
-            <a href="https://origin.example.com/remove-me">remove</a>
-            <a href="https://origin.example.com/keep-me">keep</a>
-        </body></html>"#;
-
-        let mut config = create_test_config();
-        config.integrations =
-            IntegrationRegistry::from_rewriters(vec![Arc::new(RemovingLinkRewriter)], Vec::new());
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .expect("pipeline should process HTML");
-        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
-
-        assert!(processed.contains("keep-me"));
-        assert!(!processed.contains("remove-me"));
-    }
-
-    #[test]
-    fn integration_head_injector_prepends_after_tsjs_once() {
-        struct TestHeadInjector;
-
-        impl IntegrationHeadInjector for TestHeadInjector {
-            fn integration_id(&self) -> &'static str {
-                "test"
-            }
-
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
-            }
-        }
-
-        let html = "<html><head><title>Test</title></head><body></body></html>";
-
-        let mut config = create_test_config();
-        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![Arc::new(TestHeadInjector)],
-        );
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .expect("pipeline should process HTML");
-        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
-
-        let tsjs_marker = "id=\"trustedserver-js\"";
-        let head_marker = "window.__testHeadInjector=true";
-
-        assert_eq!(
-            processed.matches(tsjs_marker).count(),
-            1,
-            "should inject unified tsjs tag once"
-        );
-        assert_eq!(
-            processed.matches(head_marker).count(),
-            1,
-            "should inject head snippet once"
-        );
-
-        let tsjs_index = processed
-            .find(tsjs_marker)
-            .expect("should include unified tsjs tag");
-        let head_index = processed
-            .find(head_marker)
-            .expect("should include head snippet");
-        let title_index = processed
-            .find("<title>")
-            .expect("should keep existing head content");
-
-        assert!(
-            head_index < tsjs_index,
-            "should inject config before tsjs bundle so auto-init can read it"
-        );
-        assert!(
-            tsjs_index < title_index,
-            "should prepend all injected content before existing head content"
-        );
     }
 
     #[test]
@@ -2501,54 +2170,6 @@ mod tests {
         assert!(
             !observed.load(Ordering::SeqCst),
             "ordinary script text must not cost a cacheable page its shared template"
-        );
-    }
-
-    #[test]
-    fn a_rewritten_script_is_written_back_as_the_rewriter_gave_it() {
-        // A script's text is not HTML text. A browser decodes no entity inside
-        // a script, so `&&` written back as `&amp;&amp;` is a syntax error.
-        struct HostRewriter;
-
-        impl crate::integrations::IntegrationScriptRewriter for HostRewriter {
-            fn integration_id(&self) -> &'static str {
-                "host-rewriter"
-            }
-
-            fn selector(&self) -> &'static str {
-                "script"
-            }
-
-            fn rewrite(
-                &self,
-                content: &str,
-                _ctx: &IntegrationScriptContext<'_>,
-            ) -> ScriptRewriteAction {
-                ScriptRewriteAction::replace(
-                    content.replace("cdn.vendor.example", "test.example.com"),
-                )
-            }
-        }
-
-        let mut config = create_test_config();
-        config.integrations =
-            IntegrationRegistry::from_rewriters(Vec::new(), vec![Arc::new(HostRewriter)]);
-        let mut processor = create_html_processor(config);
-
-        let output = processor
-            .process_chunk(
-                br#"<html><head><script>if (a && b < c || d > e) { load("https://cdn.vendor.example/tag.js?x=1&y=2"); }</script></head><body></body></html>"#,
-                true,
-            )
-            .expect("should process the document");
-        let processed = String::from_utf8(output).expect("should stay UTF-8");
-
-        assert!(
-            processed.contains(
-                r#"<script>if (a && b < c || d > e) { load("https://test.example.com/tag.js?x=1&y=2"); }</script>"#
-            ),
-            "should write the rewritten script back with its operators and its query string \
-             as they were: {processed}"
         );
     }
 

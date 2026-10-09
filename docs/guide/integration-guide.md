@@ -11,14 +11,10 @@ Axum, or Spin SDK types.
   EdgeZero-neutral request and its call into the request's module context,
   from which it names the `Settings`, the `RuntimeServices` and whatever
   else it needs.
-- `IntegrationAttributeRewriter` inspects selected HTML attributes.
-- `IntegrationScriptRewriter` handles one declared selector.
-- `IntegrationHeadInjector` inserts deterministic head markup.
-- `IntegrationHtmlPostProcessor` is for bounded whole-document work that
-  cannot be performed during streaming.
 - `IntegrationRequestFilter` makes an early request decision.
 - `Middleware` changes a page, on the pages where the operator's settings
-  place it. See [Changing a page](#changing-a-page).
+  place it, and is the one way a module changes a page. See
+  [Changing a page](#changing-a-page).
 
 Build one `IntegrationRegistration` with only the hooks the feature needs.
 Use `with_deferred_js()` only for a separately loaded integration module and
@@ -27,7 +23,7 @@ namespaced and bounded; do not introduce a general outbound proxy.
 
 ## Compiling core-neutral fixture
 
-The fixture below registers an attribute rewriter and constructs every
+The fixture below registers a middleware and constructs every
 required `RuntimeServices` service without an adapter dependency. The
 documentation test extracts this exact fence and compiles it as an isolated
 crate.
@@ -36,12 +32,16 @@ crate.
 
 ```rust
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use error_stack::Report;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationRegistration,
+    AttributeRewriteAction, IntegrationRegistration,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction,
+    MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
@@ -145,33 +145,35 @@ impl PlatformGeo for FixtureGeo {
     }
 }
 
-struct AssetRewriter;
+struct AssetAddress;
 
-impl IntegrationAttributeRewriter for AssetRewriter {
-    fn integration_id(&self) -> &'static str {
-        "example"
+impl Middleware for AssetAddress {
+    fn middleware_id(&self) -> &'static str {
+        "testing.example"
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        matches!(attribute, "src" | "href")
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        _attribute: &str,
-        value: &str,
-        _context: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        value
-            .strip_prefix("https://assets.example/")
-            .map(|path| AttributeRewriteAction::replace(format!("/assets/{path}")))
-            .unwrap_or_else(AttributeRewriteAction::keep)
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let decide: Rc<AttributeRewriteFn> = Rc::new(|matched| {
+            matched
+                .value
+                .strip_prefix("https://assets.example/")
+                .map(|path| AttributeRewriteAction::replace(format!("/assets/{path}")))
+                .unwrap_or_else(AttributeRewriteAction::keep)
+        });
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
+        }
     }
 }
 
 pub fn registration() -> IntegrationRegistration {
     IntegrationRegistration::builder("example")
-        .with_attribute_rewriter(Arc::new(AssetRewriter))
+        .with_middleware(Arc::new(AssetAddress))
         .build()
 }
 
@@ -303,10 +305,6 @@ builder every integration uses.
 | Declaration                                           | What it does                                                                                    |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                             |
-| `.with_head_injector(...)`                            | Emits markup at the start of `<head>` and, if it chooses, after the script bundle               |
-| `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                                     |
-| `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                                 |
-| `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                             |
 | `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                            |
 | `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                           |
 | `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it |
@@ -348,10 +346,10 @@ module of that type.
 
 ### Changing a page
 
-A middleware is a page change that the operator's settings place. The module
-registers each one with `.with_middleware(...)`, and it runs only on the
-pages where an entry names it, in the order that entry gives. See
-[Placing page changes](/guide/configuration#placing-page-changes).
+A module changes a page through a middleware, which the operator's settings
+place. The module registers each one with `.with_middleware(...)`, and it
+runs only on the pages where an entry names it, in the order that entry
+gives. See [Placing page changes](/guide/configuration#placing-page-changes).
 
 The fixture below loads a vendor's tag from a first-party path and marks the
 head. The documentation test extracts this exact fence and compiles it as an
@@ -564,12 +562,13 @@ preparer or a request filter leaves a value under the integration's id.
 IntegrationRequestState::insert(request, EXAMPLE_ID, ExampleDecision::default());
 ```
 
-When the request produces an HTML document, each value is copied into the
-document's state before parsing starts, so the head injector, the rewriters
-and the stream processors read it with
-`ctx.document_state.get::<ExampleDecision>(EXAMPLE_ID)`. The same values are
-handed to the response finalizer the builder declared, which runs on the
-response the page path returns.
+Where the request's reader is served an HTML document, each value is copied
+into the state the `[[serve]]` entry's middleware share, so the module's
+serve middleware reads it with
+`context.document_state.get::<ExampleDecision>(EXAMPLE_ID)`. A fetch
+middleware is handed none of it. The same values are handed to the response
+finalizer the builder declared, which runs on the response the page path
+returns.
 
 A request that carries any value gets a document made for it alone. The
 document is fetched from the origin, never read from a shared template and
@@ -577,10 +576,10 @@ never stored as one, and an HTML response with a body is sent
 `private, no-store`. So a module leaves a value only for a request it will
 act on, and an ordinary request stays on the shared path.
 
-A head injector has two places to write. `head_inserts` writes at the start
-of `<head>`, before the script bundle, and `after_bundle_inserts` writes
-straight after the bundle, for a script that needs the bundle to have run and
-has to run before the page's own scripts.
+A serve middleware has two places to write markup. `head_inserts` writes
+straight before the script bundle, and `after_bundle_inserts` writes straight
+after it, for a script that needs the bundle to have run and has to run
+before the page's own scripts.
 
 ### A module's own secrets
 
@@ -673,13 +672,14 @@ probe through the Fastly adapter under Viceroy.
 ### The modules a stock build ships
 
 `crates/trusted-server-modules` lists the modules a stock build ships from
-crates of their own, in the order their hooks run. Every adapter builds its
-state with that list followed by the builders a deployment added, and loads
-its settings against the same list. The `ts` tool registers it for deploy
-validation. A module joins a stock build by adding its crate and its builder
-to that list, in the place its hooks should run. Offering a module does not
-run it, because the registry builds a module only when a section of the
-settings selects it.
+crates of their own, in the order their request hooks run. Every adapter
+builds its state with that list followed by the builders a deployment added,
+and loads its settings against the same list. The `ts` tool registers it for
+deploy validation. A module joins a stock build by adding its crate and its
+builder to that list, in the place its request hooks should run. The order of
+the list does not order page changes, which run in the order an entry names
+them. Offering a module does not run it, because the registry builds a module
+only when a section of the settings selects it.
 
 ### Two traps a vendor will hit
 

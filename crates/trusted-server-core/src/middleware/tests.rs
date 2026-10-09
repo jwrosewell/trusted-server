@@ -901,7 +901,7 @@ fn the_middleware_of_one_document_share_its_state_and_see_nothing_a_request_left
             }
         }),
     ]);
-    // The request left a mark, which the hooks of an unstored page may read.
+    // The request left a mark, which a serve middleware may read.
     let config = config().with_request_state(request_fixture::marked());
 
     let page = page_with(config, &chain, PAGE, 8192);
@@ -1008,113 +1008,6 @@ fn a_chain_reports_its_phase_and_the_names_in_the_order_they_run() {
     assert_eq!(chain.ids(), ["example.b", "example.a"]);
     assert!(!chain.is_empty());
     assert!(chain_of(Vec::new()).is_empty());
-}
-
-/// A module's hooks, each of which marks what it was handed.
-struct Hooks;
-
-impl crate::integrations::IntegrationHeadInjector for Hooks {
-    fn integration_id(&self) -> &'static str {
-        "hooks"
-    }
-
-    fn head_inserts(&self, _ctx: &crate::integrations::IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec!["<meta name=\"hook\">".to_owned()]
-    }
-}
-
-impl crate::integrations::IntegrationAttributeRewriter for Hooks {
-    fn integration_id(&self) -> &'static str {
-        "hooks"
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        attribute == "href"
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &crate::integrations::IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        AttributeRewriteAction::replace(format!("{attr_value}/hook"))
-    }
-}
-
-impl crate::integrations::IntegrationScriptRewriter for Hooks {
-    fn integration_id(&self) -> &'static str {
-        "hooks"
-    }
-
-    fn selector(&self) -> &'static str {
-        "script"
-    }
-
-    fn rewrite(
-        &self,
-        content: &str,
-        _ctx: &crate::integrations::IntegrationScriptContext<'_>,
-    ) -> ScriptRewriteAction {
-        if content.contains("origin()") {
-            ScriptRewriteAction::replace(content.replace("origin()", "hook()"))
-        } else {
-            ScriptRewriteAction::keep()
-        }
-    }
-}
-
-#[test]
-fn a_middleware_runs_after_the_hooks_of_the_same_kind() {
-    let chain = chain_of(vec![middleware("example.after", |_| MiddlewareAction {
-        head_inserts: vec!["<meta name=\"middleware\">".to_owned()],
-        element_handlers: vec![Box::new(AttributeRewrite::matching(
-            "a",
-            "href",
-            Rc::new(|matched| {
-                AttributeRewriteAction::replace(format!("{}/middleware", matched.value))
-            }),
-        ))],
-        text_handlers: vec![Box::new(TextFn {
-            selector: "script",
-            decide: |text: &str, _is_last: bool| {
-                if text.contains("hook()") {
-                    ScriptRewriteAction::replace(text.replace("hook()", "middleware()"))
-                } else {
-                    ScriptRewriteAction::keep()
-                }
-            },
-        })],
-        ..MiddlewareAction::pass()
-    })]);
-    let mut config = config();
-    config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
-        vec![Arc::new(Hooks)],
-        vec![Arc::new(Hooks)],
-        vec![Arc::new(Hooks)],
-    );
-
-    let page = page_with(
-        config,
-        &chain,
-        r#"<html><head></head><body><a href="/start">x</a><script>origin()</script></body></html>"#,
-        8192,
-    );
-
-    let hook = index_of(&page, "name=\"hook\"");
-    let after = index_of(&page, "name=\"middleware\"");
-    assert!(
-        hook < after && after < index_of(&page, BUNDLE_TAG),
-        "should write a middleware's head markup after the hooks' own: {page}"
-    );
-    assert!(
-        page.contains(r#"<a href="/start/hook/middleware">"#),
-        "should ask an element handler about the value the hooks left: {page}"
-    );
-    assert!(
-        page.contains("<script>middleware()</script>"),
-        "should hand a text handler the script as the hooks left it: {page}"
-    );
 }
 
 // ---------------------------------------------------------------------------

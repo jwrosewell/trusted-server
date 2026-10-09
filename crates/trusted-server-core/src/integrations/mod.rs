@@ -20,15 +20,12 @@ mod registry;
 #[cfg(test)]
 pub(crate) use registry::test_support as registry_test_support;
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, CarriedJsModule, HeaderMutation,
-    HeaderMutationMode, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
-    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
-    IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationRequestFilter, IntegrationRequestState, IntegrationScriptContext,
-    IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects,
-    RequestFilterInput, RequestFilterRegistryInput, RequestFilterRegistryOutcome,
-    ScriptRewriteAction, ScriptTextAccumulator,
+    AttributeRewriteAction, CarriedJsModule, HeaderMutation, HeaderMutationMode,
+    IntegrationDocumentState, IntegrationEndpoint, IntegrationMetadata, IntegrationProxy,
+    IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
+    IntegrationRequestFilter, IntegrationRequestState, ProxyDispatchInput, RequestFilterDecision,
+    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -699,8 +696,8 @@ impl IntegrationBuilder {
 
 /// The built-in integrations, in hook order.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    // This must remain the first module a section selects: attribute
-    // rewriters chain replacements and short-circuit removals.
+    // This stays the first module a section selects, so its middleware is
+    // the first of theirs in the order the registry lists them.
     js_asset_proxy::BUILDER,
     // A stand-in for an integration that streams, which core's own tests
     // select where they need one.
