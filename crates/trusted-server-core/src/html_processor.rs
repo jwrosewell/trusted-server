@@ -1457,12 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_marks_only_the_bundle_it_asks_to_mark() {
+    fn a_registration_marks_only_the_bundle_it_asks_to_mark() {
         use crate::integrations::registry_test_support::tag_fixture as tag;
 
         fn process(mark_bundle: Option<bool>) -> String {
-            let integrations = if let Some(mark_bundle) = mark_bundle {
-                let mut settings = create_test_settings();
+            let mut settings = create_test_settings();
+            if let Some(mark_bundle) = mark_bundle {
                 settings
                     .insert_module_config(
                         "testing",
@@ -1472,13 +1472,16 @@ mod tests {
                         }),
                     )
                     .expect("should insert the stand-in's settings");
-                IntegrationRegistry::new(&settings).expect("should build the registry")
-            } else {
-                IntegrationRegistry::empty_for_tests()
-            };
+                test_support::place_on_every_page(
+                    &mut settings,
+                    crate::middleware::MiddlewarePhase::Fetch,
+                    &[tag::MODULE],
+                );
+            }
+            let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
             let mut config = create_test_config();
-            config.integrations = integrations;
-            let mut processor = create_html_processor(config);
+            config.integrations = registry.clone();
+            let mut processor = test_support::create_page_processor(&settings, &registry, config);
             let output = processor
                 .process_chunk(b"<html><head></head><body></body></html>", true)
                 .expect("should process HTML");
@@ -1500,11 +1503,11 @@ mod tests {
         let attribute = format!("{}=\"true\"", tag::BUNDLE_ATTRIBUTE);
         assert!(
             marked.contains(&attribute),
-            "should mark the bundle an injector asks to mark"
+            "should mark the bundle a registration asks to mark"
         );
         assert!(
             !unmarked.contains(tag::BUNDLE_ATTRIBUTE),
-            "should leave the bundle unmarked when the injector asks for nothing"
+            "should leave the bundle unmarked when the registration asks for nothing"
         );
         assert!(
             !without_the_integration.contains(tag::BUNDLE_ATTRIBUTE),
@@ -1519,7 +1522,7 @@ mod tests {
             .expect("should include the publisher bundle");
         assert!(
             head_insert_index < publisher_bundle_index,
-            "should keep integration head inserts before the publisher bundle"
+            "should keep a middleware's head markup before the publisher bundle"
         );
     }
 

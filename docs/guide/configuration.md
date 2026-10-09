@@ -1803,6 +1803,7 @@ takes one entry, and the order written is the order they run in.
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                      |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                        |
 | `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                           |
+| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it first                  |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
@@ -1936,6 +1937,12 @@ Each `[[proxy.js_asset_proxy.assets]]` entry:
 | `origin_url`        | String  | Required  | Exact upstream JavaScript URL fetched and match-rewritten |
 | `proxy`             | String  | `enabled` | `enabled`, `disabled`, or `blocked` (removes script tags) |
 | `cache_ttl_seconds` | Integer | None      | Optional per-asset downstream cache TTL override          |
+
+Rewriting and removing script tags is the middleware `js_asset_proxy`, which
+runs on the pages a `[[fetch]]` entry names it for. It knows a script by the
+address it is handed, which is the address as the middleware named before it
+left it, so name it first in the entry. See
+[Placing page changes](#placing-page-changes).
 
 ### lockr Integration
 

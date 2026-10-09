@@ -3347,21 +3347,23 @@ pub(crate) mod test_support {
     /// A stand-in for an integration that tags a page, for core's own tests
     /// of the HTML processor and the JavaScript asset proxy.
     ///
-    /// Selected, it inserts one script at the start of `<head>` and rewrites
-    /// the address of its own script to a first-party path. With
-    /// `mark_bundle` set it also asks for an attribute on the publisher
-    /// bundle tag.
+    /// Selected, it supplies one fetch middleware under its own name, which
+    /// writes one script in `<head>` ahead of the bundle and rewrites the
+    /// address of its own script to a first-party path. With `mark_bundle`
+    /// set it also asks for an attribute on the publisher bundle tag.
     pub(crate) mod tag_fixture {
+        use std::rc::Rc;
         use std::sync::Arc;
 
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-            IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
-        };
+        use crate::integrations::registry::{AttributeRewriteAction, IntegrationRegistration};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+            MiddlewarePhase,
+        };
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -3392,35 +3394,27 @@ pub(crate) mod test_support {
 
         struct Tag;
 
-        impl IntegrationHeadInjector for Tag {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Tag {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![format!("<script>{HEAD_FLAG}</script>")]
-            }
-        }
-
-        impl IntegrationAttributeRewriter for Tag {
-            fn integration_id(&self) -> &'static str {
-                ID
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
             }
 
-            fn handles_attribute(&self, attribute: &str) -> bool {
-                attribute == "src"
-            }
-
-            fn rewrite(
-                &self,
-                _attr_name: &str,
-                attr_value: &str,
-                _ctx: &IntegrationAttributeContext<'_>,
-            ) -> AttributeRewriteAction {
-                if attr_value == SCRIPT_URL {
-                    AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
-                } else {
-                    AttributeRewriteAction::Keep
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let decide: Rc<AttributeRewriteFn> = Rc::new(|matched| {
+                    if matched.value == SCRIPT_URL {
+                        AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
+                    } else {
+                        AttributeRewriteAction::Keep
+                    }
+                });
+                MiddlewareAction {
+                    head_inserts: vec![format!("<script>{HEAD_FLAG}</script>")],
+                    element_handlers: vec![Box::new(AttributeRewrite::new("src", decide))],
+                    ..MiddlewareAction::pass()
                 }
             }
         }
@@ -3431,11 +3425,9 @@ pub(crate) mod test_support {
             let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
                 return Ok(None);
             };
-            let tag = Arc::new(Tag);
             let mut registration = IntegrationRegistration::builder(ID)
                 .without_js()
-                .with_attribute_rewriter(tag.clone())
-                .with_head_injector(tag);
+                .with_middleware(Arc::new(Tag));
             if config.mark_bundle {
                 registration = registration.with_bundle_tag_attribute(BUNDLE_ATTRIBUTE, "true");
             }

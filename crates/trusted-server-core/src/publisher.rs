@@ -22429,6 +22429,11 @@ mod tests {
                 }),
             )
             .expect("should insert the stand-in's settings");
+        crate::html_processor::test_support::place_on_every_page(
+            &mut settings,
+            crate::middleware::MiddlewarePhase::Fetch,
+            &[tag::MODULE],
+        );
 
         let body = streaming_finalize_response_with_settings(
             html_stream_params("", None),
