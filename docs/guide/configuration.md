@@ -1787,11 +1787,16 @@ table. An entry carries none and switches nothing on.
 
 The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
-takes one entry, and the order written is the order they run in.
+takes one entry, and the order written is the order they run in. The table
+is in the order the modules register, which is the order `ts audit` writes
+the names in and the order `trusted-server.example.toml` shows them in.
 
 | Middleware                    | Phase       | What it changes                                                                                                                                                                                                   |
 | ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auction.prebid`              | `[[fetch]]` | Writes `window.__tsjs_prebid` and the tag that loads the bundle into the head, and removes an element whose `src` or `href` matches `script_patterns`                                                             |
+| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script |
 | `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                     |
+| `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                            |
 | `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                          |
 | `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                  |
 | `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                       |
@@ -1799,11 +1804,8 @@ takes one entry, and the order written is the order they run in.
 | `tag.google-tag-manager`      | `[[fetch]]` | Points Google Tag Manager and Google Analytics addresses at `/integrations/google_tag_manager`, in `src` and `href` attributes and in the text of inline scripts                                                  |
 | `bot-protection.datadome`     | `[[fetch]]` | Points a `src` or `href` that is a DataDome script's address at `/integrations/datadome`, when `rewrite_sdk` is set                                                                                               |
 | `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                          |
-| `auction.prebid`              | `[[fetch]]` | Writes `window.__tsjs_prebid` and the tag that loads the bundle into the head, and removes an element whose `src` or `href` matches `script_patterns`                                                             |
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
-| `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                            |
-| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

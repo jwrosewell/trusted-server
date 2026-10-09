@@ -254,6 +254,73 @@ mod tests {
     }
 
     #[test]
+    fn the_template_s_entries_name_the_listed_middleware() {
+        use trusted_server_core::settings::Settings;
+        use trusted_server_core::test_support::template::{
+            template_with_resolved_required_secrets, uncomment_block,
+        };
+
+        let template = uncomment_block(
+            &uncomment_block(&template_with_resolved_required_secrets(), "[[fetch]]"),
+            "[[serve]]",
+        );
+        let settings =
+            Settings::from_toml(&template).expect("should load the template with its entries");
+
+        for phase in MiddlewarePhase::ALL {
+            let listed: Vec<&str> = middleware()
+                .iter()
+                .filter(|row| row.phase == phase)
+                .map(|row| row.name)
+                .collect();
+            let entries = settings.phase_entries(phase).entries();
+            assert_eq!(
+                entries.len(),
+                1,
+                "should document one [[{phase}]] entry for every page"
+            );
+            assert!(
+                entries[0].path.is_none(),
+                "should document the [[{phase}]] entry that covers every page"
+            );
+            assert_eq!(
+                entries[0].middleware, listed,
+                "should document every {phase} middleware the stock modules supply, in the \
+                 listed order"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guide_s_table_lists_the_same_middleware() {
+        const GUIDE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/guide/configuration.md"
+        ));
+
+        // A row of the table is a name and then the list it is written in.
+        let documented: Vec<(String, String)> = GUIDE
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').map(str::trim).skip(1);
+                let name = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
+                let list = cells.next()?.strip_prefix("`[[")?.strip_suffix("]]`")?;
+                Some((name.to_owned(), list.to_owned()))
+            })
+            .collect();
+        let listed: Vec<(String, String)> = middleware()
+            .iter()
+            .map(|row| (row.name.to_owned(), row.phase.to_string()))
+            .collect();
+
+        assert_eq!(
+            documented, listed,
+            "should document the middleware the stock modules supply, each with its phase, \
+             in the listed order"
+        );
+    }
+
+    #[test]
     fn a_tool_is_handed_a_module_s_middleware_by_its_integration_id() {
         use trusted_server_bot_protection_datadome as datadome;
         use trusted_server_cmp_didomi as didomi;
