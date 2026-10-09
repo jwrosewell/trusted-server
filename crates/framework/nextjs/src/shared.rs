@@ -8,6 +8,34 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use trusted_server_core::host_rewrite::rewrite_bare_host_at_boundaries;
+use trusted_server_core::integrations::{IntegrationDocumentState, ScriptRewriteAction};
+
+/// What a script rewriter is told about the chunk of text in front of it.
+#[derive(Debug)]
+pub(crate) struct ScriptContext<'a> {
+    /// The host the page is served on.
+    pub(crate) request_host: &'a str,
+    /// The scheme the page is served over.
+    pub(crate) request_scheme: &'a str,
+    /// The host the page was fetched from.
+    pub(crate) origin_host: &'a str,
+    /// Whether the chunk is the last of its text node.
+    pub(crate) is_last_in_text_node: bool,
+    /// The most script text a rewriter may hold while it waits for the rest.
+    pub(crate) max_buffered_script_bytes: usize,
+    /// The state kept for the document the script is in.
+    pub(crate) document_state: &'a IntegrationDocumentState,
+}
+
+/// A decision about the text of the scripts a selector matches, made a chunk
+/// at a time.
+pub(crate) trait ScriptRewriter: Send + Sync {
+    /// The CSS selector of the scripts this rewriter is asked about.
+    fn selector(&self) -> &'static str;
+
+    /// Decides what happens to one chunk of a script's text.
+    fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction;
+}
 
 // These are static code-defined literals, not config-derived patterns, so they
 // intentionally remain lazy statics instead of participating in

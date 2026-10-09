@@ -1,7 +1,7 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -9,14 +9,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
-    html_content::{ContentType, EndTag},
+    html_content::{ContentType, EndTag, TextChunk},
     text,
 };
 
 use crate::integrations::{
-    AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
-    IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState, IntegrationScriptContext,
+    AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState,
     ScriptRewriteAction,
+};
+use crate::middleware::{
+    ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan,
+    TextHandler,
 };
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
@@ -96,10 +99,10 @@ pub struct HtmlProcessorConfig {
     /// Maximum bytes an integration may retain while processing one script or
     /// unresolved streaming group.
     pub max_buffered_body_bytes: usize,
-    /// What modules left on the request for their page hooks, copied into the
-    /// document's state before parsing starts. Empty for a document that may
-    /// be stored and served to other readers, where nothing made for one
-    /// request may appear.
+    /// What modules left on the request, which the serve chain is handed
+    /// where it runs on the same pass as the fetch chain. The fetch chain is
+    /// handed none of it, because what that chain writes may be stored and
+    /// served to other readers.
     pub request_state: IntegrationRequestState,
     /// What the `</body>` seam injects. Decided by the caller rather than inferred
     /// from [`Self::ad_slots_script`].
@@ -176,7 +179,7 @@ impl HtmlProcessorConfig {
         self
     }
 
-    /// Attach what modules left on the request for their page hooks.
+    /// Attach what modules left on the request, for the serve chain.
     #[must_use]
     pub fn with_request_state(mut self, request_state: IntegrationRequestState) -> Self {
         self.request_state = request_state;
@@ -194,22 +197,286 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Create an HTML processor with URL replacement and integration hooks.
+/// The chunk of text being rewritten, as the last handler to change it left
+/// it, shared by every text handler of one document.
+///
+/// The parser hands every handler a chunk as the origin sent it and writes
+/// only the last replacement, so without this a handler would undo the change
+/// of each handler before it.
+#[derive(Default)]
+struct TextEdits(RefCell<String>);
+
+impl TextEdits {
+    /// The chunk as the handlers before this one left it.
+    fn current(&self, chunk: &TextChunk<'_>) -> String {
+        if chunk.removed() {
+            self.0.borrow().clone()
+        } else {
+            chunk.as_str().to_owned()
+        }
+    }
+
+    /// Writes `text` in the chunk's place, as it is.
+    ///
+    /// Written as markup, because a handler is handed the text as the page
+    /// wrote it. Writing it as text would escape `&`, `<` and `>`, and a
+    /// browser decodes none of those inside a script.
+    fn replace(&self, chunk: &mut TextChunk<'_>, text: &str) {
+        chunk.replace(text, ContentType::Html);
+        text.clone_into(&mut self.0.borrow_mut());
+    }
+
+    /// Leaves the chunk out, along with anything an earlier handler wrote in
+    /// its place.
+    fn remove(&self, chunk: &mut TextChunk<'_>) {
+        self.replace(chunk, "");
+    }
+}
+
+/// Create an HTML processor that moves the origin's address to the
+/// publisher's and writes the script bundle, with no middleware.
 ///
 /// # Panics
 ///
 /// Panics if the `ad_bids_state` `Mutex` is poisoned. This cannot happen in
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
+pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    build_html_processor(config, MiddlewarePlan::default())
+}
+
+/// [`create_html_processor`], with the middleware of the `fetch` chain run
+/// on the document as well, and then those of the `serve` chain where the
+/// document goes to one reader and is not stored.
+///
+/// `serve` is `None` for a document that may be stored, whose serve chain
+/// runs on each reader's copy instead, through [`create_serve_processor`].
+///
+/// Each middleware is asked once, here, what it will do with this document.
+/// The state the fetch chain shares is the document's own and holds nothing a
+/// request left, because what that chain writes may be stored and served to
+/// other readers.
+///
+/// A fetch middleware's element handlers are asked after core has moved
+/// the origin's address in an attribute. Its text handlers are handed a chunk
+/// as the handlers before them left it, and its stream processor is handed
+/// what the one before it produced.
+///
+/// # Errors
+///
+/// When a handler's selector does not parse, naming the selector.
+///
+/// # Panics
+///
+/// As [`create_html_processor`].
+pub fn create_html_processor_with_middleware(
+    config: HtmlProcessorConfig,
+    fetch: &MiddlewareChain,
+    serve: Option<&MiddlewareChain>,
+) -> Result<impl StreamProcessor + use<>, String> {
+    let document_state = IntegrationDocumentState::default();
+    let plan = fetch.plan(&MiddlewareContext {
+        phase: fetch.phase(),
+        request_host: &config.request_host,
+        request_scheme: &config.request_scheme,
+        origin_host: &config.origin_host,
+        document_state: &document_state,
+        max_buffered_script_bytes: config.max_buffered_body_bytes,
+    })?;
+    let reader = match serve {
+        Some(serve) => create_serve_processor(
+            serve,
+            &ReaderDocument {
+                request_host: &config.request_host,
+                request_scheme: &config.request_scheme,
+                origin_host: &config.origin_host,
+                request_state: &config.request_state,
+                max_buffered_script_bytes: config.max_buffered_body_bytes,
+            },
+        )?,
+        None => None,
+    };
+    let mut processor = build_html_processor(config, plan);
+    processor.processors.extend(reader);
+    Ok(processor)
+}
+
+/// What a serve chain is told about the reader's copy it works on.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderDocument<'a> {
+    /// Publisher-facing host the reader asked for.
+    pub request_host: &'a str,
+    /// Publisher-facing scheme the reader asked for.
+    pub request_scheme: &'a str,
+    /// Host the document was fetched from.
+    pub origin_host: &'a str,
+    /// What modules left on this reader's request for their page changes.
+    pub request_state: &'a IntegrationRequestState,
+    /// The most a middleware may hold of one script while it decides.
+    pub max_buffered_script_bytes: usize,
+}
+
+/// A processor that carries out a serve chain alone, on one reader's copy of
+/// a document core has already rewritten, or `None` when the chain has
+/// nothing to do.
+///
+/// Nothing of core's own is written or rewritten a second time. Head markup
+/// goes straight before the script bundle's tag and markup for after the
+/// bundle straight after it, so a document core wrote no bundle into gets
+/// neither.
+///
+/// # Errors
+///
+/// When a handler's selector does not parse, naming the selector.
+pub fn create_serve_processor(
+    chain: &MiddlewareChain,
+    document: &ReaderDocument<'_>,
+) -> Result<Option<Box<dyn StreamProcessor>>, String> {
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    let document_state = IntegrationDocumentState::default();
+    document.request_state.seed(&document_state);
+    let plan = chain.plan(&MiddlewareContext {
+        phase: chain.phase(),
+        request_host: document.request_host,
+        request_scheme: document.request_scheme,
+        origin_host: document.origin_host,
+        document_state: &document_state,
+        max_buffered_script_bytes: document.max_buffered_script_bytes,
+    })?;
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(build_serve_processor(plan))))
+}
+
+/// The tag of the script bundle, which core writes once at the start of
+/// `<head>`.
+const BUNDLE_SELECTOR: &str = "script#trustedserver-js";
+
+/// One selector and what a rewriter does with what it matches.
+type ContentHandler = (
+    std::borrow::Cow<'static, lol_html::Selector>,
+    lol_html::ElementContentHandlers<'static>,
+);
+
+/// The rewriter handlers that carry out a plan's element and text handlers.
+///
+/// The text handlers share `edits` with every text handler registered before
+/// them, so each is handed a chunk as the one before it left it.
+///
+/// A selector that does not parse panics here, which
+/// [`MiddlewareChain::plan`] rules out by refusing to plan one.
+fn middleware_content_handlers(
+    element_handlers: Vec<Box<dyn ElementHandler>>,
+    text_handlers: Vec<Box<dyn TextHandler>>,
+    edits: &Rc<TextEdits>,
+) -> Vec<ContentHandler> {
+    let mut handlers: Vec<ContentHandler> = Vec::new();
+    for mut handler in element_handlers {
+        let selector = handler.selector().to_owned();
+        let attribute = handler.attribute().to_owned();
+        handlers.push(element!(selector, move |el| {
+            if el.removed() {
+                return Ok(());
+            }
+            let Some(value) = el.get_attribute(&attribute) else {
+                return Ok(());
+            };
+            let element_name = el.tag_name();
+            match handler.decide(&MatchedAttribute {
+                element_name: &element_name,
+                attribute_name: &attribute,
+                value: &value,
+            }) {
+                AttributeRewriteAction::Keep => {}
+                AttributeRewriteAction::Replace(replacement) => {
+                    if replacement != value {
+                        el.set_attribute(&attribute, &replacement)?;
+                    }
+                }
+                AttributeRewriteAction::RemoveElement => el.remove(),
+            }
+            Ok(())
+        }));
+    }
+    for mut handler in text_handlers {
+        let selector = handler.selector().to_owned();
+        let edits = Rc::clone(edits);
+        handlers.push(text!(selector, move |text| {
+            let current = edits.current(text);
+            match handler.decide(&current, text.last_in_text_node()) {
+                ScriptRewriteAction::Keep => {}
+                ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
+                ScriptRewriteAction::RemoveNode => edits.remove(text),
+            }
+            Ok(())
+        }));
+    }
+    handlers
+}
+
+/// The processor behind [`create_serve_processor`], carrying out `plan` and
+/// nothing else.
+fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
+    let MiddlewarePlan {
+        head_inserts,
+        after_bundle_inserts,
+        element_handlers,
+        text_handlers,
+        processors,
+    } = plan;
+    let mut element_content_handlers: Vec<ContentHandler> = Vec::new();
+    if !head_inserts.is_empty() || !after_bundle_inserts.is_empty() {
+        let before = head_inserts.concat();
+        let after = after_bundle_inserts.concat();
+        let written = Cell::new(false);
+        element_content_handlers.push(element!(BUNDLE_SELECTOR, move |el| {
+            // Core's tag is the first in the document. An element of the
+            // page's own under the same id is left alone.
+            if !written.replace(true) {
+                el.before(&before, ContentType::Html);
+                el.after(&after, ContentType::Html);
+            }
+            Ok(())
+        }));
+    }
+    let edits = Rc::new(TextEdits::default());
+    element_content_handlers.extend(middleware_content_handlers(
+        element_handlers,
+        text_handlers,
+        &edits,
+    ));
+    HtmlWithStreamingProcessors {
+        inner: Box::new(HtmlRewriterAdapter::new(RewriterSettings {
+            element_content_handlers,
+            ..RewriterSettings::default()
+        })),
+        processors,
+    }
+}
+
+/// The processor behind [`create_html_processor`] and
+/// [`create_html_processor_with_middleware`], carrying out `plan`.
+///
+/// A handler in `plan` whose selector does not parse panics here, which
+/// [`MiddlewareChain::plan`] rules out by refusing to plan one.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the returned processor owns request configuration captured by its handlers"
 )]
-pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-    let stream_processor_factories = config.integrations.html_stream_processor_factories();
-    let document_state = IntegrationDocumentState::default();
-    config.request_state.seed(&document_state);
-
+fn build_html_processor(
+    config: HtmlProcessorConfig,
+    plan: MiddlewarePlan,
+) -> HtmlWithStreamingProcessors {
+    let MiddlewarePlan {
+        head_inserts: middleware_head_inserts,
+        after_bundle_inserts: middleware_after_bundle_inserts,
+        element_handlers: middleware_element_handlers,
+        text_handlers: middleware_text_handlers,
+        processors: middleware_processors,
+    } = plan;
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
         origin_host: String,
@@ -276,7 +543,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let injected_tsjs = Rc::new(Cell::new(false));
     let injected_bids = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
-    let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
     let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
@@ -307,8 +573,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         element!("head", {
             let injected_tsjs = injected_tsjs.clone();
             let integrations = integration_registry.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let permissions_script = permissions_script.clone();
             move |el| {
@@ -324,16 +588,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
                     }
-                    let ctx = IntegrationHtmlContext {
-                        request_host: &patterns.request_host,
-                        request_scheme: &patterns.request_scheme,
-                        origin_host: &patterns.origin_host,
-                        document_state: &document_state,
-                    };
-                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
-                    // so it's available when the bundle's auto-init code reads it.
-                    for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
+                    // What the middleware write ahead of the bundle, such as
+                    // a module's configuration, which is then in place when
+                    // the bundle's own start-up code reads it.
+                    for insert in &middleware_head_inserts {
+                        snippet.push_str(insert);
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_parts = integrations.js_parts_immediate();
@@ -342,10 +601,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &immediate_parts,
                         &script_attributes,
                     ));
-                    // What an integration loads after the bundle and ahead of
+                    // What a middleware loads after the bundle and ahead of
                     // the page's own scripts in the origin head.
-                    for insert in integrations.after_bundle_inserts(&ctx) {
-                        snippet.push_str(&insert);
+                    for insert in &middleware_after_bundle_inserts {
+                        snippet.push_str(insert);
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
@@ -424,39 +683,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Replace URLs in href attributes
         element!("[href]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut href) = el.get_attribute("href") {
-                    let original_href = href.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&href) {
-                        href = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "href",
-                        &href,
-                        &IntegrationAttributeContext {
-                            attribute_name: "href",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_href) => {
-                            href = integration_href;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if href != original_href {
-                        el.set_attribute("href", &href)?;
-                    }
+                if let Some(href) = el.get_attribute("href")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&href)
+                {
+                    el.set_attribute("href", &rewritten)?;
                 }
                 Ok(())
             }
@@ -464,38 +695,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut src) = el.get_attribute("src") {
-                    let original_src = src.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&src) {
-                        src = rewritten;
-                    }
-                    match integrations.rewrite_attribute(
-                        "src",
-                        &src,
-                        &IntegrationAttributeContext {
-                            attribute_name: "src",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_src) => {
-                            src = integration_src;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if src != original_src {
-                        el.set_attribute("src", &src)?;
-                    }
+                if let Some(src) = el.get_attribute("src")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&src)
+                {
+                    el.set_attribute("src", &rewritten)?;
                 }
                 Ok(())
             }
@@ -503,39 +707,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Replace URLs in action attributes
         element!("[action]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut action) = el.get_attribute("action") {
-                    let original_action = action.clone();
-                    let element_name = el.tag_name();
-                    if let Some(rewritten) = patterns.rewrite_url_value(&action) {
-                        action = rewritten;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "action",
-                        &action,
-                        &IntegrationAttributeContext {
-                            attribute_name: "action",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_action) => {
-                            action = integration_action;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if action != original_action {
-                        el.set_attribute("action", &action)?;
-                    }
+                if let Some(action) = el.get_attribute("action")
+                    && let Some(rewritten) = patterns.rewrite_url_value(&action)
+                {
+                    el.set_attribute("action", &rewritten)?;
                 }
                 Ok(())
             }
@@ -543,12 +719,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Replace URLs in srcset attributes (for responsive images)
         element!("[srcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut srcset) = el.get_attribute("srcset") {
-                    let original_srcset = srcset.clone();
-                    let element_name = el.tag_name();
-                    let new_srcset = srcset
+                if let Some(srcset) = el.get_attribute("srcset") {
+                    let rewritten = srcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
                         .replace(
@@ -556,33 +729,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             &patterns.protocol_relative_replacement(),
                         )
                         .replace(&patterns.origin_host, &patterns.request_host);
-                    if new_srcset != srcset {
-                        srcset = new_srcset;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "srcset",
-                        &srcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "srcset",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_srcset) => {
-                            srcset = integration_srcset;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if srcset != original_srcset {
-                        el.set_attribute("srcset", &srcset)?;
+                    if rewritten != srcset {
+                        el.set_attribute("srcset", &rewritten)?;
                     }
                 }
                 Ok(())
@@ -591,45 +739,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         // Replace URLs in imagesrcset attributes (for link preload)
         element!("[imagesrcset]", {
             let patterns = patterns.clone();
-            let integrations = integration_registry.clone();
             move |el| {
-                if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
-                    let original_imagesrcset = imagesrcset.clone();
-                    let element_name = el.tag_name();
-                    let new_imagesrcset = imagesrcset
+                if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
+                    let rewritten = imagesrcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
                         .replace(
                             &patterns.protocol_relative_origin(),
                             &patterns.protocol_relative_replacement(),
                         );
-                    if new_imagesrcset != imagesrcset {
-                        imagesrcset = new_imagesrcset;
-                    }
-
-                    match integrations.rewrite_attribute(
-                        "imagesrcset",
-                        &imagesrcset,
-                        &IntegrationAttributeContext {
-                            attribute_name: "imagesrcset",
-                            element_name: &element_name,
-                            request_host: &patterns.request_host,
-                            request_scheme: &patterns.request_scheme,
-                            origin_host: &patterns.origin_host,
-                        },
-                    ) {
-                        AttributeRewriteOutcome::Unchanged => {}
-                        AttributeRewriteOutcome::Replaced(integration_imagesrcset) => {
-                            imagesrcset = integration_imagesrcset;
-                        }
-                        AttributeRewriteOutcome::RemoveElement => {
-                            el.remove();
-                            return Ok(());
-                        }
-                    }
-
-                    if imagesrcset != original_imagesrcset {
-                        el.set_attribute("imagesrcset", &imagesrcset)?;
+                    if rewritten != imagesrcset {
+                        el.set_attribute("imagesrcset", &rewritten)?;
                     }
                 }
                 Ok(())
@@ -668,38 +788,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        let document_state = document_state.clone();
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
-            move |text| {
-                let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
-                    is_last_in_text_node: text.last_in_text_node(),
-                    max_buffered_script_bytes: config.max_buffered_body_bytes,
-                    document_state: &document_state,
-                };
-                match rewriter.rewrite(text.as_str(), &ctx) {
-                    ScriptRewriteAction::Keep => {}
-                    ScriptRewriteAction::Replace(rewritten) => {
-                        text.replace(&rewritten, ContentType::Text);
-                    }
-                    ScriptRewriteAction::RemoveNode => {
-                        text.remove();
-                    }
-                }
-                Ok(())
-            }
-        }));
-    }
+    // Shared by every text handler, so each is handed a chunk as the one
+    // before it left it.
+    let edits = Rc::new(TextEdits::default());
+
+    // Registered after core's own handlers, so an element handler judges an
+    // address as it will be served.
+    element_content_handlers.extend(middleware_content_handlers(
+        middleware_element_handlers,
+        middleware_text_handlers,
+        &edits,
+    ));
 
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
@@ -709,29 +808,296 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     let inner = HtmlRewriterAdapter::new(rewriter_settings);
 
-    let stream_context = crate::integrations::IntegrationHtmlStreamContext {
-        request_host: config.request_host.clone(),
-        request_scheme: config.request_scheme.clone(),
-        origin_host: config.origin_host.clone(),
-        document_state: document_state.clone(),
-    };
-    let processors = stream_processor_factories
-        .into_iter()
-        .map(|factory| factory.create(stream_context.clone()))
-        .collect();
     HtmlWithStreamingProcessors {
         inner: Box::new(inner),
-        processors,
+        processors: middleware_processors,
+    }
+}
+
+/// Running a page through the document pipeline and comparing what comes out
+/// with a recording, for a module crate's own tests.
+///
+/// A recording is the page a reader receives, kept as a file beside the test.
+/// It is how a change to the way a module makes its page change is shown to
+/// leave the page as it was.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use std::io::Cursor;
+
+    use super::{HtmlProcessorConfig, create_html_processor_with_middleware};
+    use crate::integrations::IntegrationRegistry;
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase, PhaseEntries, PhaseEntry};
+    use crate::settings::Settings;
+    use crate::streaming_processor::{
+        Compression, PipelineConfig, StreamProcessor, StreamingPipeline,
+    };
+
+    /// The host a test page is fetched from.
+    pub const ORIGIN_HOST: &str = "origin.example.com";
+
+    /// The host a test page is served on, over HTTPS.
+    pub const REQUEST_HOST: &str = "publisher.example.com";
+
+    /// Set in the environment to write recordings in place of comparing with
+    /// them.
+    pub const RECORD_ENV: &str = "TS_RECORD_PAGES";
+
+    /// What stands in a recording for the hash of the script bundle, which
+    /// changes whenever any browser module does.
+    const BUNDLE_HASH: &str = "BUNDLE-HASH";
+
+    /// The path a test page is asked for at, which decides the entry of the
+    /// settings that covers it.
+    pub const REQUEST_PATH: &str = "/";
+
+    /// Has `settings` run `names` on every page in `phase`, in the order
+    /// given, in place of any entries that phase held.
+    pub fn place_on_every_page(settings: &mut Settings, phase: MiddlewarePhase, names: &[&str]) {
+        let entries = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+        }]);
+        match phase {
+            MiddlewarePhase::Fetch => settings.fetch = entries,
+            MiddlewarePhase::Serve => settings.serve = entries,
+        }
+    }
+
+    /// The processor of a page asked for at [`REQUEST_PATH`] from a
+    /// deployment running `settings` with `registry`'s modules, built from
+    /// `config`, on which a test sets what it is about. The page is not
+    /// stored, so both phases' middleware run on the one pass.
+    ///
+    /// # Panics
+    ///
+    /// When a middleware asks for a selector that does not parse.
+    #[must_use]
+    pub fn create_page_processor(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+        config: HtmlProcessorConfig,
+    ) -> impl StreamProcessor + use<> {
+        let fetch = registry.middleware_chain(
+            &settings.fetch,
+            MiddlewarePhase::Fetch,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
+        let serve = registry.middleware_chain(
+            &settings.serve,
+            MiddlewarePhase::Serve,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
+        create_html_processor_with_middleware(config, &fetch, Some(&serve))
+            .expect("should plan the page's middleware")
+    }
+
+    /// The page a reader of `html` receives from a deployment running
+    /// `settings` with `registry`'s modules, read from the origin `chunk_size`
+    /// bytes at a time and asked for at [`REQUEST_PATH`]. The page is not
+    /// stored, so both phases' middleware run on the one pass.
+    ///
+    /// The script bundle's `?v=` hash is replaced by a fixed word, so a
+    /// recording changes when a module's page change does and not when a
+    /// browser module is rebuilt.
+    ///
+    /// # Panics
+    ///
+    /// When the pipeline refuses the page, or leaves something that is not
+    /// UTF-8.
+    #[must_use]
+    pub fn processed_page(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+        html: &str,
+        chunk_size: usize,
+    ) -> String {
+        let config = HtmlProcessorConfig::from_settings(
+            settings,
+            registry,
+            ORIGIN_HOST,
+            REQUEST_HOST,
+            "https",
+        );
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            create_page_processor(settings, registry, config),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process the page");
+        without_bundle_hashes(&String::from_utf8(output).expect("should leave the page UTF-8"))
+    }
+
+    /// `page` with each `?v=` hash of a script bundle address replaced.
+    fn without_bundle_hashes(page: &str) -> String {
+        const MARK: &str = "/static/tsjs=";
+        let mut out = String::with_capacity(page.len());
+        let mut rest = page;
+        while let Some(at) = rest.find(MARK) {
+            let (before, address) = rest.split_at(at + MARK.len());
+            out.push_str(before);
+            let end = address
+                .find(['"', '\'', ' ', '>', '<'])
+                .unwrap_or(address.len());
+            let (address, after) = address.split_at(end);
+            match address.split_once("?v=") {
+                Some((file, hash))
+                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    out.push_str(file);
+                    out.push_str("?v=");
+                    out.push_str(BUNDLE_HASH);
+                }
+                _ => out.push_str(address),
+            }
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The least a deployment's settings must say, which a module's own
+    /// settings are written after.
+    const BASE_SETTINGS: &str = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "page-recording-password"
+
+[publisher]
+domain = "publisher.example.com"
+cookie_domain = ".publisher.example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "page-recording-proxy-secret"
+
+[geo]
+assume_single_jurisdiction = true
+
+[ec]
+module = "hmac"
+
+[ec.hmac]
+passphrase = "page-recording-passphrase-32-bytes"
+"#;
+
+    /// The settings of a deployment that writes `module_settings`, a TOML
+    /// document selecting a module and holding its table, after the least a
+    /// deployment must say.
+    ///
+    /// # Panics
+    ///
+    /// When the two together are not settings a deployment could load.
+    #[must_use]
+    pub fn page_settings(module_settings: &str) -> Settings {
+        Settings::from_toml(&format!("{BASE_SETTINGS}\n{module_settings}"))
+            .expect("should read the page's settings")
+    }
+
+    /// The size of the chunks a recorded page is read from the origin in,
+    /// large enough that a test page arrives whole.
+    const RECORDING_CHUNK_SIZE: usize = 8192;
+
+    /// Checks the page `html` becomes is the one in `recorded`, byte for
+    /// byte.
+    ///
+    /// The deployment writes `module_settings`, see [`page_settings`], and
+    /// links `builders` beside core's own modules. `recorded` is the recording
+    /// as the test embeds it and `path` is where it is kept. With
+    /// [`RECORD_ENV`] set the recording is written to `path` instead, which is
+    /// how a recording is made. A recording is made again only when the page
+    /// is meant to change for every reader.
+    ///
+    /// # Panics
+    ///
+    /// When the page is not the recorded one, or the recording cannot be
+    /// written.
+    pub fn assert_page_is_recorded(
+        module_settings: &str,
+        builders: &[crate::integrations::IntegrationBuilder],
+        html: &str,
+        recorded: &str,
+        path: &str,
+    ) {
+        let settings = &page_settings(module_settings);
+        let registry = &IntegrationRegistry::with_registrations(settings, builders)
+            .expect("should build the registry");
+        let page = processed_page(settings, registry, html, RECORDING_CHUNK_SIZE);
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os(RECORD_ENV).is_some() {
+            std::fs::write(path, &page).expect("should write the recording");
+            return;
+        }
+        assert!(
+            recorded == page,
+            "the page is not the one recorded at {path}.\n--- recorded\n{recorded}\n--- now\n{page}\n\
+             ---\nA recording changes only when the page is meant to change for every reader, \
+             by running the test with {RECORD_ENV} set."
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{place_on_every_page, processed_page, without_bundle_hashes};
+        use crate::integrations::IntegrationRegistry;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::MiddlewarePhase;
+
+        #[test]
+        fn a_test_page_runs_the_middleware_placed_on_every_page() {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.select_module("testing", fixture::MODULE);
+            let html = "<html><head></head><body></body></html>";
+
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            let unplaced = processed_page(&settings, &registry, html, 8192);
+
+            place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[fixture::HEAD]);
+            place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[fixture::READER]);
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            let placed = processed_page(&settings, &registry, html, 8192);
+
+            assert!(
+                !unplaced.contains("middleware-fixture"),
+                "should run no middleware an entry does not name: {unplaced}"
+            );
+            assert!(
+                placed.contains(&fixture::head_marker(""))
+                    && placed.contains("middleware-fixture-reader"),
+                "should run the middleware of both phases on a test page: {placed}"
+            );
+        }
+
+        #[test]
+        fn a_bundle_hash_is_replaced_and_nothing_else_is() {
+            let page = "<script src=\"/static/tsjs=tsjs-unified.min.js?v=0a1B2c\" id=\"x\"></script>\
+                        <script src='/static/tsjs=tsjs-prebid.min.js?v=ff00' defer></script>\
+                        <a href=\"/static/tsjs=other.js?v=not-a-hash\">kept</a>\
+                        <a href=\"/page?v=0a1b2c\">kept</a>";
+
+            let replaced = without_bundle_hashes(page);
+
+            assert_eq!(
+                replaced,
+                "<script src=\"/static/tsjs=tsjs-unified.min.js?v=BUNDLE-HASH\" id=\"x\"></script>\
+                 <script src='/static/tsjs=tsjs-prebid.min.js?v=BUNDLE-HASH' defer></script>\
+                 <a href=\"/static/tsjs=other.js?v=not-a-hash\">kept</a>\
+                 <a href=\"/page?v=0a1b2c\">kept</a>"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::{
-        AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
-    };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -760,137 +1126,12 @@ mod tests {
     }
 
     #[test]
-    fn integration_attribute_rewriter_can_remove_elements() {
-        struct RemovingLinkRewriter;
-
-        impl IntegrationAttributeRewriter for RemovingLinkRewriter {
-            fn integration_id(&self) -> &'static str {
-                "removing"
-            }
-
-            fn handles_attribute(&self, attribute: &str) -> bool {
-                attribute == "href"
-            }
-
-            fn rewrite(
-                &self,
-                _attr_name: &str,
-                attr_value: &str,
-                _ctx: &IntegrationAttributeContext<'_>,
-            ) -> AttributeRewriteAction {
-                if attr_value.contains("remove-me") {
-                    AttributeRewriteAction::remove_element()
-                } else {
-                    AttributeRewriteAction::keep()
-                }
-            }
-        }
-
-        let html = r#"<html><body>
-            <a href="https://origin.example.com/remove-me">remove</a>
-            <a href="https://origin.example.com/keep-me">keep</a>
-        </body></html>"#;
-
-        let mut config = create_test_config();
-        config.integrations =
-            IntegrationRegistry::from_rewriters(vec![Arc::new(RemovingLinkRewriter)], Vec::new());
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .expect("pipeline should process HTML");
-        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
-
-        assert!(processed.contains("keep-me"));
-        assert!(!processed.contains("remove-me"));
-    }
-
-    #[test]
-    fn integration_head_injector_prepends_after_tsjs_once() {
-        struct TestHeadInjector;
-
-        impl IntegrationHeadInjector for TestHeadInjector {
-            fn integration_id(&self) -> &'static str {
-                "test"
-            }
-
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
-            }
-        }
-
-        let html = "<html><head><title>Test</title></head><body></body></html>";
-
-        let mut config = create_test_config();
-        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![Arc::new(TestHeadInjector)],
-        );
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        pipeline
-            .process(Cursor::new(html.as_bytes()), &mut output)
-            .expect("pipeline should process HTML");
-        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
-
-        let tsjs_marker = "id=\"trustedserver-js\"";
-        let head_marker = "window.__testHeadInjector=true";
-
-        assert_eq!(
-            processed.matches(tsjs_marker).count(),
-            1,
-            "should inject unified tsjs tag once"
-        );
-        assert_eq!(
-            processed.matches(head_marker).count(),
-            1,
-            "should inject head snippet once"
-        );
-
-        let tsjs_index = processed
-            .find(tsjs_marker)
-            .expect("should include unified tsjs tag");
-        let head_index = processed
-            .find(head_marker)
-            .expect("should include head snippet");
-        let title_index = processed
-            .find("<title>")
-            .expect("should keep existing head content");
-
-        assert!(
-            head_index < tsjs_index,
-            "should inject config before tsjs bundle so auto-init can read it"
-        );
-        assert!(
-            tsjs_index < title_index,
-            "should prepend all injected content before existing head content"
-        );
-    }
-
-    #[test]
-    fn integration_head_injector_marks_only_the_bundle_it_asks_to_mark() {
+    fn a_registration_marks_only_the_bundle_it_asks_to_mark() {
         use crate::integrations::registry_test_support::tag_fixture as tag;
 
         fn process(mark_bundle: Option<bool>) -> String {
-            let integrations = if let Some(mark_bundle) = mark_bundle {
-                let mut settings = create_test_settings();
+            let mut settings = create_test_settings();
+            if let Some(mark_bundle) = mark_bundle {
                 settings
                     .insert_module_config(
                         "testing",
@@ -900,13 +1141,16 @@ mod tests {
                         }),
                     )
                     .expect("should insert the stand-in's settings");
-                IntegrationRegistry::new(&settings).expect("should build the registry")
-            } else {
-                IntegrationRegistry::empty_for_tests()
-            };
+                test_support::place_on_every_page(
+                    &mut settings,
+                    crate::middleware::MiddlewarePhase::Fetch,
+                    &[tag::MODULE],
+                );
+            }
+            let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
             let mut config = create_test_config();
-            config.integrations = integrations;
-            let mut processor = create_html_processor(config);
+            config.integrations = registry.clone();
+            let mut processor = test_support::create_page_processor(&settings, &registry, config);
             let output = processor
                 .process_chunk(b"<html><head></head><body></body></html>", true)
                 .expect("should process HTML");
@@ -928,11 +1172,11 @@ mod tests {
         let attribute = format!("{}=\"true\"", tag::BUNDLE_ATTRIBUTE);
         assert!(
             marked.contains(&attribute),
-            "should mark the bundle an injector asks to mark"
+            "should mark the bundle a registration asks to mark"
         );
         assert!(
             !unmarked.contains(tag::BUNDLE_ATTRIBUTE),
-            "should leave the bundle unmarked when the injector asks for nothing"
+            "should leave the bundle unmarked when the registration asks for nothing"
         );
         assert!(
             !without_the_integration.contains(tag::BUNDLE_ATTRIBUTE),
@@ -947,7 +1191,7 @@ mod tests {
             .expect("should include the publisher bundle");
         assert!(
             head_insert_index < publisher_bundle_index,
-            "should keep integration head inserts before the publisher bundle"
+            "should keep a middleware's head markup before the publisher bundle"
         );
     }
 
@@ -957,13 +1201,14 @@ mod tests {
 
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings.select_module("testing", request_fixture::MODULE);
-        let mut config = create_test_config();
-        config.integrations =
+        request_fixture::select_and_place(&mut settings);
+        let registry =
             IntegrationRegistry::new(&settings).expect("should build integration registry");
+        let mut config = create_test_config();
+        config.integrations = registry.clone();
         config.request_state = request_fixture::marked();
 
-        let processor = create_html_processor(config);
+        let processor = test_support::create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -1051,6 +1296,37 @@ mod tests {
         assert!(result.contains(r#"action="https://test.example.com/submit""#));
         assert!(result.contains(r#"action="//test.example.com/submit2""#));
         assert!(!result.contains("origin.example.com"));
+    }
+
+    #[test]
+    fn the_origin_s_address_is_moved_in_srcset_and_imagesrcset() {
+        let mut processor = create_html_processor(create_test_config());
+
+        let output = processor
+            .process_chunk(
+                br#"<html><head><link rel="preload" as="image" imagesrcset="https://origin.example.com/a.png 1x, http://origin.example.com/b.png 2x, //origin.example.com/c.png 3x"></head><body><img srcset="https://origin.example.com/a.png 1x, http://origin.example.com/b.png 2x, //origin.example.com/c.png 3x, origin.example.com/d.png 4x"><img srcset="https://cdn.example.net/e.png 1x"></body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+        let processed = String::from_utf8(output).expect("should stay UTF-8");
+
+        assert!(
+            processed.contains(
+                r#"imagesrcset="https://test.example.com/a.png 1x, https://test.example.com/b.png 2x, //test.example.com/c.png 3x""#
+            ),
+            "should move the origin's address in every candidate of an imagesrcset: {processed}"
+        );
+        assert!(
+            processed.contains(
+                r#"srcset="https://test.example.com/a.png 1x, https://test.example.com/b.png 2x, //test.example.com/c.png 3x, test.example.com/d.png 4x""#
+            ),
+            "should move the origin's address in every candidate of a srcset, a bare host \
+             included: {processed}"
+        );
+        assert!(
+            processed.contains(r#"<img srcset="https://cdn.example.net/e.png 1x">"#),
+            "should leave a srcset that names another host as it is: {processed}"
+        );
     }
 
     #[test]

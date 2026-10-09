@@ -4,13 +4,11 @@ use error_stack::Report;
 use regex::{Regex, escape};
 
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::{
-    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
-};
+use trusted_server_core::integrations::ScriptRewriteAction;
 
+use super::NextJsIntegrationConfig;
 use super::rsc_stream::{FragmentCapture, capture_fragment, document_state};
-use super::shared::strip_origin_host_with_optional_port;
-use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
+use super::shared::{ScriptContext, ScriptRewriter, strip_origin_host_with_optional_port};
 
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -27,11 +25,7 @@ impl NextJsNextDataRewriter {
         })
     }
 
-    fn rewrite_structured(
-        &self,
-        content: &str,
-        ctx: &IntegrationScriptContext<'_>,
-    ) -> ScriptRewriteAction {
+    fn rewrite_structured(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction {
         if ctx.origin_host.is_empty()
             || ctx.request_host.is_empty()
             || self.config.rewrite_attributes.is_empty()
@@ -52,16 +46,12 @@ impl NextJsNextDataRewriter {
     }
 }
 
-impl IntegrationScriptRewriter for NextJsNextDataRewriter {
-    fn integration_id(&self) -> &'static str {
-        NEXTJS_INTEGRATION_ID
-    }
-
+impl ScriptRewriter for NextJsNextDataRewriter {
     fn selector(&self) -> &'static str {
         "script#__NEXT_DATA__"
     }
 
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+    fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction {
         if self.config.rewrite_attributes.is_empty() {
             return ScriptRewriteAction::keep();
         }
@@ -218,12 +208,8 @@ mod tests {
         })
     }
 
-    fn ctx<'a>(
-        selector: &'static str,
-        document_state: &'a IntegrationDocumentState,
-    ) -> IntegrationScriptContext<'a> {
-        IntegrationScriptContext {
-            selector,
+    fn ctx(document_state: &IntegrationDocumentState) -> ScriptContext<'_> {
+        ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -244,9 +230,9 @@ mod tests {
 
         // Document one: cut off before its final fragment arrives.
         let first_document = IntegrationDocumentState::default();
-        let interrupted = IntegrationScriptContext {
+        let interrupted = ScriptContext {
             is_last_in_text_node: false,
-            ..ctx("script#__NEXT_DATA__", &first_document)
+            ..ctx(&first_document)
         };
         let secret = r#"{"props":{"pageProps":{"sessionToken":"SESSION-ONE-SECRET","href":"#;
 
@@ -259,7 +245,7 @@ mod tests {
 
         // Document two: fresh document state, same rewriter.
         let second_document = IntegrationDocumentState::default();
-        let fresh = ctx("script#__NEXT_DATA__", &second_document);
+        let fresh = ctx(&second_document);
         let benign = r#"{"props":{"pageProps":{"href":"https://origin.example.com/reviews"}}}"#;
 
         let action = rewriter.rewrite(benign, &fresh);
@@ -286,7 +272,7 @@ mod tests {
         let rewriter = NextJsNextDataRewriter::new(test_config())
             .expect("should build Next.js structured rewriter");
         let document_state = IntegrationDocumentState::default();
-        let result = rewriter.rewrite(payload, &ctx("script#__NEXT_DATA__", &document_state));
+        let result = rewriter.rewrite(payload, &ctx(&document_state));
 
         match result {
             ScriptRewriteAction::Replace(value) => {
@@ -544,8 +530,7 @@ mod tests {
         let fragment1 = r#"{"props":{"pageProps":{"href":"https://origin."#;
         let fragment2 = r#"example.com/reviews"}}}"#;
 
-        let ctx_intermediate = IntegrationScriptContext {
-            selector: "script#__NEXT_DATA__",
+        let ctx_intermediate = ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -553,7 +538,7 @@ mod tests {
             max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
-        let ctx_last = IntegrationScriptContext {
+        let ctx_last = ScriptContext {
             is_last_in_text_node: true,
             ..ctx_intermediate
         };
@@ -591,8 +576,7 @@ mod tests {
         let document_state = IntegrationDocumentState::default();
         let payload = r#"{"props":{"pageProps":{"href":"https://origin.example.com/page"}}}"#;
 
-        let ctx_single = IntegrationScriptContext {
-            selector: "script#__NEXT_DATA__",
+        let ctx_single = ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -622,8 +606,7 @@ mod tests {
         let fragment1 = r#"{"props":{"pageProps":{"title":"Hello"#;
         let fragment2 = r#" World","count":42}}}"#;
 
-        let ctx_intermediate = IntegrationScriptContext {
-            selector: "script#__NEXT_DATA__",
+        let ctx_intermediate = ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -631,7 +614,7 @@ mod tests {
             max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
-        let ctx_last = IntegrationScriptContext {
+        let ctx_last = ScriptContext {
             is_last_in_text_node: true,
             ..ctx_intermediate
         };
@@ -658,8 +641,7 @@ mod tests {
     fn fragmented_next_data_releases_suppressed_prefix_on_overflow_and_resets() {
         let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
         let document_state = IntegrationDocumentState::default();
-        let first = IntegrationScriptContext {
-            selector: "script#__NEXT_DATA__",
+        let first = ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -681,7 +663,7 @@ mod tests {
         assert_eq!(
             rewriter.rewrite(
                 "-tail",
-                &IntegrationScriptContext {
+                &ScriptContext {
                     is_last_in_text_node: true,
                     ..first
                 },
@@ -701,8 +683,7 @@ mod tests {
         let rewriter = NextJsNextDataRewriter::new(test_config()).expect("should build rewriter");
         let first_state = IntegrationDocumentState::default();
         let second_state = IntegrationDocumentState::default();
-        let first_context = IntegrationScriptContext {
-            selector: "script#__NEXT_DATA__",
+        let first_context = ScriptContext {
             request_host: "ts.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -710,7 +691,7 @@ mod tests {
             max_buffered_script_bytes: 64,
             document_state: &first_state,
         };
-        let second_context = IntegrationScriptContext {
+        let second_context = ScriptContext {
             document_state: &second_state,
             ..first_context
         };
@@ -728,7 +709,7 @@ mod tests {
 
         let ScriptRewriteAction::Replace(first_output) = rewriter.rewrite(
             "done",
-            &IntegrationScriptContext {
+            &ScriptContext {
                 is_last_in_text_node: true,
                 ..first_context
             },

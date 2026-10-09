@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use trusted_server_core::integrations::{
-    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
-};
+use trusted_server_core::integrations::ScriptRewriteAction;
 
+use super::NextJsIntegrationConfig;
 use super::rsc::DEFAULT_MAX_COMBINED_PAYLOAD_BYTES;
 #[cfg(test)]
 pub(super) use super::rsc_stream::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
@@ -12,10 +11,9 @@ use super::rsc_stream::{
     capture_fragment, classify_rsc_group, document_state, rsc_payload_placeholder,
 };
 use super::shared::{
-    RSC_RECEIVER_CONTEXT_BYTES, find_rsc_push_payload_range, find_trimmed_rsc_push_payload_range,
-    receiver_context_is_flight_push,
+    RSC_RECEIVER_CONTEXT_BYTES, ScriptContext, ScriptRewriter, find_rsc_push_payload_range,
+    find_trimmed_rsc_push_payload_range, receiver_context_is_flight_push,
 };
-use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(super) struct NextJsRscPlaceholderRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -169,16 +167,12 @@ impl NextJsRscPlaceholderRewriter {
     }
 }
 
-impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
-    fn integration_id(&self) -> &'static str {
-        NEXTJS_INTEGRATION_ID
-    }
-
+impl ScriptRewriter for NextJsRscPlaceholderRewriter {
     fn selector(&self) -> &'static str {
         "script"
     }
 
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+    fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction {
         if self.config.rewrite_attributes.is_empty() {
             return ScriptRewriteAction::keep();
         }
@@ -344,15 +338,15 @@ fn remember_released(context: &mut String, released: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NEXTJS_INTEGRATION_ID;
     use crate::rsc_stream::NextJsDocumentState;
     use trusted_server_core::integrations::IntegrationDocumentState;
 
     fn ctx(
         is_last_in_text_node: bool,
         document_state: &IntegrationDocumentState,
-    ) -> IntegrationScriptContext<'_> {
-        IntegrationScriptContext {
-            selector: "script",
+    ) -> ScriptContext<'_> {
+        ScriptContext {
             request_host: "proxy.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -732,7 +726,7 @@ mod tests {
 
         let state = IntegrationDocumentState::default();
         let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
-        let context = IntegrationScriptContext {
+        let context = ScriptContext {
             max_buffered_script_bytes: budget,
             ..ctx(true, &state)
         };
