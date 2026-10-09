@@ -1093,6 +1093,13 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
                 buf.push_str(content);
                 return ScriptRewriteAction::RemoveNode;
             }
+            // Nothing held can become a marker now, so what was held goes out
+            // ahead of this fragment. Left for the last fragment, it would be
+            // written after text that came later in the script.
+            if !buf.is_empty() {
+                buf.push_str(content);
+                return ScriptRewriteAction::replace(std::mem::take(&mut *buf));
+            }
             return ScriptRewriteAction::keep();
         }
 
@@ -3413,6 +3420,58 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             ),
             "should change the address and leave the script's operators as they were: \
              {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_held_for_a_marker_that_never_comes_is_written_back_as_it_was() {
+        // The first chunk ends on `google`, which could be the start of a
+        // marker, so the script's text is held until its last chunk shows it
+        // names no Google Tag Manager host.
+        let script = r#"var engine = "google"; if (a && b < c) { search(engine); }"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+        let first_chunk_ends = html.find("google").expect("should find the word") + "google".len();
+
+        let processed = page_with_gtm(&html, first_chunk_ends);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write a script it held and did not change back as the page wrote it: \
+             {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_held_and_then_let_go_keeps_its_order() {
+        // The first chunk ends on `google`, so the script's text is held. Two
+        // chunks later nothing held can become a marker any more, and what was
+        // held has to go out ahead of the text that follows it.
+        let script = r#"var engine = "google"; var one = 1; var two = 2; var three = 3; var four = 4; var five = 5; var six = 6;"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+        let first_chunk_ends = html.find("google").expect("should find the word") + "google".len();
+
+        let processed = page_with_gtm(&html, first_chunk_ends);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write the script back in the order the page wrote it: {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_writes_markup_keeps_its_order() {
+        // The page arrives in one piece. The parser still hands a script's
+        // text over in parts, split where a `<` might close the script, so the
+        // part ending on `google` is held without any help from the network.
+        let script =
+            r#"footer.innerHTML = '<b>Search with google</b> <i>or</i> <u>another</u> engine';"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+
+        let processed = page_with_gtm(&html, 8192);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write the script back in the order the page wrote it: {processed}"
         );
     }
 
