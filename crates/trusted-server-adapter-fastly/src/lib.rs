@@ -46,6 +46,7 @@ use trusted_server_device_fastly::{FastlyDeviceModule, FastlyHostSignals};
 mod app;
 mod backend;
 mod compat;
+mod config_selection;
 mod ec_kv;
 mod esi_assembly;
 mod logging;
@@ -84,6 +85,65 @@ fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandl
         fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
+}
+
+/// Chooses the app-config blob that serves this request.
+///
+/// A `__KEY` selector that carries the host placeholder names a blob for each
+/// host, so the key is the selector with this request's host in it. Any
+/// other selector is the key as it stands.
+///
+/// # Errors
+///
+/// Returns why the request is not served, which [`refusal_response`] turns
+/// into the answer.
+fn stores_for_request(
+    stores: RuntimeStoreConfig,
+    req: &FastlyRequest,
+) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
+    let host = req.get_header_str(header::HOST.as_str());
+    let resolved = config_selection::resolve_key(&stores.config_key, host, |key| {
+        config_selection::blob_exists(stores.config_store_name.as_ref(), key)
+    });
+    match resolved {
+        Ok(config_key) => Ok(RuntimeStoreConfig {
+            config_key,
+            ..stores
+        }),
+        Err(refusal) => {
+            let named = host.unwrap_or_default();
+            match &refusal {
+                config_selection::Refusal::NoConfigForHost => log::warn!(
+                    "no app config for host {named:?} under key selector `{}`",
+                    stores.config_key
+                ),
+                config_selection::Refusal::StoreUnavailable(reason) => {
+                    log::error!("cannot tell whether host {named:?} has an app config: {reason}");
+                }
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// The answer to a request no app-config blob serves.
+///
+/// A host with no blob is answered `421 Misdirected Request`, because this
+/// service is not configured to answer for it. The answer is not to be
+/// stored, so a host is served as soon as its blob is pushed. A store that
+/// could not say whether the host has a blob is answered `500`.
+fn refusal_response(refusal: &config_selection::Refusal) -> FastlyResponse {
+    match refusal {
+        config_selection::Refusal::NoConfigForHost => {
+            FastlyResponse::from_status(fastly::http::StatusCode::MISDIRECTED_REQUEST)
+                .with_header("cache-control", "private, no-store")
+                .with_body_text_plain("Misdirected Request")
+        }
+        config_selection::Refusal::StoreUnavailable(_) => {
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body_text_plain("Internal Server Error")
+        }
+    }
 }
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
@@ -359,7 +419,16 @@ fn heap_mib() -> String {
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
     let runtime_env = runtime_env_config(TrustedServerApp::stores());
-    let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+    // Settled before anything reads settings, so every path below reads the
+    // blob of the publisher this request is for.
+    let runtime_stores = match stores_for_request(RuntimeStoreConfig::from_env(&runtime_env), &req)
+    {
+        Ok(stores) => stores,
+        Err(refusal) => {
+            refusal_response(&refusal).send_to_client();
+            return;
+        }
+    };
 
     // Short-circuit the sandbox counters probe before app construction. It must
     // not build the application: polling it would otherwise increment the very
@@ -1200,6 +1269,97 @@ mod tests {
         assert!(
             health_response(&req).is_none(),
             "should only short-circuit /health"
+        );
+    }
+
+    /// The stores a service with no runtime overrides resolves, with
+    /// `selector` as its `__KEY` selector.
+    fn stores_with_selector(selector: &str) -> RuntimeStoreConfig {
+        RuntimeStoreConfig {
+            config_key: selector.to_owned(),
+            ..RuntimeStoreConfig::from_env(&edgezero_core::env_config::EnvConfig::default())
+        }
+    }
+
+    /// A request carrying `host` as its `Host` header, or none.
+    fn request_for_host(host: Option<&str>) -> FastlyRequest {
+        let mut req = FastlyRequest::get("https://example.com/article");
+        req.remove_header(header::HOST.as_str());
+        if let Some(host) = host {
+            req.set_header(header::HOST.as_str(), host);
+        }
+        req
+    }
+
+    #[test]
+    fn a_service_with_one_blob_reads_its_key_whatever_the_host() {
+        for selector in ["trusted_server_config", "trusted_server_config_staging"] {
+            let stores = stores_with_selector(selector);
+
+            for host in [None, Some("publisher.example"), Some("not a host")] {
+                let resolved = stores_for_request(stores.clone(), &request_for_host(host))
+                    .expect("should serve from the one blob");
+
+                assert_eq!(
+                    resolved, stores,
+                    "should read `{selector}` for host {host:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_selector_refuses_what_is_not_a_host_name() {
+        for host in [
+            None,
+            Some(""),
+            Some("trusted_server_config"),
+            Some("publisher.example.__edgezero_chunks.abc.0"),
+            Some("[::1]:7676"),
+        ] {
+            let refusal =
+                stores_for_request(stores_with_selector("{host}"), &request_for_host(host))
+                    .expect_err("should refuse a request that names no host name");
+
+            assert_eq!(
+                refusal,
+                config_selection::Refusal::NoConfigForHost,
+                "should refuse host {host:?} as one with no app config"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_with_no_app_config_is_answered_421_and_the_answer_is_not_stored() {
+        let mut response = refusal_response(&config_selection::Refusal::NoConfigForHost);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::MISDIRECTED_REQUEST,
+            "should say this service does not answer for the host"
+        );
+        assert_eq!(
+            response.get_header_str("cache-control"),
+            Some("private, no-store"),
+            "a refusal should not be stored, so the host is served once it has a blob"
+        );
+        assert_eq!(
+            response.take_body_str(),
+            "Misdirected Request",
+            "should say only that the request was misdirected"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_store_is_answered_500() {
+        let response = refusal_response(&config_selection::Refusal::StoreUnavailable(
+            "lookup failed".to_owned(),
+        ));
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "should not answer 421 while the host's blob is unknown"
         );
     }
 
