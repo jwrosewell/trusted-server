@@ -1028,9 +1028,11 @@ pub mod test_support {
 
     use super::{HtmlProcessorConfig, create_html_processor_with_middleware};
     use crate::integrations::IntegrationRegistry;
-    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase, PhaseEntries, PhaseEntry};
     use crate::settings::Settings;
-    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::streaming_processor::{
+        Compression, PipelineConfig, StreamProcessor, StreamingPipeline,
+    };
 
     /// The host a test page is fetched from.
     pub const ORIGIN_HOST: &str = "origin.example.com";
@@ -1049,6 +1051,50 @@ pub mod test_support {
     /// The path a test page is asked for at, which decides the entry of the
     /// settings that covers it.
     pub const REQUEST_PATH: &str = "/";
+
+    /// Has `settings` run `names` on every page in `phase`, in the order
+    /// given, in place of any entries that phase held.
+    pub fn place_on_every_page(settings: &mut Settings, phase: MiddlewarePhase, names: &[&str]) {
+        let entries = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+        }]);
+        match phase {
+            MiddlewarePhase::Fetch => settings.fetch = entries,
+            MiddlewarePhase::Serve => settings.serve = entries,
+        }
+    }
+
+    /// The processor of a page asked for at [`REQUEST_PATH`] from a
+    /// deployment running `settings` with `registry`'s modules, built from
+    /// `config`, on which a test sets what it is about. The page is not
+    /// stored, so both phases' middleware run on the one pass.
+    ///
+    /// # Panics
+    ///
+    /// When a middleware asks for a selector that does not parse.
+    #[must_use]
+    pub fn create_page_processor(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+        config: HtmlProcessorConfig,
+    ) -> impl StreamProcessor + use<> {
+        let fetch = registry.middleware_chain(
+            &settings.fetch,
+            MiddlewarePhase::Fetch,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
+        let serve = registry.middleware_chain(
+            &settings.serve,
+            MiddlewarePhase::Serve,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
+        create_html_processor_with_middleware(config, &fetch, Some(&serve))
+            .expect("should plan the page's middleware")
+    }
 
     /// The page a reader of `html` receives from a deployment running
     /// `settings` with `registry`'s modules, read from the origin `chunk_size`
@@ -1077,26 +1123,13 @@ pub mod test_support {
             REQUEST_HOST,
             "https",
         );
-        let fetch = registry.middleware_chain(
-            &settings.fetch,
-            MiddlewarePhase::Fetch,
-            HTML_MEDIA_TYPE,
-            REQUEST_PATH,
-        );
-        let serve = registry.middleware_chain(
-            &settings.serve,
-            MiddlewarePhase::Serve,
-            HTML_MEDIA_TYPE,
-            REQUEST_PATH,
-        );
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
                 input_compression: Compression::None,
                 output_compression: Compression::None,
                 chunk_size,
             },
-            create_html_processor_with_middleware(config, &fetch, Some(&serve))
-                .expect("should plan the page's middleware"),
+            create_page_processor(settings, registry, config),
         );
         let mut output = Vec::new();
         pipeline
@@ -1214,7 +1247,35 @@ passphrase = "page-recording-passphrase-32-bytes"
 
     #[cfg(test)]
     mod tests {
-        use super::without_bundle_hashes;
+        use super::{place_on_every_page, processed_page, without_bundle_hashes};
+        use crate::integrations::IntegrationRegistry;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::MiddlewarePhase;
+
+        #[test]
+        fn a_test_page_runs_the_middleware_placed_on_every_page() {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.select_module("testing", fixture::MODULE);
+            let html = "<html><head></head><body></body></html>";
+
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            let unplaced = processed_page(&settings, &registry, html, 8192);
+
+            place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[fixture::HEAD]);
+            place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[fixture::READER]);
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            let placed = processed_page(&settings, &registry, html, 8192);
+
+            assert!(
+                !unplaced.contains("middleware-fixture"),
+                "should run no middleware an entry does not name: {unplaced}"
+            );
+            assert!(
+                placed.contains(&fixture::head_marker(""))
+                    && placed.contains("middleware-fixture-reader"),
+                "should run the middleware of both phases on a test page: {placed}"
+            );
+        }
 
         #[test]
         fn a_bundle_hash_is_replaced_and_nothing_else_is() {

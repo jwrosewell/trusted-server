@@ -162,6 +162,22 @@ impl AttributeRewrite {
             decide,
         }
     }
+
+    /// One handler for each of `attributes`, each asking `decide` about every
+    /// element that carries it, for a decision that is the same wherever an
+    /// address is written.
+    #[must_use]
+    pub fn each(
+        attributes: &[&'static str],
+        decide: &Rc<AttributeRewriteFn>,
+    ) -> Vec<Box<dyn ElementHandler>> {
+        attributes
+            .iter()
+            .map(|attribute| {
+                Box::new(Self::new(attribute, Rc::clone(decide))) as Box<dyn ElementHandler>
+            })
+            .collect()
+    }
 }
 
 impl ElementHandler for AttributeRewrite {
@@ -603,6 +619,32 @@ impl fmt::Debug for MiddlewarePlan {
             .field("text_handlers", &selectors_of_text(&self.text_handlers))
             .field("processors", &self.processors.len())
             .finish()
+    }
+}
+
+/// What a module's own tests hand a middleware they call directly.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{MiddlewareContext, MiddlewarePhase};
+    use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
+    use crate::integrations::IntegrationDocumentState;
+
+    /// What a middleware is told in `phase` about a test page, fetched from
+    /// [`ORIGIN_HOST`] for a reader of [`REQUEST_HOST`] over HTTPS, with
+    /// `document_state` as the document's.
+    #[must_use]
+    pub fn context(
+        phase: MiddlewarePhase,
+        document_state: &IntegrationDocumentState,
+    ) -> MiddlewareContext<'_> {
+        MiddlewareContext {
+            phase,
+            request_host: REQUEST_HOST,
+            request_scheme: "https",
+            origin_host: ORIGIN_HOST,
+            document_state,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
+        }
     }
 }
 

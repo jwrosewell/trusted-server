@@ -577,6 +577,60 @@ fn an_element_handler_is_asked_about_an_address_as_it_will_be_served() {
 }
 
 #[test]
+fn one_decision_can_be_asked_about_each_of_several_attributes() {
+    let chain = chain_of(vec![middleware("example.each", |_| {
+        let decide: Rc<AttributeRewriteFn> = Rc::new(|matched| {
+            if matched.value == "/vendor.js" {
+                AttributeRewriteAction::replace(format!(
+                    "/first-party.js#{}",
+                    matched.attribute_name
+                ))
+            } else {
+                AttributeRewriteAction::keep()
+            }
+        });
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
+        }
+    })]);
+
+    let page = page(
+        &chain,
+        r#"<html><body><script src="/vendor.js"></script><link href="/vendor.js"><img src="/other.png"><a data-src="/vendor.js">x</a></body></html>"#,
+    );
+
+    assert!(
+        page.contains(r#"<script src="/first-party.js#src"></script>"#)
+            && page.contains(r#"<link href="/first-party.js#href">"#),
+        "should ask the one decision about each attribute named: {page}"
+    );
+    assert!(
+        page.contains(r#"<img src="/other.png">"#) && page.contains(r#"<a data-src="/vendor.js">"#),
+        "should leave another value and another attribute alone: {page}"
+    );
+}
+
+#[test]
+fn a_module_s_tests_can_call_a_middleware_with_a_test_page_s_context() {
+    use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
+
+    let document_state = crate::integrations::IntegrationDocumentState::default();
+    let context = test_support::context(MiddlewarePhase::Serve, &document_state);
+
+    assert_eq!(context.phase, MiddlewarePhase::Serve);
+    assert_eq!(
+        (
+            context.request_scheme,
+            context.request_host,
+            context.origin_host
+        ),
+        ("https", REQUEST_HOST, ORIGIN_HOST),
+        "should describe the page the recording helpers serve"
+    );
+}
+
+#[test]
 fn an_element_handler_can_remove_the_element() {
     let chain = chain_of(vec![element("example.remove", "a.gone", "href", |_| {
         AttributeRewriteAction::remove_element()
