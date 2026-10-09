@@ -7,10 +7,11 @@ use serde_json::json;
 
 use super::*;
 use crate::html_processor::{
-    HtmlProcessorConfig, create_html_processor, create_html_processor_with_middleware,
+    HtmlProcessorConfig, ReaderDocument, create_html_processor,
+    create_html_processor_with_middleware, create_serve_processor,
 };
-use crate::integrations::IntegrationRegistry;
 use crate::integrations::registry_test_support::request_fixture;
+use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 use crate::test_support::tests::create_test_settings;
 
@@ -21,6 +22,8 @@ const BUNDLE_TAG: &str = "id=\"trustedserver-js\"";
 type CreateFn = dyn Fn(&MiddlewareContext<'_>) -> MiddlewareAction + Send + Sync;
 
 /// A middleware made from a function, under a name of the test's choosing.
+/// It says it runs in both phases, and a test runs it in the one its chain
+/// names.
 struct FromFn {
     id: &'static str,
     create: Box<CreateFn>,
@@ -32,7 +35,7 @@ impl Middleware for FromFn {
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
-        &[MiddlewarePhase::Fetch]
+        &MiddlewarePhase::ALL
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
@@ -52,6 +55,55 @@ fn middleware(
 
 fn chain_of(middleware: Vec<Arc<dyn Middleware>>) -> MiddlewareChain {
     MiddlewareChain::new(MiddlewarePhase::Fetch, middleware)
+}
+
+fn serve_chain_of(middleware: Vec<Arc<dyn Middleware>>) -> MiddlewareChain {
+    MiddlewareChain::new(MiddlewarePhase::Serve, middleware)
+}
+
+/// What a serve chain is told of a reader whose request left `request_state`.
+fn reader(request_state: &IntegrationRequestState) -> ReaderDocument<'_> {
+    ReaderDocument {
+        request_host: REQUEST_HOST,
+        request_scheme: "https",
+        origin_host: ORIGIN_HOST,
+        request_state,
+        max_buffered_script_bytes: 16 * 1024 * 1024,
+    }
+}
+
+/// `html`, a document core has already rewritten, as a reader whose request
+/// left `request_state` receives it after `chain` has run, read `chunk_size`
+/// bytes at a time. A chain with nothing to do leaves it as it was.
+fn served_with(
+    chain: &MiddlewareChain,
+    request_state: &IntegrationRequestState,
+    html: &str,
+    chunk_size: usize,
+) -> String {
+    let Some(mut processor) = create_serve_processor(chain, &reader(request_state))
+        .expect("should plan the reader's middleware")
+    else {
+        return html.to_owned();
+    };
+    let mut output = Vec::new();
+    for chunk in html.as_bytes().chunks(chunk_size) {
+        output.extend(
+            processor
+                .process_chunk(chunk, false)
+                .expect("should process a piece of the reader's copy"),
+        );
+    }
+    output.extend(
+        processor
+            .process_chunk(&[], true)
+            .expect("should finish the reader's copy"),
+    );
+    String::from_utf8(output).expect("should leave the reader's copy UTF-8")
+}
+
+fn served(chain: &MiddlewareChain, html: &str) -> String {
+    served_with(chain, &IntegrationRequestState::default(), html, 8192)
 }
 
 /// A middleware that writes `markup` at the start of `<head>`.
@@ -133,7 +185,7 @@ fn page_with(
     html: &str,
     chunk_size: usize,
 ) -> String {
-    let processor = create_html_processor_with_middleware(config, chain)
+    let processor = create_html_processor_with_middleware(config, chain, None)
         .expect("should plan the document's middleware");
     let mut pipeline = StreamingPipeline::new(
         PipelineConfig {
@@ -863,7 +915,7 @@ fn a_selector_that_does_not_parse_refuses_the_document_naming_the_middleware() {
     ];
 
     for chain in chains {
-        let message = create_html_processor_with_middleware(config(), &chain)
+        let message = create_html_processor_with_middleware(config(), &chain, None)
             .err()
             .expect("should refuse to plan the document");
 
@@ -996,6 +1048,256 @@ fn a_middleware_runs_after_the_hooks_of_the_same_kind() {
 }
 
 // ---------------------------------------------------------------------------
+// What the document pipeline does with a serve chain
+// ---------------------------------------------------------------------------
+
+/// [`PAGE`] as core leaves it for a store, with the script bundle in its
+/// head and one link.
+fn rewritten_page() -> String {
+    page(
+        &chain_of(Vec::new()),
+        r#"<html><head><title>Page</title></head><body><a href="https://origin.example.com/x">x</a><script>var a = 1;</script></body></html>"#,
+    )
+}
+
+#[test]
+fn a_serve_chain_writes_head_markup_straight_before_the_bundle_and_the_rest_straight_after() {
+    let chain = serve_chain_of(vec![
+        middleware("example.first", |_| MiddlewareAction {
+            head_inserts: vec!["<meta name=\"first\">".to_owned()],
+            after_bundle_inserts: vec!["<script id=\"after-first\"></script>".to_owned()],
+            ..MiddlewareAction::pass()
+        }),
+        middleware("example.second", |_| MiddlewareAction {
+            head_inserts: vec!["<meta name=\"second\">".to_owned()],
+            after_bundle_inserts: vec!["<script id=\"after-second\"></script>".to_owned()],
+            ..MiddlewareAction::pass()
+        }),
+    ]);
+    let rewritten = rewritten_page();
+
+    let page = served(&chain, &rewritten);
+
+    assert!(
+        page.contains("<meta name=\"first\"><meta name=\"second\"><script src="),
+        "should write head markup in the order named, straight before the bundle: {page}"
+    );
+    assert!(
+        page.contains(
+            "id=\"trustedserver-js\"></script><script id=\"after-first\"></script><script \
+             id=\"after-second\"></script>"
+        ),
+        "should write the markup for after the bundle straight after it: {page}"
+    );
+    assert_eq!(
+        page.matches(BUNDLE_TAG).count(),
+        1,
+        "should write no second bundle: {page}"
+    );
+    assert_eq!(
+        page.replace("<meta name=\"first\"><meta name=\"second\">", "")
+            .replace(
+                "<script id=\"after-first\"></script><script id=\"after-second\"></script>",
+                ""
+            ),
+        rewritten,
+        "should change nothing else of a document core has already rewritten"
+    );
+}
+
+#[test]
+fn a_serve_chain_writes_head_markup_once_where_the_page_repeats_the_bundle_s_id() {
+    let chain = serve_chain_of(vec![head("example.first", "<meta name=\"first\">")]);
+    let rewritten = rewritten_page().replace(
+        "</body>",
+        "<script id=\"trustedserver-js\">var own = 1;</script></body>",
+    );
+
+    let page = served(&chain, &rewritten);
+
+    assert_eq!(
+        page.matches("name=\"first\"").count(),
+        1,
+        "should write head markup at core's tag alone: {page}"
+    );
+    assert!(
+        index_of(&page, "name=\"first\"") < index_of(&page, "<title>"),
+        "should write it in the head: {page}"
+    );
+}
+
+#[test]
+fn a_reader_s_copy_with_no_bundle_gets_no_head_markup() {
+    let chain = serve_chain_of(vec![head("example.first", "<meta name=\"first\">")]);
+
+    let page = served(&chain, "<p>a fragment</p>");
+
+    assert_eq!(page, "<p>a fragment</p>");
+}
+
+#[test]
+fn a_serve_chain_s_handlers_work_on_the_page_as_core_left_it() {
+    let chain = serve_chain_of(vec![
+        element("example.link", "a", "href", |matched| {
+            AttributeRewriteAction::replace(format!("{}?reader=1", matched.value))
+        }),
+        text("example.script", "script", || {
+            |text: &str, _is_last: bool| {
+                if text.contains("var a = 1;") {
+                    ScriptRewriteAction::replace(text.replace("var a = 1;", "var a = 2 && 3;"))
+                } else {
+                    ScriptRewriteAction::keep()
+                }
+            }
+        }),
+    ]);
+
+    let page = served(&chain, &rewritten_page());
+
+    assert!(
+        page.contains(r#"<a href="https://test.example.com/x?reader=1">"#),
+        "should hand an element handler the address core already moved: {page}"
+    );
+    assert!(
+        page.contains("<script>var a = 2 && 3;</script>"),
+        "should write a text handler's replacement as it is: {page}"
+    );
+}
+
+#[test]
+fn a_serve_chain_s_stream_processor_runs_over_the_reader_s_copy() {
+    let chain = serve_chain_of(vec![middleware("example.stream", |_| MiddlewareAction {
+        stream: Some(Box::new(Rewording {
+            from: "<title>Page</title>",
+            to: "<title>Reader</title>",
+            comment: "<!--reader-->",
+        })),
+        ..MiddlewareAction::pass()
+    })]);
+
+    let page = served(&chain, &rewritten_page());
+
+    assert!(page.contains("<title>Reader</title>") && page.ends_with("<!--reader-->"));
+}
+
+#[test]
+fn a_serve_middleware_reads_what_the_request_left() {
+    let chain = serve_chain_of(vec![middleware("example.reads", |context| {
+        let marked = context
+            .document_state
+            .get::<request_fixture::Mark>(request_fixture::ID)
+            .is_some();
+        MiddlewareAction {
+            head_inserts: vec![format!(
+                "<meta name=\"reader\" content=\"{} {}://{} from {}; marked {marked}\">",
+                context.phase, context.request_scheme, context.request_host, context.origin_host
+            )],
+            ..MiddlewareAction::pass()
+        }
+    })]);
+    let rewritten = rewritten_page();
+
+    let marked = served_with(&chain, &request_fixture::marked(), &rewritten, 8192);
+    let unmarked = served(&chain, &rewritten);
+
+    let told = format!("serve https://{REQUEST_HOST} from {ORIGIN_HOST}");
+    assert!(
+        marked.contains(&format!("content=\"{told}; marked true\"")),
+        "should hand a serve middleware what the request left: {marked}"
+    );
+    assert!(
+        unmarked.contains(&format!("content=\"{told}; marked false\"")),
+        "should hand it nothing where the request left nothing: {unmarked}"
+    );
+}
+
+#[test]
+fn a_serve_chain_with_nothing_to_do_makes_no_processor() {
+    let state = IntegrationRequestState::default();
+
+    let none = create_serve_processor(&serve_chain_of(Vec::new()), &reader(&state))
+        .expect("should plan an empty chain");
+    assert!(none.is_none(), "should make no processor for no middleware");
+
+    let passes = serve_chain_of(vec![middleware("example.pass", |_| {
+        MiddlewareAction::pass()
+    })]);
+    let none =
+        create_serve_processor(&passes, &reader(&state)).expect("should plan a chain that passes");
+    assert!(
+        none.is_none(),
+        "should make no processor where every middleware leaves the page alone"
+    );
+}
+
+#[test]
+fn a_serve_selector_that_does_not_parse_refuses_the_reader_s_copy() {
+    let chain = serve_chain_of(vec![element("example.broken", "a[", "href", |_| {
+        AttributeRewriteAction::keep()
+    })]);
+
+    let message = create_serve_processor(&chain, &reader(&IntegrationRequestState::default()))
+        .err()
+        .expect("should refuse to plan the reader's copy");
+
+    assert!(
+        message.contains("the serve middleware `example.broken` cannot run")
+            && message.contains("`a[` is not a usable selector"),
+        "should name the phase, the middleware and the selector: {message}"
+    );
+}
+
+#[test]
+fn on_a_page_that_is_not_stored_the_serve_chain_follows_the_fetch_chain_on_the_one_pass() {
+    let fetch = chain_of(vec![
+        head("example.fetch-head", "<meta name=\"fetch\">"),
+        element("example.fetch-link", "a", "href", |_| {
+            AttributeRewriteAction::replace("/fetch")
+        }),
+    ]);
+    let serve = serve_chain_of(vec![
+        head("example.serve-head", "<meta name=\"serve\">"),
+        element("example.serve-link", "a", "href", |matched| {
+            AttributeRewriteAction::replace(format!("{}/serve", matched.value))
+        }),
+    ]);
+    let html =
+        r#"<html><head><title>Page</title></head><body><a href="/start">x</a></body></html>"#;
+
+    // Read whole, and then seven bytes at a time, so the second rewriter is
+    // fed the first one's output in pieces.
+    for chunk_size in [8192, 7] {
+        let processor = create_html_processor_with_middleware(config(), &fetch, Some(&serve))
+            .expect("should plan both chains");
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            processor,
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process the document");
+        let page = String::from_utf8(output).expect("should leave the document UTF-8");
+
+        assert!(
+            page.contains(r#"<a href="/fetch/serve">"#),
+            "should hand the serve chain the page as the fetch chain left it: {page}"
+        );
+        let fetch_head = index_of(&page, "name=\"fetch\"");
+        let serve_head = index_of(&page, "name=\"serve\"");
+        assert!(
+            fetch_head < serve_head && serve_head < index_of(&page, BUNDLE_TAG),
+            "should write the serve chain's head markup after the fetch chain's and ahead of \
+             the bundle: {page}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The settings
 // ---------------------------------------------------------------------------
 
@@ -1033,12 +1335,58 @@ middleware = ["example.all"]
 }
 
 #[test]
+fn serve_entries_are_read_from_the_settings_beside_the_fetch_entries() {
+    let settings = settings_with_document(
+        r#"
+[[fetch]]
+media_type = "text/html"
+middleware = ["example.all"]
+
+[[serve]]
+media_type = "text/html"
+path = "/news/"
+middleware = ["example.reader"]
+"#,
+    )
+    .expect("should read settings with an entry in each phase");
+
+    assert_eq!(
+        settings.phase_entries(MiddlewarePhase::Fetch),
+        &PhaseEntries::new(vec![entry(None, &["example.all"])])
+    );
+    assert_eq!(
+        settings.phase_entries(MiddlewarePhase::Serve),
+        &PhaseEntries::new(vec![entry(Some("/news/"), &["example.reader"])])
+    );
+    let written = serde_json::to_value(&settings).expect("should write the settings");
+    assert_eq!(
+        written.get("serve"),
+        Some(&json!([
+            { "media_type": "text/html", "path": "/news/", "middleware": ["example.reader"] }
+        ])),
+        "should write the serve entries a document holds"
+    );
+}
+
+#[test]
+fn settings_with_a_misshapen_serve_entry_are_refused_naming_the_phase() {
+    let message =
+        settings_with_document("\n[[serve]]\nmedia_type = \"text/html\"\nmiddleware = []\n")
+            .expect_err("should refuse the settings");
+
+    assert!(
+        message.contains("[[serve]] entry 1 names no middleware"),
+        "should name the phase and the entry: {message}"
+    );
+}
+
+#[test]
 fn settings_without_entries_write_no_fetch_key() {
     let settings = settings_with_document("").expect("should read settings with no entries");
     let written = serde_json::to_value(&settings).expect("should write the settings");
     assert!(
-        written.get("fetch").is_none(),
-        "should leave the key out of a stored document that wrote no entries"
+        written.get("fetch").is_none() && written.get("serve").is_none(),
+        "should leave both keys out of a stored document that wrote no entries"
     );
 
     let settings = settings_with_document(

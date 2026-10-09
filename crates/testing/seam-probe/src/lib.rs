@@ -2,8 +2,8 @@
 //! part of the integration seam from a vendor crate's position.
 //!
 //! One registration carries a browser module, a proxy route, a geo module,
-//! an Edge Cookie identity module, a device module and a middleware that
-//! changes a page, alongside its own configuration block, and the builder
+//! an Edge Cookie identity module, a device module and a middleware for
+//! each phase of a page, alongside its own configuration block, and the builder
 //! adds a request preparer, a demand implementation `[demand]` can name and
 //! an ad server implementation `[ad-server]` can name. The round-trip
 //! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
@@ -185,6 +185,41 @@ impl Middleware for SeamProbeMiddleware {
                 country: self.country.clone(),
                 held: String::new(),
             })],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// The name an entry gives the probe's serve middleware, which is the
+/// module's name with a part of its own after it.
+#[must_use]
+pub fn reader_middleware_name() -> &'static str {
+    trusted_server_core::module_name!("reader")
+}
+
+/// What the probe's serve middleware writes ahead of the script bundle for a
+/// reader who asked for `request_host`.
+#[must_use]
+pub fn seam_probe_reader_marker(request_host: &str) -> String {
+    format!("<meta name=\"seam-probe-reader\" content=\"{request_host}\">")
+}
+
+/// The probe's change to one reader's copy of a page, which marks the head
+/// with the host that reader asked for.
+pub struct SeamProbeReaderMiddleware;
+
+impl Middleware for SeamProbeReaderMiddleware {
+    fn middleware_id(&self) -> &'static str {
+        reader_middleware_name()
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec![seam_probe_reader_marker(context.request_host)],
             ..MiddlewareAction::pass()
         }
     }
@@ -597,7 +632,8 @@ pub fn register(
         })
         .with_middleware(Arc::new(SeamProbeMiddleware {
             country: config.country.clone(),
-        }));
+        }))
+        .with_middleware(Arc::new(SeamProbeReaderMiddleware));
     if config.declares_geo {
         registration = registration
             .with_geo_module(module_name(), Arc::new(SeamProbeGeo::new(config.country)));
@@ -877,13 +913,53 @@ mod tests {
     }
 
     #[test]
+    fn the_serve_middleware_marks_a_reader_s_copy_where_an_entry_names_it() {
+        use trusted_server_core::html_processor::test_support::REQUEST_HOST;
+
+        let settings = settings_with_probe(
+            r#"country = "NZ"
+
+                [[fetch]]
+                media_type = "text/html"
+                middleware = ["testing.seam-probe"]
+
+                [[serve]]
+                media_type = "text/html"
+                middleware = ["testing.seam-probe.reader"]
+            "#,
+        );
+
+        let page = probe_page(&settings, 8192);
+
+        let country = page
+            .find(&seam_probe_head_marker("NZ"))
+            .expect("should mark the head with the country");
+        let reader = page
+            .find(&seam_probe_reader_marker(REQUEST_HOST))
+            .expect("should mark the head with the host the reader asked for");
+        let bundle = page
+            .find("id=\"trustedserver-js\"")
+            .expect("should carry the script bundle");
+        assert!(
+            country < reader && reader < bundle,
+            "should write the serve middleware's mark after the fetch one's and ahead of the \
+             bundle: {page}"
+        );
+        assert_eq!(
+            reader_middleware_name(),
+            "testing.seam-probe.reader",
+            "should name the serve middleware after the module"
+        );
+    }
+
+    #[test]
     fn the_middleware_changes_nothing_where_no_entry_names_it() {
         use trusted_server_core::html_processor::test_support::REQUEST_HOST;
 
         let page = probe_page(&settings_with_probe(r#"country = "NZ""#), 8192);
 
         assert!(
-            !page.contains("seam-probe-country"),
+            !page.contains("seam-probe-country") && !page.contains("seam-probe-reader"),
             "should not mark the head of a page no entry places it on: {page}"
         );
         assert!(

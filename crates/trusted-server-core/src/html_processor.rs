@@ -18,7 +18,10 @@ use crate::integrations::{
     IntegrationDocumentState, IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState,
     IntegrationScriptContext, ScriptRewriteAction,
 };
-use crate::middleware::{MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan};
+use crate::middleware::{
+    ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan,
+    TextHandler,
+};
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -242,19 +245,23 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     build_html_processor(config, MiddlewarePlan::default())
 }
 
-/// [`create_html_processor`], with the middleware of `chain` run on the
-/// document as well.
+/// [`create_html_processor`], with the middleware of the `fetch` chain run
+/// on the document as well, and then those of the `serve` chain where the
+/// document goes to one reader and is not stored.
+///
+/// `serve` is `None` for a document that may be stored, whose serve chain
+/// runs on each reader's copy instead, through [`create_serve_processor`].
 ///
 /// Each middleware is asked once, here, what it will do with this document.
-/// The state the chain shares is the document's own and holds nothing a
-/// request left, because what this processor writes may be stored and served
-/// to other readers.
+/// The state the fetch chain shares is the document's own and holds nothing a
+/// request left, because what that chain writes may be stored and served to
+/// other readers.
 ///
-/// A middleware's head markup follows the hooks' own. Its element handlers
-/// are asked after core has moved the origin's address in an attribute and
-/// after the hooks. Its text handlers are handed a chunk as the hooks and the
-/// handlers before them left it, and its stream processors run after the
-/// hooks' own.
+/// A fetch middleware's head markup follows the hooks' own. Its element
+/// handlers are asked after core has moved the origin's address in an
+/// attribute and after the hooks. Its text handlers are handed a chunk as the
+/// hooks and the handlers before them left it, and its stream processors run
+/// after the hooks' own.
 ///
 /// # Errors
 ///
@@ -265,18 +272,190 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 /// As [`create_html_processor`].
 pub fn create_html_processor_with_middleware(
     config: HtmlProcessorConfig,
-    chain: &MiddlewareChain,
+    fetch: &MiddlewareChain,
+    serve: Option<&MiddlewareChain>,
 ) -> Result<impl StreamProcessor + use<>, String> {
     let document_state = IntegrationDocumentState::default();
-    let plan = chain.plan(&MiddlewareContext {
-        phase: chain.phase(),
+    let plan = fetch.plan(&MiddlewareContext {
+        phase: fetch.phase(),
         request_host: &config.request_host,
         request_scheme: &config.request_scheme,
         origin_host: &config.origin_host,
         document_state: &document_state,
         max_buffered_script_bytes: config.max_buffered_body_bytes,
     })?;
-    Ok(build_html_processor(config, plan))
+    let reader = match serve {
+        Some(serve) => create_serve_processor(
+            serve,
+            &ReaderDocument {
+                request_host: &config.request_host,
+                request_scheme: &config.request_scheme,
+                origin_host: &config.origin_host,
+                request_state: &config.request_state,
+                max_buffered_script_bytes: config.max_buffered_body_bytes,
+            },
+        )?,
+        None => None,
+    };
+    let mut processor = build_html_processor(config, plan);
+    processor.processors.extend(reader);
+    Ok(processor)
+}
+
+/// What a serve chain is told about the reader's copy it works on.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderDocument<'a> {
+    /// Publisher-facing host the reader asked for.
+    pub request_host: &'a str,
+    /// Publisher-facing scheme the reader asked for.
+    pub request_scheme: &'a str,
+    /// Host the document was fetched from.
+    pub origin_host: &'a str,
+    /// What modules left on this reader's request for their page changes.
+    pub request_state: &'a IntegrationRequestState,
+    /// The most a middleware may hold of one script while it decides.
+    pub max_buffered_script_bytes: usize,
+}
+
+/// A processor that carries out a serve chain alone, on one reader's copy of
+/// a document core has already rewritten, or `None` when the chain has
+/// nothing to do.
+///
+/// Nothing of core's own is written or rewritten a second time. Head markup
+/// goes straight before the script bundle's tag and markup for after the
+/// bundle straight after it, so a document core wrote no bundle into gets
+/// neither.
+///
+/// # Errors
+///
+/// When a handler's selector does not parse, naming the selector.
+pub fn create_serve_processor(
+    chain: &MiddlewareChain,
+    document: &ReaderDocument<'_>,
+) -> Result<Option<Box<dyn StreamProcessor>>, String> {
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    let document_state = IntegrationDocumentState::default();
+    document.request_state.seed(&document_state);
+    let plan = chain.plan(&MiddlewareContext {
+        phase: chain.phase(),
+        request_host: document.request_host,
+        request_scheme: document.request_scheme,
+        origin_host: document.origin_host,
+        document_state: &document_state,
+        max_buffered_script_bytes: document.max_buffered_script_bytes,
+    })?;
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(build_serve_processor(plan))))
+}
+
+/// The tag of the script bundle, which core writes once at the start of
+/// `<head>`.
+const BUNDLE_SELECTOR: &str = "script#trustedserver-js";
+
+/// One selector and what a rewriter does with what it matches.
+type ContentHandler = (
+    std::borrow::Cow<'static, lol_html::Selector>,
+    lol_html::ElementContentHandlers<'static>,
+);
+
+/// The rewriter handlers that carry out a plan's element and text handlers.
+///
+/// The text handlers share `edits` with every text handler registered before
+/// them, so each is handed a chunk as the one before it left it.
+///
+/// A selector that does not parse panics here, which
+/// [`MiddlewareChain::plan`] rules out by refusing to plan one.
+fn middleware_content_handlers(
+    element_handlers: Vec<Box<dyn ElementHandler>>,
+    text_handlers: Vec<Box<dyn TextHandler>>,
+    edits: &Rc<TextEdits>,
+) -> Vec<ContentHandler> {
+    let mut handlers: Vec<ContentHandler> = Vec::new();
+    for mut handler in element_handlers {
+        let selector = handler.selector().to_owned();
+        let attribute = handler.attribute().to_owned();
+        handlers.push(element!(selector, move |el| {
+            if el.removed() {
+                return Ok(());
+            }
+            let Some(value) = el.get_attribute(&attribute) else {
+                return Ok(());
+            };
+            let element_name = el.tag_name();
+            match handler.decide(&MatchedAttribute {
+                element_name: &element_name,
+                attribute_name: &attribute,
+                value: &value,
+            }) {
+                AttributeRewriteAction::Keep => {}
+                AttributeRewriteAction::Replace(replacement) => {
+                    if replacement != value {
+                        el.set_attribute(&attribute, &replacement)?;
+                    }
+                }
+                AttributeRewriteAction::RemoveElement => el.remove(),
+            }
+            Ok(())
+        }));
+    }
+    for mut handler in text_handlers {
+        let selector = handler.selector().to_owned();
+        let edits = Rc::clone(edits);
+        handlers.push(text!(selector, move |text| {
+            let current = edits.current(text);
+            match handler.decide(&current, text.last_in_text_node()) {
+                ScriptRewriteAction::Keep => {}
+                ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
+                ScriptRewriteAction::RemoveNode => edits.remove(text),
+            }
+            Ok(())
+        }));
+    }
+    handlers
+}
+
+/// The processor behind [`create_serve_processor`], carrying out `plan` and
+/// nothing else.
+fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
+    let MiddlewarePlan {
+        head_inserts,
+        after_bundle_inserts,
+        element_handlers,
+        text_handlers,
+        processors,
+    } = plan;
+    let mut element_content_handlers: Vec<ContentHandler> = Vec::new();
+    if !head_inserts.is_empty() || !after_bundle_inserts.is_empty() {
+        let before = head_inserts.concat();
+        let after = after_bundle_inserts.concat();
+        let written = Cell::new(false);
+        element_content_handlers.push(element!(BUNDLE_SELECTOR, move |el| {
+            // Core's tag is the first in the document. An element of the
+            // page's own under the same id is left alone.
+            if !written.replace(true) {
+                el.before(&before, ContentType::Html);
+                el.after(&after, ContentType::Html);
+            }
+            Ok(())
+        }));
+    }
+    let edits = Rc::new(TextEdits::default());
+    element_content_handlers.extend(middleware_content_handlers(
+        element_handlers,
+        text_handlers,
+        &edits,
+    ));
+    HtmlWithStreamingProcessors {
+        inner: Box::new(HtmlRewriterAdapter::new(RewriterSettings {
+            element_content_handlers,
+            ..RewriterSettings::default()
+        })),
+        processors,
+    }
 }
 
 /// The processor behind [`create_html_processor`] and
@@ -291,7 +470,7 @@ pub fn create_html_processor_with_middleware(
 fn build_html_processor(
     config: HtmlProcessorConfig,
     plan: MiddlewarePlan,
-) -> impl StreamProcessor + use<> {
+) -> HtmlWithStreamingProcessors {
     let MiddlewarePlan {
         head_inserts: middleware_head_inserts,
         after_bundle_inserts: middleware_after_bundle_inserts,
@@ -767,36 +946,6 @@ fn build_html_processor(
         }));
     }
 
-    // Asked after core has moved the origin's address in an attribute and
-    // after the hooks, so a handler judges an address as it will be served.
-    for mut handler in middleware_element_handlers {
-        let selector = handler.selector().to_owned();
-        let attribute = handler.attribute().to_owned();
-        element_content_handlers.push(element!(selector, move |el| {
-            if el.removed() {
-                return Ok(());
-            }
-            let Some(value) = el.get_attribute(&attribute) else {
-                return Ok(());
-            };
-            let element_name = el.tag_name();
-            match handler.decide(&MatchedAttribute {
-                element_name: &element_name,
-                attribute_name: &attribute,
-                value: &value,
-            }) {
-                AttributeRewriteAction::Keep => {}
-                AttributeRewriteAction::Replace(replacement) => {
-                    if replacement != value {
-                        el.set_attribute(&attribute, &replacement)?;
-                    }
-                }
-                AttributeRewriteAction::RemoveElement => el.remove(),
-            }
-            Ok(())
-        }));
-    }
-
     // Shared by every text handler below, the hooks' and the middleware's,
     // so each is handed a chunk as the one before it left it.
     let edits = Rc::new(TextEdits::default());
@@ -833,19 +982,14 @@ fn build_html_processor(
         }));
     }
 
-    for mut handler in middleware_text_handlers {
-        let selector = handler.selector().to_owned();
-        let edits = Rc::clone(&edits);
-        element_content_handlers.push(text!(selector, move |text| {
-            let current = edits.current(text);
-            match handler.decide(&current, text.last_in_text_node()) {
-                ScriptRewriteAction::Keep => {}
-                ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
-                ScriptRewriteAction::RemoveNode => edits.remove(text),
-            }
-            Ok(())
-        }));
-    }
+    // Registered after core's own handlers and the hooks', so an element
+    // handler judges an address as it will be served and a text handler is
+    // handed a script as the hooks left it.
+    element_content_handlers.extend(middleware_content_handlers(
+        middleware_element_handlers,
+        middleware_text_handlers,
+        &edits,
+    ));
 
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
@@ -908,7 +1052,8 @@ pub mod test_support {
 
     /// The page a reader of `html` receives from a deployment running
     /// `settings` with `registry`'s modules, read from the origin `chunk_size`
-    /// bytes at a time and asked for at [`REQUEST_PATH`].
+    /// bytes at a time and asked for at [`REQUEST_PATH`]. The page is not
+    /// stored, so both phases' middleware run on the one pass.
     ///
     /// The script bundle's `?v=` hash is replaced by a fixed word, so a
     /// recording changes when a module's page change does and not when a
@@ -932,9 +1077,15 @@ pub mod test_support {
             REQUEST_HOST,
             "https",
         );
-        let chain = registry.middleware_chain(
+        let fetch = registry.middleware_chain(
             &settings.fetch,
             MiddlewarePhase::Fetch,
+            HTML_MEDIA_TYPE,
+            REQUEST_PATH,
+        );
+        let serve = registry.middleware_chain(
+            &settings.serve,
+            MiddlewarePhase::Serve,
             HTML_MEDIA_TYPE,
             REQUEST_PATH,
         );
@@ -944,7 +1095,7 @@ pub mod test_support {
                 output_compression: Compression::None,
                 chunk_size,
             },
-            create_html_processor_with_middleware(config, &chain)
+            create_html_processor_with_middleware(config, &fetch, Some(&serve))
                 .expect("should plan the page's middleware"),
         );
         let mut output = Vec::new();

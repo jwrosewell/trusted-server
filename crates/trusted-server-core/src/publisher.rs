@@ -1556,14 +1556,95 @@ fn create_html_stream_processor(
 
     // The middleware of the first [[fetch]] entry covering this path. What
     // they leave is what a shared template stores.
-    let chain = params.integration_registry.middleware_chain(
+    let fetch = params.integration_registry.middleware_chain(
         &params.settings.fetch,
         MiddlewarePhase::Fetch,
         HTML_MEDIA_TYPE,
         params.request_path,
     );
-    create_html_processor_with_middleware(config, &chain)
+    // A response that may be stored leaves this processor as the template
+    // every reader shares, so its [[serve]] entry runs on each reader's copy
+    // once that copy is assembled. See `run_serve_pass`.
+    let serve = (!params.shared_template_authorized).then(|| {
+        params.integration_registry.middleware_chain(
+            &params.settings.serve,
+            MiddlewarePhase::Serve,
+            HTML_MEDIA_TYPE,
+            params.request_path,
+        )
+    });
+    create_html_processor_with_middleware(config, &fetch, serve.as_ref())
         .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
+}
+
+/// The processor that carries out the `[[serve]]` entry covering this request
+/// on a reader's copy that is assembled and not yet encoded, or `None` when
+/// no entry covers the request or its middleware have nothing to do.
+///
+/// The origin host is read from the settings. A page served from the store
+/// keeps no record of it, and a serve middleware is told the same about a
+/// page from the store as about one fetched for this request.
+fn reader_serve_processor(
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Option<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
+    use crate::html_processor::{ReaderDocument, create_serve_processor};
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
+
+    if !is_html_content_type(&params.content_type) {
+        return Ok(None);
+    }
+    let chain = integration_registry.middleware_chain(
+        &settings.serve,
+        MiddlewarePhase::Serve,
+        HTML_MEDIA_TYPE,
+        &params.request_path,
+    );
+    let origin_host = settings.publisher.origin_host();
+    create_serve_processor(
+        &chain,
+        &ReaderDocument {
+            request_host: &params.request_host,
+            request_scheme: &params.request_scheme,
+            origin_host: &origin_host,
+            request_state: &params.request_state,
+            max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+        },
+    )
+    .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
+}
+
+/// Runs the `[[serve]]` entry covering this request over a reader's whole
+/// copy, assembled and not yet encoded.
+fn run_serve_pass(
+    bytes: Vec<u8>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let Some(mut processor) = reader_serve_processor(params, settings, integration_registry)?
+    else {
+        return Ok(bytes);
+    };
+    processor
+        .process_chunk(&bytes, true)
+        .change_context(TrustedServerError::Proxy {
+            message: "a serve middleware could not rewrite the page".to_string(),
+        })
+}
+
+/// One piece of a streamed reader's copy through the `[[serve]]` entry, when
+/// one covers the request.
+fn serve_chunk(
+    serve: &mut Option<Box<dyn StreamProcessor>>,
+    bytes: Vec<u8>,
+    is_last: bool,
+) -> Result<Vec<u8>, std::io::Error> {
+    match serve {
+        Some(processor) => processor.process_chunk(&bytes, is_last),
+        None => Ok(bytes),
+    }
 }
 
 /// Result of publisher request handling, indicating whether the response body
@@ -1747,8 +1828,8 @@ pub struct OwnedProcessResponseParams {
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
-    /// The path the reader asked for, which decides the `[[fetch]]` entry
-    /// that covers the document.
+    /// The path the reader asked for, which decides the `[[fetch]]` and
+    /// `[[serve]]` entries that cover the document.
     pub(crate) request_path: String,
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
@@ -1979,6 +2060,11 @@ pub async fn buffer_publisher_response_async(
                 set_assembly_response_state(&mut response, state);
             }
             let bytes = if was_authorized {
+                // The transform wrote a template every reader shares, so the
+                // [[serve]] entry runs here, on this reader's assembled copy.
+                // A page that was never authorized ran it inside the
+                // transform.
+                let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
                 bytes
@@ -2028,6 +2114,7 @@ pub async fn buffer_publisher_response_async(
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
             assembled.extend_from_slice(tail);
+            let assembled = run_serve_pass(assembled, &params, settings, integration_registry)?;
             let assembled = encode_complete_body(assembled, response_compression(&response))?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -2511,6 +2598,23 @@ pub async fn publisher_response_into_streaming_response(
                 return Ok(response);
             }
 
+            // Planned before the lazy body is built, so a serve entry that
+            // cannot run fails the response while it still can be failed.
+            let mut serve = match reader_serve_processor(&params, &settings, integration_registry) {
+                Ok(serve) => serve,
+                Err(err) => {
+                    if let Some(dispatched) = params.dispatched_auction.take() {
+                        emit_abandoned_auction(
+                            &services,
+                            params.auction_observation.take(),
+                            dispatched,
+                            "processor_init_error",
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
@@ -2534,8 +2638,10 @@ pub async fn publisher_response_into_streaming_response(
                 let (head, tail) = split_template_at_seam(&template)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let mut encoder = BodyStreamEncoder::new(compression);
+                // Each piece goes through the serve entry as it leaves, so
+                // the head is still written before the auction is awaited.
                 let encoded_head = encoder
-                    .encode_chunk(head.to_vec())
+                    .encode_chunk(serve_chunk(&mut serve, head.to_vec(), false)?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_head.is_empty() {
                     yield bytes::Bytes::from(encoded_head);
@@ -2566,14 +2672,14 @@ pub async fn publisher_response_into_streaming_response(
                 let seam = seam_script_for(&params);
                 if !seam.is_empty() {
                     let encoded_seam = encoder
-                        .encode_chunk(seam.into_bytes())
+                        .encode_chunk(serve_chunk(&mut serve, seam.into_bytes(), false)?)
                         .map_err(publisher_stream_error)?;
                     if !encoded_seam.is_empty() {
                         yield bytes::Bytes::from(encoded_seam);
                     }
                 }
                 let encoded_tail = encoder
-                    .encode_chunk(tail.to_vec())
+                    .encode_chunk(serve_chunk(&mut serve, tail.to_vec(), true)?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_tail.is_empty() {
                     yield bytes::Bytes::from(encoded_tail);
@@ -11252,6 +11358,329 @@ mod tests {
                         1,
                         "should serve the {reader} {label} reader what the middleware wrote, \
                          once: {page}"
+                    );
+                }
+            }
+        }
+
+        /// One `[[serve]]` entry naming `names` for `path`.
+        fn serve_entry(path: Option<&str>, names: &[&str]) -> crate::middleware::PhaseEntries {
+            crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+            }])
+        }
+
+        /// Settings in `mode` whose fetch entry runs the stand-in's head
+        /// middleware on every page and whose serve entry runs its reader
+        /// middleware under `serve_path`.
+        fn settings_with_both_phases(
+            mode: &str,
+            label: &str,
+            serve_path: Option<&str>,
+        ) -> Settings {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_fetch_entry(mode, label, None, &[fixture::HEAD]);
+            settings.serve = serve_entry(serve_path, &[fixture::READER]);
+            settings
+        }
+
+        /// What the stand-in's reader middleware writes for a deployment
+        /// running `settings`, for a request that left a mark or did not.
+        fn reader_marker_for(settings: &Settings, marked: bool) -> String {
+            crate::integrations::registry_test_support::middleware_fixture::reader_marker(
+                &settings.publisher.origin_host(),
+                marked,
+            )
+        }
+
+        fn index_in(page: &str, needle: &str) -> usize {
+            page.find(needle)
+                .unwrap_or_else(|| panic!("should find `{needle}` in: {page}"))
+        }
+
+        #[tokio::test]
+        async fn a_reader_of_a_page_that_is_not_stored_gets_the_serve_entry() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_both_phases("inline", label, None));
+                let reader = reader_marker_for(&settings, false);
+                queue_shareable_html(&stub);
+
+                let page =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    page.matches(&reader).count(),
+                    1,
+                    "should run the serve entry once on a {label} page: {page}"
+                );
+                assert_eq!(page.matches(fixture::READER_SCRIPT).count(), 1);
+                let fetch_at = index_in(&page, &fixture::head_marker(label));
+                let reader_at = index_in(&page, &reader);
+                let bundle_at = index_in(&page, "id=\"trustedserver-js\"");
+                let after_at = index_in(&page, fixture::READER_SCRIPT);
+                assert!(
+                    fetch_at < reader_at && reader_at < bundle_at && bundle_at < after_at,
+                    "should write the serve entry's markup around the bundle, after the fetch \
+                     entry's: {page}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reader_of_a_shared_template_gets_the_serve_entry_and_the_store_never_does() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::clone(&cache),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_both_phases("esi", label, None));
+                // Told the same origin on the miss as on the hit, where the
+                // page's own record of it is empty.
+                let reader = reader_marker_for(&settings, false);
+                // One answer from the origin, so the second reader can only
+                // be served from the store.
+                queue_shareable_html(&stub);
+
+                let miss =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                let hit =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents().len(),
+                    1,
+                    "should serve the second {label} reader from the stored template"
+                );
+                for (reader_of, page) in [("miss", &miss), ("hit", &hit)] {
+                    assert_eq!(
+                        page.matches(&reader).count(),
+                        1,
+                        "should run the serve entry once for the {label} reader of a \
+                         {reader_of}: {page}"
+                    );
+                    assert_eq!(
+                        page.matches(fixture::READER_SCRIPT).count(),
+                        1,
+                        "should write its markup after the bundle once on a {reader_of}: {page}"
+                    );
+                    assert_eq!(
+                        page.matches(&fixture::head_marker(label)).count(),
+                        1,
+                        "should serve what the fetch entry wrote once on a {reader_of}: {page}"
+                    );
+                }
+                let stored: Vec<String> = cache
+                    .entries
+                    .lock()
+                    .expect("should lock the stored templates")
+                    .values()
+                    .map(|entry| String::from_utf8_lossy(&entry.body).into_owned())
+                    .collect();
+                assert_eq!(stored.len(), 1, "should store one template");
+                assert!(
+                    stored[0].contains(&fixture::head_marker(label)),
+                    "should store what the fetch entry wrote: {}",
+                    stored[0]
+                );
+                assert!(
+                    !stored[0].contains("middleware-fixture-reader")
+                        && !stored[0].contains("data-fixture-reader"),
+                    "should store nothing the serve entry wrote: {}",
+                    stored[0]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_from_the_store_sends_its_head_through_the_serve_entry_before_the_auction() {
+            // The streaming finalizer writes a stored page's head at once and
+            // waits for the auction only at the seam. The serve entry is a
+            // rewriter in that stream, so this checks it hands the head on
+            // instead of holding it until the page ends.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_both_phases("esi", "streamed", None));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            let hit = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second request must be a hit, or this asserts nothing"
+            );
+            let EdgeBody::Stream(mut stream) = hit.into_body() else {
+                panic!("a page from the store must stream, not buffer");
+            };
+            let first = stream
+                .next()
+                .await
+                .expect("the stream should yield a first chunk")
+                .expect("the first chunk should read");
+            let first = String::from_utf8_lossy(&first);
+
+            assert!(
+                first.contains(&reader_marker_for(&settings, false))
+                    && first.contains("id=\"trustedserver-js\""),
+                "the first chunk must be the head, with what the serve entry wrote in it: \
+                 {first}"
+            );
+            assert!(
+                !first.contains("window.tsjs"),
+                "the first chunk must come before the bids script: {first}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_request_path_picks_the_serve_entry() {
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings =
+                    Arc::new(settings_with_both_phases("inline", label, Some("/article")));
+                let reader = reader_marker_for(&settings, false);
+
+                queue_shareable_html(&stub);
+                let covered =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                queue_shareable_html(&stub);
+                let elsewhere = page_of(
+                    run_via(
+                        &settings,
+                        &services,
+                        navigation_request_for("/elsewhere"),
+                        finalizer,
+                    )
+                    .await,
+                )
+                .await;
+
+                assert_eq!(
+                    covered.matches(&reader).count(),
+                    1,
+                    "should run the serve entry on a {label} page under its path: {covered}"
+                );
+                assert!(
+                    !elsewhere.contains("middleware-fixture-reader"),
+                    "should run no serve entry on a {label} page no entry covers: {elsewhere}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_serve_middleware_reads_what_a_request_left_and_that_page_is_not_stored() {
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::clone(&cache),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                // A shared mode, which a request that carries state of its
+                // own never takes.
+                let settings = Arc::new(settings_with_both_phases("esi", label, None));
+                queue_shareable_html(&stub);
+
+                let page = page_of(
+                    run_via(&settings, &services, marked_navigation_request(), finalizer).await,
+                )
+                .await;
+
+                assert_eq!(
+                    page.matches(&reader_marker_for(&settings, true)).count(),
+                    1,
+                    "should hand the serve middleware what the {label} request left: {page}"
+                );
+                assert!(
+                    cache
+                        .entries
+                        .lock()
+                        .expect("should lock the stored templates")
+                        .is_empty(),
+                    "should store nothing of a page made for one request"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reader_with_an_auction_gets_the_serve_entry_and_its_bids() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let mut settings = settings_with_bidder(mode);
+                settings.select_module("testing", fixture::MODULE);
+                settings.serve = serve_entry(None, &[fixture::READER]);
+                let settings = Arc::new(settings);
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let reader = reader_marker_for(&settings, false);
+
+                // Bid first, page second: one queue, and the auction is
+                // dispatched before the origin fetch.
+                queue_bid_response(&stub);
+                queue_shareable_html(&stub);
+                let first =
+                    page_of(run_bidding(&settings, &services, navigation_request()).await).await;
+                // A second reader, whose page comes from the store under a
+                // shared mode and from the origin otherwise.
+                queue_bid_response(&stub);
+                if mode == "inline" {
+                    queue_shareable_html(&stub);
+                }
+                let second =
+                    page_of(run_bidding(&settings, &services, navigation_request()).await).await;
+
+                for (which, page) in [("first", &first), ("second", &second)] {
+                    assert_eq!(
+                        page.matches(&reader).count(),
+                        1,
+                        "should run the serve entry once for the {which} {mode} reader: {page}"
+                    );
+                    let bids_at = index_in(page, "3.50");
+                    assert!(
+                        bids_at < index_in(page, "</body>"),
+                        "should write the {which} {mode} reader's bid ahead of the end of the \
+                         body: {page}"
                     );
                 }
             }
@@ -20697,6 +21126,131 @@ mod tests {
                 error.current_context().status_code(),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "should answer as a fault of the deployment's own in the {finalizer} finalizer"
+            );
+        }
+    }
+
+    /// A serve entry that cannot run fails the response at each place a page
+    /// leaves from, being a page that is not stored and a page from the
+    /// store, through each finalizer.
+    #[tokio::test]
+    async fn a_serve_middleware_whose_selector_does_not_parse_fails_the_response_wherever_it_leaves()
+     {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN_READER.to_owned()],
+        }]);
+        let settings = Arc::new(settings);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let services = noop_services();
+        let response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(EdgeBody::empty())
+                .expect("should build the response")
+        };
+        let params = || {
+            Box::new(OwnedProcessResponseParams {
+                csp_nonce_observed: None,
+                template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
+                ad_slots_script: None,
+                ad_bids_state: AdBidsState::default(),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+                request_state: IntegrationRequestState::default(),
+            })
+        };
+        let from_the_origin = || PublisherResponse::Stream {
+            response: response(),
+            body: EdgeBody::from(
+                b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
+            ),
+            params: params(),
+        };
+        let from_the_store = || PublisherResponse::AssembleTemplate {
+            response: response(),
+            template: format!(
+                "<html><head></head><body><a href=\"/x\">x</a>{AD_ASSEMBLY_SEAM}</body></html>"
+            )
+            .into_bytes(),
+            params: params(),
+        };
+
+        let mut results = Vec::new();
+        let pages: [(&str, &dyn Fn() -> PublisherResponse); 2] = [
+            ("from the origin", &from_the_origin),
+            ("from the store", &from_the_store),
+        ];
+        for (page, publisher_response) in pages {
+            results.push((
+                page,
+                "streaming",
+                publisher_response_into_streaming_response(
+                    publisher_response(),
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await,
+            ));
+            results.push((
+                page,
+                "buffered",
+                buffer_publisher_response_async(
+                    publisher_response(),
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await,
+            ));
+        }
+
+        for (page, finalizer, result) in results {
+            let error = result.err().unwrap_or_else(|| {
+                panic!("should fail a page {page} in the {finalizer} finalizer")
+            });
+            assert!(
+                error.to_string().contains(&format!(
+                    "the serve middleware `{}` cannot run",
+                    fixture::BROKEN_READER
+                )),
+                "should name the middleware for a page {page} in the {finalizer} finalizer: \
+                 {error}"
+            );
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should answer as a fault of the deployment's own for a page {page} in the \
+                 {finalizer} finalizer"
             );
         }
     }

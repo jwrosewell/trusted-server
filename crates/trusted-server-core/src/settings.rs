@@ -3922,6 +3922,10 @@ pub struct Settings {
     /// as `[[fetch]]` entries. See [`crate::middleware`].
     #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
     pub fetch: PhaseEntries,
+    /// The page changes run on each reader's copy of a document, written as
+    /// `[[serve]]` entries.
+    #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
+    pub serve: PhaseEntries,
     /// Where the loader wrote secrets, which the configuration view masks.
     /// Never read from a document and never written to one.
     #[serde(skip)]
@@ -4567,6 +4571,7 @@ impl Settings {
     pub fn phase_entries(&self, phase: MiddlewarePhase) -> &PhaseEntries {
         match phase {
             MiddlewarePhase::Fetch => &self.fetch,
+            MiddlewarePhase::Serve => &self.serve,
         }
     }
 

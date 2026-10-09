@@ -422,6 +422,44 @@ fn fetch_entry_naming_a_modules_middleware_starts_the_adapter() {
         .expect("should start with an entry naming a middleware the module supplies");
 }
 
+/// A `[[serve]]` entry starts the adapter when it names a middleware that
+/// runs in that phase, and is a startup error when it names one that does
+/// not.
+#[test]
+fn serve_entry_starts_the_adapter_only_with_a_middleware_of_that_phase() {
+    let settings = |name: &str| {
+        settings_with(&format!(
+            r#"
+            {PROBE_BLOCK}
+
+            [[serve]]
+            media_type = "text/html"
+            middleware = ["{name}"]
+            "#
+        ))
+    };
+
+    TrustedServerApp::routes_with_registrations(
+        settings(seam_probe::reader_middleware_name()),
+        &[seam_probe::builder()],
+    )
+    .expect("should start with a serve entry naming the module's serve middleware");
+
+    let error = TrustedServerApp::routes_with_registrations(
+        settings(seam_probe::module_name()),
+        &[seam_probe::builder()],
+    )
+    .err()
+    .expect("should refuse to start when a serve entry names a fetch middleware");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("[[serve]] entry 1 names `testing.seam-probe`")
+            && message.contains("does not run in that phase. It runs in [[fetch]]"),
+        "should say which phase the middleware runs in: {message}"
+    );
+}
+
 /// A `[[fetch]]` entry naming the middleware of a module no section selects
 /// is a startup error, raised where the adapter builds its routes.
 #[test]

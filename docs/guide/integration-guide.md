@@ -308,7 +308,7 @@ builder every integration uses.
 | `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
 | `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
 | `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                |
-| `.with_middleware(...)`                               | Offers a page change that a `[[fetch]]` entry may place by the middleware's name    |
+| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name               |
 | `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`     |
 | `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
 | `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
@@ -414,6 +414,14 @@ pub fn registration() -> IntegrationRegistration {
 
 <!-- documentation-snippet:middleware:end -->
 
+A middleware says which phase it runs in, and an entry of the other phase
+that names it refuses startup.
+
+| Phase                    | Runs                                                                               | `document_state` holds                      |
+| ------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------- |
+| `MiddlewarePhase::Fetch` | On the page as the origin sent it. What it leaves is what a shared template stores | Nothing a request left                      |
+| `MiddlewarePhase::Serve` | On each reader's copy, whether the page came from the store or from the origin     | What the module's request hooks left for it |
+
 A middleware is asked once for each document, by `create`, and what it
 answers is used for that document alone, so a handler may hold state between
 the chunks of one script. The answer is a `MiddlewareAction`, which may set
@@ -421,7 +429,7 @@ any of five things.
 
 | Field                  | What it does                                                                                             |
 | ---------------------- | -------------------------------------------------------------------------------------------------------- |
-| `head_inserts`         | Writes markup at the start of `<head>`, ahead of the script bundle                                       |
+| `head_inserts`         | Writes markup in `<head>`, ahead of the script bundle                                                    |
 | `after_bundle_inserts` | Writes markup straight after the script bundle, for a script that needs the bundle to have run           |
 | `element_handlers`     | For the elements a CSS selector matches, keeps the element, replaces one attribute's value or removes it |
 | `text_handlers`        | For the text inside the elements a CSS selector matches, keeps a chunk, replaces it or removes it        |
@@ -441,18 +449,23 @@ A middleware can rely on these rules.
   escaped.
 - A fetch middleware is told nothing about the reader, because what it leaves
   is what a shared template stores. `MiddlewareContext::document_state` is
-  shared by the middleware working on one document, and holds nothing a
-  request left.
+  shared by the middleware working on one document in one phase.
+- A serve middleware works on the page as core and the fetch middleware left
+  it, the script bundle's tag included. What a request preparer or a request
+  filter left with `IntegrationRequestState::insert` is in its
+  `document_state`, and a request that carries any is never answered from a
+  shared template. It is told the same origin host for a page from the store
+  as for one fetched for that request.
 - A selector that does not parse fails the response with a `500` and a
   message naming the middleware. A middleware chooses its selectors for each
   document, so they cannot be checked when the service starts.
 
 A middleware's name is the module's own name, as `module_name!()` gives it,
-with a part of its own after it when the module supplies several, such as
-`tag.example` and `tag.example.cleanup`. Startup refuses two registrations
-that supply one name, and a name an entry could not write. A middleware reads
-its settings from the module's own table, which the build function is
-handed.
+with a part of its own after it when the module supplies several, as
+`module_name!("cleanup")` gives `tag.example.cleanup`. Startup refuses two
+registrations that supply one name, and a name an entry could not write. A
+middleware reads its settings from the module's own table, which the build
+function is handed.
 
 ### What a module is handed
 

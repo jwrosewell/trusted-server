@@ -3074,6 +3074,12 @@ pub(crate) mod test_support {
     /// setting at the start of `<head>`. The one named `.links` points every
     /// link that carries `data-fixture` at a fixed path. The one named
     /// `.broken` asks for a selector that does not parse.
+    ///
+    /// It supplies two serve middleware as well. The one named `.reader`
+    /// writes a marker ahead of the script bundle, saying which origin it was
+    /// told of and whether the request stand-in left its mark, and a script
+    /// straight after the bundle. The one named `.broken-reader` asks for a
+    /// selector that does not parse.
     pub(crate) mod middleware_fixture {
         use std::rc::Rc;
         use std::sync::Arc;
@@ -3098,6 +3104,12 @@ pub(crate) mod test_support {
         pub(crate) const LINKS: &str = "testing.middleware-fixture.links";
         /// The name of the middleware whose selector does not parse.
         pub(crate) const BROKEN: &str = "testing.middleware-fixture.broken";
+        /// The name of the serve middleware that marks a reader's copy.
+        pub(crate) const READER: &str = "testing.middleware-fixture.reader";
+        /// The name of the serve middleware whose selector does not parse.
+        pub(crate) const BROKEN_READER: &str = "testing.middleware-fixture.broken-reader";
+        /// What the reader middleware writes straight after the bundle.
+        pub(crate) const READER_SCRIPT: &str = "<script data-fixture-reader></script>";
         /// Where the links middleware points a link.
         pub(crate) const LINK_TARGET: &str = "/fixture/link";
         /// The selector the broken middleware asks for.
@@ -3137,6 +3149,64 @@ pub(crate) mod test_support {
             fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 MiddlewareAction {
                     head_inserts: vec![head_marker(&self.label)],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        /// The marker the reader middleware writes when told of `origin_host`,
+        /// for a request the request stand-in marked or did not.
+        pub(crate) fn reader_marker(origin_host: &str, marked: bool) -> String {
+            format!(
+                "<meta name=\"middleware-fixture-reader\" content=\"origin {origin_host}; marked \
+                 {marked}\">"
+            )
+        }
+
+        struct Reader;
+
+        impl Middleware for Reader {
+            fn middleware_id(&self) -> &'static str {
+                READER
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                use super::request_fixture;
+
+                let marked = context
+                    .document_state
+                    .get::<request_fixture::Mark>(request_fixture::ID)
+                    .is_some();
+                MiddlewareAction {
+                    head_inserts: vec![reader_marker(context.origin_host, marked)],
+                    after_bundle_inserts: vec![READER_SCRIPT.to_owned()],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct BrokenReader;
+
+        impl Middleware for BrokenReader {
+            fn middleware_id(&self) -> &'static str {
+                BROKEN_READER
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        BROKEN_SELECTOR,
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::keep()),
+                    ))],
                     ..MiddlewareAction::pass()
                 }
             }
@@ -3202,6 +3272,8 @@ pub(crate) mod test_support {
                     }))
                     .with_middleware(Arc::new(Links))
                     .with_middleware(Arc::new(Broken))
+                    .with_middleware(Arc::new(Reader))
+                    .with_middleware(Arc::new(BrokenReader))
                     .build(),
             ))
         }
@@ -6270,7 +6342,13 @@ mod tests {
 
         assert_eq!(
             registry.middleware_ids(),
-            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            [
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER,
+            ],
             "should list the middleware the selected module supplies"
         );
         let chain_for = |media_type: &str, path: &str| {
@@ -6318,10 +6396,12 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}]",
+                "[{}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
-                fixture::BROKEN
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER
             )),
             "should name the entry and list what could be named: {message}"
         );
@@ -6367,7 +6447,13 @@ mod tests {
 
         assert_eq!(
             unnamed(Vec::new()),
-            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            [
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER,
+            ],
             "should list every middleware when there are no entries"
         );
         assert_eq!(
@@ -6375,8 +6461,71 @@ mod tests {
                 html_entry(Some("/news/"), &[fixture::LINKS]),
                 html_entry(None, &[fixture::HEAD]),
             ]),
-            [fixture::BROKEN],
+            [fixture::BROKEN, fixture::READER, fixture::BROKEN_READER],
             "should leave out a middleware any entry names"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_middleware_in_a_phase_it_does_not_run_in_is_refused() {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.serve = PhaseEntries::new(vec![html_entry(None, &[fixture::HEAD])]);
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse a fetch middleware named in a serve entry");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[serve]] entry 1 names `{}`", fixture::HEAD))
+                && message.contains("does not run in that phase. It runs in [[fetch]]"),
+            "should say which phase the middleware runs in: {message}"
+        );
+
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::READER])]);
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse a serve middleware named in a fetch entry");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[fetch]] entry 1 names `{}`", fixture::READER))
+                && message.contains("does not run in that phase. It runs in [[serve]]"),
+            "should say which phase the middleware runs in: {message}"
+        );
+    }
+
+    #[test]
+    fn each_phase_has_entries_of_its_own() {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::HEAD])]);
+        settings.serve = PhaseEntries::new(vec![html_entry(Some("/news/"), &[fixture::READER])]);
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should build a registry with an entry in each phase");
+
+        let chain_for = |phase: MiddlewarePhase, path: &str| {
+            registry
+                .middleware_chain(settings.phase_entries(phase), phase, HTML_MEDIA_TYPE, path)
+                .ids()
+        };
+        assert_eq!(
+            chain_for(MiddlewarePhase::Fetch, "/news/today"),
+            [fixture::HEAD]
+        );
+        assert_eq!(
+            chain_for(MiddlewarePhase::Serve, "/news/today"),
+            [fixture::READER]
+        );
+        assert!(
+            chain_for(MiddlewarePhase::Serve, "/sport/today").is_empty(),
+            "should run no serve middleware on a path only the fetch entries cover"
+        );
+        let unnamed: Vec<&str> = unnamed_middleware(&settings, &registry.inner)
+            .into_iter()
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect();
+        assert_eq!(
+            unnamed,
+            [fixture::LINKS, fixture::BROKEN, fixture::BROKEN_READER],
+            "should count a middleware as named only by an entry of a phase it runs in"
         );
     }
 

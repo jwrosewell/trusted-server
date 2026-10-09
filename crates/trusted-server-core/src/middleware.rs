@@ -2,10 +2,11 @@
 //!
 //! A middleware is a page change the settings place. A module registers the
 //! ones it supplies, and one runs only where an entry in the settings names
-//! it. The entries are an ordered list. An entry covers one media type,
-//! optionally only the requests under a path prefix, and names the middleware
-//! to run in order. A response takes the first entry that covers it, and each
-//! middleware is handed the document as the ones before it left it.
+//! it. Each phase has its own ordered list of entries. An entry covers one
+//! media type, optionally only the requests under a path prefix, and names
+//! the middleware to run in order. A response takes the first entry that
+//! covers it, and each middleware is handed the document as the ones before
+//! it left it.
 //!
 //! ```toml
 //! [[fetch]]
@@ -16,6 +17,10 @@
 //! [[fetch]]
 //! media_type = "text/html"
 //! middleware = ["example.strip"]
+//!
+//! [[serve]]
+//! media_type = "text/html"
+//! middleware = ["example.reader"]
 //! ```
 //!
 //! An entry carries no settings and switches nothing on. Whether a module
@@ -25,7 +30,10 @@
 //!
 //! Fetch is obtaining the document from the origin. A fetch middleware is
 //! handed nothing about the reader, so what it leaves is what a shared
-//! template stores for every reader.
+//! template stores for every reader. Serve is preparing the document for one
+//! response. A serve middleware runs for each reader, on that reader's copy,
+//! whether the page came from the store or from the origin, and nothing it
+//! writes is stored.
 
 use std::fmt;
 use std::rc::Rc;
@@ -46,17 +54,21 @@ pub enum MiddlewarePhase {
     /// On the document as the origin sent it. What is left is what a shared
     /// template stores, so nothing here may depend on the reader.
     Fetch,
+    /// On one reader's copy, on its way out, whether it came from the store
+    /// or from the origin. Nothing written here is stored.
+    Serve,
 }
 
 impl MiddlewarePhase {
-    /// Every phase, in the order they happen.
-    pub const ALL: [Self; 1] = [Self::Fetch];
+    /// Both phases, in the order they happen.
+    pub const ALL: [Self; 2] = [Self::Fetch, Self::Serve];
 
     /// The name the phase's entries are written under in the settings.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
+            Self::Serve => "serve",
         }
     }
 }
@@ -71,7 +83,8 @@ impl fmt::Display for MiddlewarePhase {
 ///
 /// In [`MiddlewarePhase::Fetch`] the document's state holds nothing a
 /// request left, because the document may be stored and served to other
-/// readers.
+/// readers. In [`MiddlewarePhase::Serve`] it holds what the modules' request
+/// hooks left for this reader's request.
 #[derive(Debug, Clone, Copy)]
 pub struct MiddlewareContext<'a> {
     /// Which phase is running.
@@ -80,7 +93,8 @@ pub struct MiddlewareContext<'a> {
     pub request_host: &'a str,
     /// Publisher-facing scheme the reader asked for.
     pub request_scheme: &'a str,
-    /// Host the document was fetched from.
+    /// Host the document was fetched from, the same for a page served from
+    /// the store as for one fetched for this request.
     pub origin_host: &'a str,
     /// State shared by the middleware working on this document in this
     /// phase.
@@ -97,7 +111,8 @@ pub struct MatchedAttribute<'a> {
     /// The attribute the handler judges.
     pub attribute_name: &'a str,
     /// The attribute's value, as the handlers before this one left it. Core
-    /// has already moved the origin's address in it to the reader's host.
+    /// has already moved the origin's address in it to the reader's host, in
+    /// either phase.
     pub value: &'a str,
 }
 
@@ -185,7 +200,8 @@ pub trait TextHandler {
 /// arrived.
 #[derive(Default)]
 pub struct MiddlewareAction {
-    /// Markup to write at the start of `<head>`, in the order given.
+    /// Markup to write in `<head>` ahead of the script bundle, in the order
+    /// given. A document with no `<head>` gets none.
     pub head_inserts: Vec<String>,
     /// Markup to write straight after the main script bundle and before any
     /// deferred one, for a script that needs the bundle to have run and has
@@ -284,8 +300,8 @@ pub trait Middleware: Send + Sync {
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction;
 }
 
-/// One entry of a phase, such as `[[fetch]]`, being which responses it
-/// covers and the middleware run on them, in the order written.
+/// One entry of `[[fetch]]` or `[[serve]]`, being which responses it covers
+/// and the middleware run on them, in the order written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseEntry {
@@ -440,8 +456,8 @@ impl<'de> Deserialize<'de> for PhaseEntries {
     {
         let entries = Vec::<PhaseEntry>::deserialize(deserializer).map_err(|error| {
             de::Error::custom(format!(
-                "{error}. A phase is a list of entries, each written as [[fetch]] with \
-                 media_type and middleware, and path where it covers part of the site"
+                "{error}. A phase is a list of entries, each written as [[fetch]] or [[serve]] \
+                 with media_type and middleware, and path where it covers part of the site"
             ))
         })?;
         Ok(Self(entries))
@@ -538,7 +554,8 @@ impl MiddlewareChain {
 /// What one document's chain will do, in the order it happens.
 #[derive(Default)]
 pub struct MiddlewarePlan {
-    /// Markup for the start of `<head>`, in the order it is written.
+    /// Markup for `<head>`, ahead of the script bundle, in the order it is
+    /// written.
     pub head_inserts: Vec<String>,
     /// Markup for straight after the main script bundle, in the order it is
     /// written.
