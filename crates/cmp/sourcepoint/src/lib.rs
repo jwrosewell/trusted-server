@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_skips_when_rewrite_disabled() {
+    fn element_handler_skips_when_rewrite_disabled() {
         let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
@@ -1506,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_config_script_plus_trap_when_enabled() {
+    fn head_markup_emits_config_script_plus_trap_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
 
         let inserts = integration.head_markup();
@@ -1560,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_returns_config_when_rewrite_disabled() {
+    fn head_markup_returns_config_when_rewrite_disabled() {
         let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));

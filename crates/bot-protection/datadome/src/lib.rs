@@ -1553,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_escapes_client_side_tag_url_attribute() {
+    fn head_markup_escapes_client_side_tag_url_attribute() {
         let mut config = test_config();
         config.client_side_key = "test-client-key".to_string();
         config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
@@ -1570,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_client_side_tag_when_key_configured() {
+    fn head_markup_emits_client_side_tag_when_key_configured() {
         let mut config = test_config();
         config.client_side_key = "test-client-key".to_string();
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
@@ -1594,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+    fn head_markup_omits_client_side_tag_when_disabled_or_blank() {
         let mut suppressed = test_config();
         suppressed.client_side_key = "test-client-key".to_string();
         let suppressed_integration = DataDomeIntegration::new(suppressed);
@@ -1697,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_matches_datadome() {
+    fn element_handler_matches_datadome() {
         // Should judge both src and href attributes, and no other
         let document_state = IntegrationDocumentState::default();
         let context = trusted_server_core::middleware::test_support::context(
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_preserves_path() {
+    fn element_handler_preserves_path() {
         // Should preserve /js/... paths for signal collection API
         let action = DataDomeIntegration::rewrite_sdk_address("https://js.datadome.co/js/check");
         match action {

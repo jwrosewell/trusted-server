@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_rewrites_sdk_urls() {
+    fn test_element_handler_rewrites_sdk_urls() {
         let integration = LockrIntegration::new(test_config());
 
         let result = integration.rewrite_sdk_address("https://aim.loc.kr/identity-lockr-v1.0.js");
@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_keeps_non_lockr_urls() {
+    fn test_element_handler_keeps_non_lockr_urls() {
         let integration = LockrIntegration::new(test_config());
 
         let result = integration.rewrite_sdk_address("https://example.com/other.js");
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_noop_when_disabled() {
+    fn test_element_handler_noop_when_disabled() {
         let config = LockrConfig {
             rewrite_sdk: false,
             ..test_config()

@@ -726,10 +726,10 @@ mod tests {
         );
     }
 
-    // -- Attribute rewriter --
+    // -- Element handler --
 
     #[test]
-    fn attribute_rewriter_rewrites_gpt_urls() {
+    fn element_handler_rewrites_gpt_urls() {
         let result = GptIntegration::rewrite_script_address(
             "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
         );
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_keeps_non_gpt_urls() {
+    fn element_handler_keeps_non_gpt_urls() {
         let result = GptIntegration::rewrite_script_address("https://cdn.example.com/analytics.js");
 
         assert_eq!(
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_noop_when_disabled() {
+    fn element_handler_noop_when_disabled() {
         let config = GptConfig {
             rewrite_script: false,
             ..test_config()
@@ -1205,10 +1205,10 @@ mod tests {
         );
     }
 
-    // -- Head injector --
+    // -- Head markup --
 
     #[test]
-    fn head_injector_emits_enable_flag() {
+    fn head_markup_emits_enable_flag() {
         let integration = GptIntegration::new(test_config());
         let inserts = integration.head_markup();
 

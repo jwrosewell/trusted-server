@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_rewrites_sdk_urls() {
+    fn test_element_handler_rewrites_sdk_urls() {
         let config = PermutiveConfig {
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_noop_when_disabled() {
+    fn test_element_handler_noop_when_disabled() {
         let config = PermutiveConfig {
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),

@@ -2386,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter() {
+    fn test_element_handler() {
         // Case 1: Standard HTTPS URL
         let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.googletagmanager.com/gtm.js?id=GTM-TEST1234",
@@ -2464,7 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_rejects_false_positives() {
+    fn test_element_handler_rejects_false_positives() {
         // Test that URLs with GTM domains in query parameters or paths are NOT rewritten
         // This verifies the fix for P2: proper URL parsing instead of substring matching
         // Case 1: GTM domain in query parameter - should NOT be rewritten
@@ -2514,7 +2514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_script_rewriter() {
+    fn test_text_handler() {
         let mut script = InlineSnippet::default();
 
         // Case 1: Inline GTM snippet
@@ -3945,7 +3945,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // English or minified tokens and must NOT engage GTM accumulation.
         // Previously these returned true because any non-empty prefix of a
         // marker was accepted, which let GTM claim and clobber fragments
-        // from overlapping script rewriters (see PR #618 P1).
+        // from overlapping text handlers (see PR #618 P1).
         for text in [
             "x",                  // "g"-less
             "img",                // ends in 'g'

@@ -80,9 +80,11 @@ impl ScriptRewriteAction {
 
 type IntegrationDocumentStateMap = BTreeMap<(&'static str, TypeId), Arc<dyn Any + Send + Sync>>;
 
-/// Per-document state shared between HTML/script rewriters and post-processors.
+/// State shared by the middleware working on one document in one phase.
 ///
-/// This exists to support multi-phase HTML processing without requiring a second HTML parse.
+/// What one handler leaves here a later handler or a stream processor reads,
+/// so the document is parsed once. In the serve phase it starts with what
+/// the request's hooks left, see [`IntegrationRequestState`].
 #[derive(Clone, Default)]
 pub struct IntegrationDocumentState {
     inner: Arc<Mutex<IntegrationDocumentStateMap>>,

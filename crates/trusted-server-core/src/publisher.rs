@@ -23594,12 +23594,11 @@ mod tests {
         );
     }
 
-    /// Document-state survives from the parser pass into the stream processor.
-    /// A script rewriter writes into `IntegrationDocumentState` during
-    /// parsing, and the request-local stream processor reads it and substitutes.
+    /// What a text handler captures during parsing reaches the stream
+    /// processor of the same document, which substitutes it.
     /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
-    fn document_state_placeholders_substitute_through_streaming_path() {
+    fn a_handler_s_placeholders_are_substituted_through_the_streaming_path() {
         let mut settings = create_test_settings();
         crate::integrations::registry_test_support::payload_fixture::select_and_place(
             &mut settings,

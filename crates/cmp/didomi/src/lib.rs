@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_proxy_path() {
+    fn head_markup_emits_proxy_path() {
         let custom_config = DidomiIntegrationConfig {
             geo_query_parameters: false,
             proxy_path: Some("my-consent".to_string()),
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_default_path() {
+    fn head_markup_default_path() {
         let integration = DidomiIntegration::new(Arc::new(config()));
 
         assert_eq!(

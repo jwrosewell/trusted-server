@@ -2164,7 +2164,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
     }
 
     #[test]
-    fn attribute_rewriter_removes_prebid_scripts() {
+    fn element_handler_removes_prebid_scripts() {
         let integration = PrebidIntegration::new(base_config());
         let rewritten = integration.rewrite_script_address("https://cdn.prebid.org/prebid.min.js");
         assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
@@ -2174,7 +2174,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
     }
 
     #[test]
-    fn attribute_rewriter_handles_query_strings_and_links() {
+    fn element_handler_handles_query_strings_and_links() {
         let integration = PrebidIntegration::new(base_config());
         let rewritten =
             integration.rewrite_script_address("https://cdn.prebid.org/prebid.js?v=1.2.3");
@@ -2975,7 +2975,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_config_script() {
+    fn head_markup_emits_config_script() {
         let integration = PrebidIntegration::new(base_config());
         let inserts = integration.head_markup();
         assert_eq!(inserts.len(), 2, "should produce config and bundle inserts");
@@ -3062,7 +3062,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_managed_user_ids() {
+    fn head_markup_includes_managed_user_ids() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             name: "exampleId".to_string(),
@@ -3090,7 +3090,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_optional_managed_user_id_fields_when_unset() {
+    fn head_markup_omits_optional_managed_user_id_fields_when_unset() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             name: "exampleId".to_string(),
@@ -3108,7 +3108,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_managed_user_ids_when_none_configured() {
+    fn head_markup_omits_managed_user_ids_when_none_configured() {
         let integration = PrebidIntegration::new(base_config());
         let inserts = integration.head_markup();
         let script = &inserts[0];
@@ -3185,7 +3185,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_escapes_script_breakout_in_managed_user_ids() {
+    fn head_markup_escapes_script_breakout_in_managed_user_ids() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             params: serde_json::Map::from_iter([(
@@ -3218,7 +3218,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_excluded_gam_ad_unit_path_suffixes() {
+    fn head_markup_includes_excluded_gam_ad_unit_path_suffixes() {
         let mut config = base_config();
         config.excluded_gam_ad_unit_path_suffixes =
             vec!["/trackingonly".to_string(), "/measurement-only".to_string()];
@@ -3235,7 +3235,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_handles_missing_account_id() {
+    fn head_markup_handles_missing_account_id() {
         let mut config = base_config();
         config.account_id = None;
         let integration = PrebidIntegration::new(config);
@@ -3249,7 +3249,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_external_bundle_script_with_hash_and_integrity() {
+    fn head_markup_emits_external_bundle_script_with_hash_and_integrity() {
         let sha256 = "a".repeat(64);
         let mut config = base_config();
         config.external_bundle_url =
@@ -3278,7 +3278,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_external_bundle_script_without_hash_query_when_unhashed() {
+    fn head_markup_emits_external_bundle_script_without_hash_query_when_unhashed() {
         let mut config = base_config();
         config.external_bundle_url =
             Some("https://assets.example/prebid/trusted-prebid.js".to_string());
@@ -3299,7 +3299,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_escapes_less_than_signs_in_values() {
+    fn head_markup_escapes_less_than_signs_in_values() {
         let mut config = base_config();
         config.account_id = Some("</script><script>alert(1)</script>".to_string());
         let integration = PrebidIntegration::new(config);
@@ -3313,7 +3313,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_client_side_bidders_when_empty() {
+    fn head_markup_omits_client_side_bidders_when_empty() {
         let integration = PrebidIntegration::new(base_config());
         let inserts = integration.head_markup();
         let script = &inserts[0];
@@ -3325,7 +3325,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_client_side_bidders_when_configured() {
+    fn head_markup_includes_client_side_bidders_when_configured() {
         let mut config = base_config();
         config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
         let integration = PrebidIntegration::new(config);
