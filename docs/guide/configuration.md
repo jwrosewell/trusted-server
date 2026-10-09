@@ -1027,6 +1027,12 @@ Edit TOML, validate, and push again for those changes.
 Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
 :::
 
+### Headers that describe the deployment
+
+`X-Served-By`, `X-Cache` and `X-Cache-Hits` name the node that answered and say how a cache treated the request. They arrive on a response from the publisher's origin or from a cache on the way to it. On a publisher's page they tell a reader nothing, and tell something probing the site how it is built.
+
+Every adapter removes the three from a response before it finalizes it, unless the request was for a path beneath `/_ts`, which is where a deployment is asked about itself. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
+
 ## robots.txt Configuration
 
 What `/robots.txt` answers. With no `[robots-txt]` section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
