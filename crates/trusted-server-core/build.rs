@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use edgezero_core::manifest::ManifestLoader;
 
 mod build_time;
+mod key_schedule;
 
 /// Source file that must stay out of the generated list.
 ///
@@ -25,47 +26,28 @@ fn main() {
 /// Embeds the attestation signing key schedule in the file
 /// `TRUSTED_SERVER_ATTESTATION_KEYS` names, or an empty schedule.
 ///
-/// One key per line, being the key id, the Unix second it comes into force
-/// and the private key as base64 DER, separated by tabs. The schedule is
-/// compiled into the binary, so no signing key sits in a store the service
-/// reads when it runs.
+/// The schedule is compiled into the binary, so no signing key sits in a
+/// store the service reads when it runs. See [`key_schedule::constant_source`]
+/// for what a schedule holds.
 fn write_attestation_keys() {
     println!("cargo:rerun-if-env-changed=TRUSTED_SERVER_ATTESTATION_KEYS");
-    let mut generated = String::from("const ATTESTATION_KEYS: &[(&str, i64, &str)] = &[");
-    if let Some(path) =
-        env::var_os("TRUSTED_SERVER_ATTESTATION_KEYS").filter(|path| !path.is_empty())
-    {
-        let path = PathBuf::from(path);
-        println!("cargo:rerun-if-changed={}", path.display());
-        let text = fs::read_to_string(&path).expect("should read the attestation key schedule");
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let mut fields = line.split('\t');
-            let key_id = fields.next().unwrap_or_default();
-            let starts_at: i64 = fields
-                .next()
-                .unwrap_or_default()
-                .parse()
-                .expect("should read each attestation key's start as Unix seconds");
-            let private_key = fields.next().unwrap_or_default();
-            assert!(
-                fields.next().is_none() && is_plain(key_id) && is_plain(private_key),
-                "each attestation key line should hold a key id, a start and a key",
-            );
-            generated.push_str(&format!("({key_id:?}, {starts_at}, {private_key:?}),"));
+    let schedule = env::var_os("TRUSTED_SERVER_ATTESTATION_KEYS")
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = PathBuf::from(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+            fs::read_to_string(&path).expect("should read the attestation key schedule")
+        });
+    let source = match key_schedule::constant_source(schedule.as_deref()) {
+        Ok(source) => source,
+        Err(reason) => {
+            println!("cargo::error=the attestation key schedule is refused, because {reason}");
+            std::process::exit(1);
         }
-    }
-    generated.push_str("];");
+    };
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should read OUT_DIR"));
-    fs::write(out_dir.join("attestation_keys.rs"), generated)
+    fs::write(out_dir.join("attestation_keys.rs"), source)
         .expect("should write the attestation key schedule");
-}
-
-/// Whether a schedule field holds only characters a key id or base64 uses.
-fn is_plain(field: &str) -> bool {
-    !field.is_empty()
-        && field
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:+/=".contains(&b))
 }
 
 /// Bakes the build time into the binary as `TRUSTED_SERVER_BUILT_AT`.

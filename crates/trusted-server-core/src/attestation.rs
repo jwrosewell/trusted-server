@@ -38,6 +38,12 @@ use crate::settings::Settings;
 // `ATTESTATION_KEYS`, written by build.rs from the schedule the build names.
 include!(concat!(env!("OUT_DIR"), "/attestation_keys.rs"));
 
+/// The build script's reading of a key schedule, compiled here so a test can
+/// call it.
+#[cfg(test)]
+#[path = "../key_schedule.rs"]
+mod key_schedule;
+
 /// The address of the attestation page when the settings name none. The JSON
 /// form is at the same address plus `.json`.
 pub const DEFAULT_ENDPOINT: &str = "/_ts/attestation";
@@ -822,6 +828,97 @@ mod tests {
             .expect("base64url signature");
         assert_eq!(raw.len(), 64, "the signature is the raw r and s pair");
         (payload, Signature::from_slice(&raw).expect("64 bytes"))
+    }
+
+    /// A build given no schedule, an empty one or blank lines compiles a
+    /// schedule with no key in it, which is what makes the endpoint answer
+    /// 503.
+    #[test]
+    fn a_build_given_no_schedule_compiles_an_empty_one() {
+        let empty = "const ATTESTATION_KEYS: &[(&str, i64, &str)] = &[];";
+
+        for (case, schedule) in [
+            ("no schedule", None),
+            ("an empty file", Some("")),
+            ("blank lines", Some("\n  \n\r\n")),
+        ] {
+            assert_eq!(
+                key_schedule::constant_source(schedule).as_deref(),
+                Ok(empty),
+                "{case} should compile an empty schedule"
+            );
+        }
+    }
+
+    /// Each line becomes one key, in the order written, whichever line ending
+    /// the file was saved with.
+    #[test]
+    fn each_line_of_a_schedule_becomes_a_key() {
+        let first = key_text(&FIRST);
+        let second = key_text(&SECOND);
+        let expected = format!(
+            "const ATTESTATION_KEYS: &[(&str, i64, &str)] = &[\
+             (\"example-first\", 1000, {first:?}),(\"example-second\", 2000, {second:?}),];"
+        );
+
+        for ending in ["\n", "\r\n"] {
+            let schedule = format!(
+                "example-first\t1000\t{first}{ending}example-second\t2000\t{second}{ending}"
+            );
+            assert_eq!(
+                key_schedule::constant_source(Some(&schedule)),
+                Ok(expected.clone()),
+                "should read both keys from a file with {ending:?} line endings"
+            );
+        }
+    }
+
+    /// A line of any other shape stops the build. Its key is never repeated
+    /// in the message, and nothing it holds can end the string it would be
+    /// written in.
+    #[test]
+    fn a_schedule_line_of_any_other_shape_is_refused_without_showing_the_key() {
+        let key = key_text(&FIRST);
+        let cases = [
+            ("two fields", format!("example-first\t{key}")),
+            ("four fields", format!("example-first\t1000\t{key}\textra")),
+            (
+                "spaces in place of tabs",
+                format!("example-first 1000 {key}"),
+            ),
+            (
+                "a start that is not a number",
+                format!("example-first\tsoon\t{key}"),
+            ),
+            ("an empty key id", format!("\t1000\t{key}")),
+            ("an empty key", "example-first\t1000\t".to_owned()),
+            (
+                "a key id that would end its string",
+                format!("example\"); evil(\"\t1000\t{key}"),
+            ),
+            (
+                "a key that would end its string",
+                format!("example-first\t1000\t{key}\"), (\"x"),
+            ),
+            (
+                "a key holding a backslash",
+                format!("example-first\t1000\t{key}\\"),
+            ),
+        ];
+        for (case, line) in cases {
+            let schedule = format!("example-zero\t500\t{key}\n{line}\n");
+            let refused = key_schedule::constant_source(Some(&schedule))
+                .expect_err("should refuse the schedule");
+
+            assert!(
+                refused.starts_with("line 2 "),
+                "{case} should be refused by its line number, got: {refused}"
+            );
+            assert!(
+                !refused.contains(&key),
+                "{case} should be refused without repeating the key"
+            );
+        }
     }
 
     /// A verifier with only the public key, in the `SubjectPublicKeyInfo` DER
