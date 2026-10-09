@@ -19,6 +19,7 @@
     )
 )]
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,10 +33,13 @@ use validator::Validate;
 use trusted_server_core::constants::INTERNAL_HEADERS;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
-    ensure_integration_backend,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded,
+    collect_response_bounded, ensure_integration_backend,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
@@ -373,7 +377,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_middleware(Arc::new(SdkAddress(integration)))
             .build(),
     ))
 }
@@ -421,26 +425,11 @@ impl IntegrationProxy for LockrIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for LockrIntegration {
-    fn integration_id(&self) -> &'static str {
-        LOCKR_INTEGRATION_ID
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_sdk && matches!(attribute, "src" | "href")
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if !self.config.rewrite_sdk {
-            return AttributeRewriteAction::Keep;
-        }
-
-        if self.is_lockr_sdk_url(attr_value) {
+impl LockrIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party endpoint when it is the SDK's address.
+    fn rewrite_sdk_address(&self, value: &str) -> AttributeRewriteAction {
+        if self.is_lockr_sdk_url(value) {
             // Root-relative so the browser resolves it against the page host.
             // Note: a page-level `<base href>` participates in this resolution,
             // so on pages that set an external base URL these resolve against
@@ -451,6 +440,33 @@ impl IntegrationAttributeRewriter for LockrIntegration {
             AttributeRewriteAction::Replace(replacement)
         } else {
             AttributeRewriteAction::Keep
+        }
+    }
+}
+
+/// Loads the SDK from the first-party endpoint, on the pages a `[[fetch]]`
+/// entry names [`MODULE`] for. It does nothing unless `rewrite_sdk` is set.
+struct SdkAddress(Arc<LockrIntegration>);
+
+impl Middleware for SdkAddress {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        if !self.0.config.rewrite_sdk {
+            return MiddlewareAction::pass();
+        }
+        let integration = Arc::clone(&self.0);
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(move |matched| integration.rewrite_sdk_address(matched.value));
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
         }
     }
 }
@@ -492,16 +508,6 @@ mod tests {
             rewrite_sdk: true,
             rewrite_sdk_host: None,
             origin_override: None,
-        }
-    }
-
-    fn test_context() -> IntegrationAttributeContext<'static> {
-        IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
         }
     }
 
@@ -547,9 +553,8 @@ mod tests {
     #[test]
     fn test_attribute_rewriter_rewrites_sdk_urls() {
         let integration = LockrIntegration::new(test_config());
-        let ctx = test_context();
 
-        let result = integration.rewrite("src", "https://aim.loc.kr/identity-lockr-v1.0.js", &ctx);
+        let result = integration.rewrite_sdk_address("https://aim.loc.kr/identity-lockr-v1.0.js");
 
         assert_eq!(
             result,
@@ -561,9 +566,8 @@ mod tests {
     #[test]
     fn test_attribute_rewriter_keeps_non_lockr_urls() {
         let integration = LockrIntegration::new(test_config());
-        let ctx = test_context();
 
-        let result = integration.rewrite("src", "https://example.com/other.js", &ctx);
+        let result = integration.rewrite_sdk_address("https://example.com/other.js");
 
         assert_eq!(
             result,
@@ -579,14 +583,15 @@ mod tests {
             ..test_config()
         };
         let integration = LockrIntegration::new(config);
-        let ctx = test_context();
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
 
-        let result = integration.rewrite("src", "https://aim.loc.kr/identity-lockr-v1.0.js", &ctx);
-
-        assert_eq!(
-            result,
-            AttributeRewriteAction::Keep,
-            "should keep all URLs when rewrite_sdk is disabled"
+        assert!(
+            SdkAddress(integration).create(&context).is_pass(),
+            "should leave every page alone when rewrite_sdk is disabled"
         );
     }
 

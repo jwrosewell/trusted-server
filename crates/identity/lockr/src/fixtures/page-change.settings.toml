@@ -3,3 +3,7 @@ modules = ["lockr"]
 
 [identity.lockr]
 app_id = "test-app-id"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["identity.lockr"]
