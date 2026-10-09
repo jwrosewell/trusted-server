@@ -343,6 +343,17 @@ made up and check 6 against the host it fetched from, so a stored or copied
 answer cannot pass them. A verifier handed an envelope can make checks 5 and 6
 only against the values the relying party gives it.
 
+## Seeing it run
+
+`./scripts/attestation-local-test.sh` makes two signing keys, builds the
+Fastly adapter with their schedule compiled in and runs it under Viceroy. It
+then checks the evidence as a verifier would, with OpenSSL and the public key
+alone. The signature verifies over the context, a line feed and the payload,
+and fails with the other key, under another context and once the host in the
+payload is changed. The script also checks every field the evidence carries,
+that a forwarded host header never becomes the signed host, and the answers
+to a malformed nonce and to another method.
+
 ## Replay and relay
 
 Genuine evidence for one site must never pass as evidence for another. The
