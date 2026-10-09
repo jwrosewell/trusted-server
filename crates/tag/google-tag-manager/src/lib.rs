@@ -3338,6 +3338,84 @@ assume_single_jurisdiction = true
         );
     }
 
+    /// The page a reader receives when `html` arrives from the origin
+    /// `chunk_size` bytes at a time, with Google Tag Manager running.
+    fn page_with_gtm(html: &str, chunk_size: usize) -> String {
+        let mut settings = make_settings();
+        settings
+            .insert_module_config(
+                "tag",
+                MODULE,
+                &serde_json::json!({
+                    "container_id": "GTM-12345",
+                    "upstream_url": "https://www.googletagmanager.com"
+                }),
+            )
+            .expect("should update config");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            create_html_processor(config),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process");
+        String::from_utf8(output).expect("should stay UTF-8")
+    }
+
+    #[test]
+    fn the_rewritten_snippet_keeps_its_data_layer_parameter() {
+        // The standard snippet adds `'&l='+l` to the container's address when
+        // a page names its own data layer. A browser decodes no entity inside
+        // a script, so `&amp;l=` would send a parameter called `amp;l`, and
+        // the container would read the default data layer instead.
+        let processed = page_with_gtm(
+            r#"<html><head><script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+})(window,document,'script','pageData','GTM-12345');</script></head><body></body></html>"#,
+            8192,
+        );
+
+        assert!(
+            processed.contains("'/integrations/google_tag_manager/gtm.js?id='+i+dl"),
+            "should point the snippet at the first-party path: {processed}"
+        );
+        assert!(
+            processed.contains("dl=l!='dataLayer'?'&l='+l:''"),
+            "should keep the data layer parameter as the snippet wrote it: {processed}"
+        );
+        assert!(
+            !processed.contains("&amp;"),
+            "should escape nothing inside the script: {processed}"
+        );
+    }
+
+    #[test]
+    fn a_loader_of_the_page_s_own_keeps_its_operators() {
+        let processed = page_with_gtm(
+            r#"<html><head><script>if (ready && tries < 3 || waited > 9) { load('https://www.googletagmanager.com/gtm.js?id=GTM-12345'); }</script></head><body></body></html>"#,
+            8192,
+        );
+
+        assert!(
+            processed.contains(
+                "<script>if (ready && tries < 3 || waited > 9) { \
+                 load('/integrations/google_tag_manager/gtm.js?id=GTM-12345'); }</script>"
+            ),
+            "should change the address and leave the script's operators as they were: \
+             {processed}"
+        );
+    }
+
     #[test]
     fn test_container_id_validation_accepts_valid_ids() {
         // Valid container IDs with different lengths

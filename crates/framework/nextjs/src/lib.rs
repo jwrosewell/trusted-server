@@ -228,6 +228,50 @@ mod tests {
     }
 
     #[test]
+    fn html_processor_keeps_what_a_rewritten_next_data_script_holds() {
+        // The payload is rewritten because it names the origin, and the rest
+        // of it has to come back as the page wrote it.
+        let html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"primary":{"href":"https://origin.example.com/search?q=shoes&page=2"},"note":"a < b && c > d"}}}</script></body></html>"#;
+
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
+                &json!({
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 8192,
+            },
+            create_html_processor(config),
+        );
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains(r#""href":"https://test.example.com/search?q=shoes&page=2""#),
+            "should move the address and keep its query string as written: {processed}"
+        );
+        assert!(
+            processed.contains(r#""note":"a < b && c > d""#),
+            "should keep a value it did not rewrite as written: {processed}"
+        );
+    }
+
+    #[test]
     fn html_processor_rewrites_next_data_fixture_like_payload() {
         let html = r#"<html><body>
             <script id="__NEXT_DATA__" type="application/json">

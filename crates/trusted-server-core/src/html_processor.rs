@@ -690,7 +690,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 match rewriter.rewrite(text.as_str(), &ctx) {
                     ScriptRewriteAction::Keep => {}
                     ScriptRewriteAction::Replace(rewritten) => {
-                        text.replace(&rewritten, ContentType::Text);
+                        // Written back as markup, because the rewriter was
+                        // handed the text as the page wrote it. Writing it as
+                        // text would escape `&`, `<` and `>`, and a browser
+                        // decodes none of those inside a script.
+                        text.replace(&rewritten, ContentType::Html);
                     }
                     ScriptRewriteAction::RemoveNode => {
                         text.remove();
@@ -2095,6 +2099,54 @@ mod tests {
         assert!(
             !observed.load(Ordering::SeqCst),
             "ordinary script text must not cost a cacheable page its shared template"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_script_is_written_back_as_the_rewriter_gave_it() {
+        // A script's text is not HTML text. A browser decodes no entity inside
+        // a script, so `&&` written back as `&amp;&amp;` is a syntax error.
+        struct HostRewriter;
+
+        impl crate::integrations::IntegrationScriptRewriter for HostRewriter {
+            fn integration_id(&self) -> &'static str {
+                "host-rewriter"
+            }
+
+            fn selector(&self) -> &'static str {
+                "script"
+            }
+
+            fn rewrite(
+                &self,
+                content: &str,
+                _ctx: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                ScriptRewriteAction::replace(
+                    content.replace("cdn.vendor.example", "test.example.com"),
+                )
+            }
+        }
+
+        let mut config = create_test_config();
+        config.integrations =
+            IntegrationRegistry::from_rewriters(Vec::new(), vec![Arc::new(HostRewriter)]);
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(
+                br#"<html><head><script>if (a && b < c || d > e) { load("https://cdn.vendor.example/tag.js?x=1&y=2"); }</script></head><body></body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+        let processed = String::from_utf8(output).expect("should stay UTF-8");
+
+        assert!(
+            processed.contains(
+                r#"<script>if (a && b < c || d > e) { load("https://test.example.com/tag.js?x=1&y=2"); }</script>"#
+            ),
+            "should write the rewritten script back with its operators and its query string \
+             as they were: {processed}"
         );
     }
 
