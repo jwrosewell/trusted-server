@@ -1789,6 +1789,18 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// The names of the middleware that run in `phase`, in registration
+    /// order.
+    #[must_use]
+    pub fn middleware_in(&self, phase: MiddlewarePhase) -> Vec<&'static str> {
+        self.inner
+            .middleware
+            .iter()
+            .filter(|(_, middleware)| middleware.phases().contains(&phase))
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect()
+    }
+
     /// The middleware the first entry covering a response selects, in the
     /// order they run, for a response of `media_type` to a request for `path`.
     /// A response no entry covers gives an empty chain.
@@ -5877,6 +5889,16 @@ mod tests {
                 fixture::BROKEN_READER,
             ],
             "should list the middleware the selected module supplies"
+        );
+        assert_eq!(
+            registry.middleware_in(MiddlewarePhase::Fetch),
+            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            "should list the middleware that run in the fetch phase"
+        );
+        assert_eq!(
+            registry.middleware_in(MiddlewarePhase::Serve),
+            [fixture::READER, fixture::BROKEN_READER],
+            "should list the middleware that run in the serve phase"
         );
         let chain_for = |media_type: &str, path: &str| {
             registry
