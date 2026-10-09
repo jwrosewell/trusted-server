@@ -47,8 +47,7 @@ config, local-push output, bodies, headers, and logs.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
+Key rotation is registered but returns a not-supported response because the
 adapter has no request-time KV implementation. It sanitizes forwarded client-IP
 headers but does not resolve `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).

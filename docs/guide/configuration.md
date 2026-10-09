@@ -1174,13 +1174,8 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 
 ::: warning Admin coverage and passwords are validated at startup
 
-Startup fails when no handler covers an admin route. The dynamic
-`/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
-Basic Auth runs on the raw path before routing, so coverage cannot be inferred
-from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
-matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
-patterns).
+Startup fails when no handler covers an admin route. Use a prefix-level
+matcher such as `^/_ts/admin`.
 
 Handler expressions match the raw URI path, while a publisher origin may decode
 percent-encoded aliases before routing. For a whole-site staging gate, use

@@ -14,6 +14,7 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 #[cfg(any(test, target_arch = "wasm32"))]
 use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
@@ -21,12 +22,7 @@ use trusted_server_core::config_payload::{
     DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with,
 };
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::inspect::config::{CONFIG_PATHS, handle_config};
 use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
@@ -523,10 +519,6 @@ fn cache_purge_not_supported() -> Response {
     response
 }
 
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Cloudflare adapter.
 ///
@@ -692,7 +684,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
-            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+            if let Some(response) = closed_path_response(&req) {
                 return Ok(response);
             }
             if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
@@ -824,26 +816,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
-            .get(
-                "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
-                }),
-            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

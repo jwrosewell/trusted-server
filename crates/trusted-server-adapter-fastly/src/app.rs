@@ -22,9 +22,6 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
-//! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -57,7 +54,7 @@
 //! `route_request` (tracked in issue #495):
 //!
 //! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth, and the read-only admin diagnostics)
+//!   batch-sync, which uses Bearer auth)
 //!   and reproduces the legacy
 //!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
 //!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
@@ -112,11 +109,9 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::admin::{
-    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
@@ -801,34 +796,6 @@ async fn execute_named(
         return Ok(response);
     }
 
-    // These diagnostics are read-only. Running the normal EC lifecycle would
-    // attach finalization state and could ingest request cookies into KV after
-    // the handler returns, violating that contract.
-    if matches!(
-        handler,
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
-    ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
-                NamedRouteHandler::AdminEcLookup => {
-                    // Deliberately do not use an EC request-state graph: that
-                    // copy is bot-gated, while operators use curl for this
-                    // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
-                    // The selected module decides which identifiers this
-                    // deployment recognizes, so build it here rather than
-                    // assuming the built-in HMAC shape. The read-only
-                    // diagnostic builds no EC request state to borrow it from.
-                    let module = request_module(&state.settings.ec, &services)?;
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, module.as_deref(), &req)
-                }
-                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
-                _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
-        return Ok(response);
-    }
-
     // Read only. The permissions are resolved for this request as a page's
     // would be, then shown, and the Edge Cookie lifecycle never runs, so
     // nothing is written for the reader.
@@ -903,9 +870,6 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
-            unreachable!("admin diagnostics should be handled before EC setup")
-        }
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
         }
@@ -1062,7 +1026,7 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
-    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+    if let Some(response) = closed_path_response(&req) {
         return response;
     }
 
@@ -1370,8 +1334,6 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
-    AdminEcLookup,
-    AdminEidsLookup,
     AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
@@ -1442,25 +1404,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/cache/purge",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::AdminCachePurge,
-    },
-    // Admin EC lookup: the bare route reads the EC ID from the caller's
-    // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
-    NamedRoute {
-        path: "/_ts/admin/ec",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    NamedRoute {
-        path: "/_ts/admin/ec/{id}",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
-    // an ingestion preview. Pure request inspection — no KV access.
-    NamedRoute {
-        path: "/_ts/admin/eids",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEidsLookup,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1769,7 +1712,6 @@ mod tests {
         build_per_request_services, build_state_from_settings, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
-    use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
@@ -2344,44 +2286,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_ec_lookup_routes_are_registered() {
-        // Both lookup shapes must be explicitly routed to the admin EC
-        // handler: the bare cookie-based route and the parameterized route.
-        // Leaving either unrouted would fall through to the publisher
-        // fallback, forwarding the caller's `Authorization` header to the
-        // origin.
-        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
-            let route = NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} must be a named route"));
-            assert!(
-                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
-                "{path} must map to the admin EC lookup handler"
-            );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET],
-                "{path} must have GET as its only primary method"
-            );
-        }
-
-        let eids_route = NAMED_ROUTES
-            .iter()
-            .find(|route| route.path == "/_ts/admin/eids")
-            .expect("should register /_ts/admin/eids as a named route");
-        assert!(
-            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
-            "/_ts/admin/eids must map to the admin EIDs lookup handler"
-        );
-        assert_eq!(
-            eids_route.primary_methods,
-            &[Method::GET],
-            "/_ts/admin/eids must have GET as its only primary method"
-        );
-    }
-
-    #[test]
     fn page_bids_serves_canonical_path_and_deprecated_alias() {
         // The SPA re-auction endpoint lives at the canonical single-underscore
         // `/_ts/page-bids`, matching every other internal route. The deprecated
@@ -2481,51 +2385,13 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+    fn an_authenticated_request_to_a_closed_path_is_answered_here() {
         let router = test_router();
         let ec_id = format!("{}.abc123", "a".repeat(64));
-        let valid_paths = [
+        for path in [
             "/_ts/admin/ec".to_owned(),
             format!("/_ts/admin/ec/{ec_id}"),
             "/_ts/admin/eids".to_owned(),
-        ];
-
-        for path in valid_paths {
-            for method in [
-                Method::POST,
-                Method::HEAD,
-                Method::OPTIONS,
-                Method::PUT,
-                Method::PATCH,
-                Method::DELETE,
-            ] {
-                let request = request_builder()
-                    .method(method.clone())
-                    .uri(format!("https://test-publisher.com{path}"))
-                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
-                    .body(Body::from("sensitive-admin-body"))
-                    .expect("should build authenticated admin request");
-                let response = route(&router, request);
-
-                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-                assert_eq!(
-                    response
-                        .headers()
-                        .get(header::ALLOW)
-                        .and_then(|v| v.to_str().ok()),
-                    Some("GET")
-                );
-                assert_eq!(
-                    response
-                        .headers()
-                        .get(header::CACHE_CONTROL)
-                        .and_then(|v| v.to_str().ok()),
-                    Some("no-store")
-                );
-            }
-        }
-
-        for path in [
             "/_ts/admin/ec/".to_owned(),
             format!("/_ts/admin/ec/{ec_id}/extra"),
             "/_ts/admin/eids/".to_owned(),
@@ -3315,103 +3181,6 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_some(),
             "named-route responses should carry EcFinalizeState for entry-point EC finalization"
-        );
-    }
-
-    #[test]
-    fn admin_eids_diagnostic_skips_ec_finalization() {
-        let router = test_router();
-        let ec_id = format!("{}.abc123", "a".repeat(64));
-        let eids = serde_json::json!([{
-            "source": "example.com",
-            "uids": [{ "id": "example-uid", "atype": 1 }]
-        }]);
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("https://test-publisher.com/_ts/admin/eids")
-            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header(
-                header::COOKIE,
-                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
-            )
-            .body(Body::empty())
-            .expect("should build authenticated EIDs diagnostic request");
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
-
-        let response = route(&router, request);
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .extensions()
-                .get::<super::EcFinalizeState>()
-                .is_none(),
-            "admin EIDs diagnostics should not attach EC finalization state"
-        );
-    }
-
-    #[test]
-    fn admin_ec_diagnostic_skips_ec_finalization() {
-        let router = test_router();
-        let ec_id = format!("{}.abc123", "a".repeat(64));
-        let eids = serde_json::json!([{
-            "source": "example.com",
-            "uids": [{ "id": "example-uid", "atype": 1 }]
-        }]);
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri(format!("https://test-publisher.com/_ts/admin/ec/{ec_id}"))
-            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header(
-                header::COOKIE,
-                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
-            )
-            .body(Body::empty())
-            .expect("should build authenticated EC diagnostic request");
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
-
-        let response = route(&router, request);
-
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "configured admin EC handler should run and report the unavailable test KV graph"
-        );
-        assert!(
-            response
-                .extensions()
-                .get::<super::EcFinalizeState>()
-                .is_none(),
-            "admin EC diagnostics should not attach EC finalization state"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "admin EC diagnostics should not mutate the EC cookie"
-        );
-    }
-
-    #[test]
-    fn admin_ec_route_without_credentials_returns_401() {
-        let router = test_router();
-
-        let response = route(&router, empty_request(Method::GET, "/_ts/admin/ec"));
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            response.headers().contains_key(header::WWW_AUTHENTICATE),
-            "admin EC 401 should include the Basic authentication challenge"
         );
     }
 

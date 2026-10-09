@@ -204,7 +204,7 @@ mod tests {
         // `^/_ts/admin` matches the raw path, so a percent-encoded separator
         // still consumes admin credentials. The publisher-fallback boundary
         // reserves the same paths so those credentials are never forwarded
-        // upstream (see `ec::admin::deny_admin_diagnostic_fallback`).
+        // upstream (see `closed_paths::closed_path_response`).
         let settings = create_test_settings();
 
         for path in ["/_ts/admin%2Fec", "/_ts/admin%2fec"] {

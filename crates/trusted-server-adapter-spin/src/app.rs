@@ -18,15 +18,11 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob_with;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
@@ -381,7 +377,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 22] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -392,9 +388,6 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 22] {
         (DATA_PAGE_PATH, &[Method::GET]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
-        ("/_ts/admin/ec", &[Method::GET]),
-        ("/_ts/admin/ec/{id}", &[Method::GET]),
-        ("/_ts/admin/eids", &[Method::GET]),
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
@@ -627,10 +620,6 @@ fn admin_key_management_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
-}
-
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
 }
 
 // ---------------------------------------------------------------------------
@@ -867,23 +856,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let cache_purge_unsupported_handler =
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
 
-        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-        };
-
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
-        let s = Arc::clone(&state);
-        let admin_eids_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -1024,7 +996,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
-            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+            if let Some(response) = closed_path_response(&req) {
                 return Ok(response);
             }
             if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
@@ -1157,14 +1129,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
-            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
-            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)

@@ -57,9 +57,9 @@ only after all four bindings are present.
 A successful `ts config push` alone does not configure this runtime: the
 Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time
 store registries are also unwired, so EC KV lookup and key rotation are not
-available. The read-only `/_ts/admin/eids` diagnostic remains available.
-Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
-resolved. See the [API reference](./api-reference) for route-level behavior.
+available. Forwarded client-IP headers are sanitized, but `[trusted_client_ip]`
+is not resolved. See the [API reference](./api-reference) for route-level
+behavior.
 
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.
