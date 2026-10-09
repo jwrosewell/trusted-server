@@ -8017,9 +8017,8 @@ mod tests {
             &[SCHEDULING_PROVIDER],
         );
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         settings
     }
@@ -9399,9 +9398,8 @@ mod tests {
     #[test]
     fn stream_publisher_body_writes_what_a_module_left_on_the_request_into_materialized_html() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         let integration_registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -9579,17 +9577,19 @@ mod tests {
         //! passing code: the decisions were right and nothing checked what the
         //! composition of them *renders*.
         //!
-        //! These tests render whole documents through `create_html_processor`,
-        //! composing the same three decisions `create_html_stream_processor` uses,
-        //! and compare bytes. A future request-dependent injection added at either
-        //! seam fails here even if every decision function is left untouched.
+        //! These tests render whole documents through the processor
+        //! `create_html_stream_processor` builds, composing the same decisions it
+        //! uses, and compare bytes. A future request-dependent injection added at
+        //! either seam fails here even if every decision function is left untouched.
 
         use super::template_neutrality_tests::{settings_with_slots, slot};
         use super::*;
         use crate::creative_opportunities::AssemblyMode;
-        use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
         use crate::integrations::IntegrationRegistry;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::integrations::registry_test_support::request_fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
         const DOCUMENT: &[u8] =
             b"<html><head><title>t</title></head><body><p>content</p></body></html>";
@@ -9600,7 +9600,7 @@ mod tests {
         struct RequestShape {
             /// Folds in consent, bot classification, prefetch and the kill switch.
             ad_stack_ran: bool,
-            /// A module left state on the request for its page hooks.
+            /// A module left state on the request for its serve middleware.
             module_state_left: bool,
             /// A resolved auction, present only when one was dispatched.
             bids_available: bool,
@@ -9612,9 +9612,19 @@ mod tests {
             let mut settings = settings_with_slots();
             settings.proxy.allowed_domains =
                 vec!["*.example".to_string(), "*.example.com".to_string()];
-            // The stand-in is what writes a marked request's state into a
-            // document, so it runs for every shape.
+            // The request stand-in is what writes a marked request's state
+            // into a document, so it runs for every shape. The reader
+            // middleware beside it writes into every reader's copy, marked or
+            // not, so a template that ran the serve entry would show it.
             settings.select_module("testing", request_fixture::MODULE);
+            settings.select_module("testing", fixture::MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                &mut settings,
+                MiddlewarePhase::Serve,
+                &[request_fixture::MODULE, fixture::READER],
+            );
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should build a registry that runs the stand-in");
             let slots = [slot()];
 
             let ad_slots_script =
@@ -9639,8 +9649,7 @@ mod tests {
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
-                integrations: IntegrationRegistry::new(&settings)
-                    .expect("should build a registry that runs the stand-in"),
+                integrations: registry.clone(),
                 permissions_script: template_permissions_script(mode, &permissions_json_fixture()),
                 ad_slots_script,
                 ad_bids_state,
@@ -9649,7 +9658,27 @@ mod tests {
                 body_close,
             };
 
-            let mut processor = create_html_processor(config);
+            let fetch = registry.middleware_chain(
+                &settings.fetch,
+                MiddlewarePhase::Fetch,
+                HTML_MEDIA_TYPE,
+                "/",
+            );
+            // A shared mode builds the template every reader shares, which is
+            // the response `create_html_stream_processor` runs no serve entry
+            // on.
+            let shared_template_authorized = matches!(mode, AssemblyMode::Esi);
+            let serve = (!shared_template_authorized).then(|| {
+                registry.middleware_chain(
+                    &settings.serve,
+                    MiddlewarePhase::Serve,
+                    HTML_MEDIA_TYPE,
+                    "/",
+                )
+            });
+            let mut processor =
+                create_html_processor_with_middleware(config, &fetch, serve.as_ref())
+                    .expect("should plan the document's middleware");
             let out = processor
                 .process_chunk(DOCUMENT, true)
                 .expect("should process the document");
@@ -9731,6 +9760,7 @@ mod tests {
                 "permissions",
                 request_fixture::HEAD_FLAG,
                 request_fixture::MODULE_FILE,
+                fixture::READER_SCRIPT,
             ] {
                 assert!(
                     !rendered.contains(forbidden),
@@ -9812,6 +9842,12 @@ mod tests {
                 !unmarked.contains(request_fixture::HEAD_FLAG)
                     && !unmarked.contains(request_fixture::MODULE_FILE),
                 "a request no module left state on should get neither:\n{unmarked}"
+            );
+            assert!(
+                rendered.contains(fixture::READER_SCRIPT)
+                    && unmarked.contains(fixture::READER_SCRIPT),
+                "an inline document is one reader's copy, so the serve entry should run on \
+                 it whatever the request left:\n{unmarked}"
             );
         }
 
@@ -15459,10 +15495,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -15551,10 +15584,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -15621,10 +15651,7 @@ mod tests {
                 .as_mut()
                 .expect("fixture configures creative opportunities")
                 .origin_is_cookie_independent = Some(true);
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -18493,9 +18520,8 @@ mod tests {
         async fn inactive_ad_stack_preserves_the_cache_privacy_of_a_request_a_module_acts_on() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
+            crate::integrations::registry_test_support::request_fixture::select_and_place(
+                &mut settings,
             );
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "no-cache");
@@ -19110,9 +19136,8 @@ mod tests {
     #[tokio::test]
     async fn what_a_request_filter_leaves_survives_into_the_publisher_html_pipeline() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         let registry = IntegrationRegistry::new(&settings)
             .expect("should create integration registry with the stand-in");

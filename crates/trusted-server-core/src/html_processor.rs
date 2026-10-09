@@ -1532,13 +1532,14 @@ mod tests {
 
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings.select_module("testing", request_fixture::MODULE);
-        let mut config = create_test_config();
-        config.integrations =
+        request_fixture::select_and_place(&mut settings);
+        let registry =
             IntegrationRegistry::new(&settings).expect("should build integration registry");
+        let mut config = create_test_config();
+        config.integrations = registry.clone();
         config.request_state = request_fixture::marked();
 
-        let processor = create_html_processor(config);
+        let processor = test_support::create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,

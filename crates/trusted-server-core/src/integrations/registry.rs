@@ -2798,10 +2798,10 @@ pub(crate) mod test_support {
     /// does, the way a module that reserves a cookie does. Selected, its
     /// request filter leaves the same mark on a request that carries its
     /// header, which is the route a module that decides in its filter takes.
-    /// Selected, the
-    /// stand-in's head injector reads the mark from the document's state and
-    /// writes one script at the start of `<head>` and the tag of its
-    /// standalone module after the bundle. Its response finalizer sets a
+    /// Selected, it supplies one serve middleware under its own name, which
+    /// reads the mark from the state the request left and writes one script
+    /// ahead of the bundle and the tag of its standalone module after it,
+    /// into that reader's copy alone. Its response finalizer sets a
     /// cookie on the response to a marked request, and its builder declares
     /// that it reads the auction token.
     pub(crate) mod request_fixture {
@@ -2813,11 +2813,12 @@ pub(crate) mod test_support {
 
         use crate::error::TrustedServerError;
         use crate::integrations::registry::{
-            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
-            IntegrationRegistration, IntegrationRequestFilter, IntegrationRequestState,
-            RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+            CarriedJsModule, IntegrationRegistration, IntegrationRequestFilter,
+            IntegrationRequestState, RequestFilterDecision, RequestFilterEffects,
+            RequestFilterInput,
         };
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase};
         use crate::settings::Settings;
         use crate::tsjs_bundle::JsModulePart;
 
@@ -2971,38 +2972,44 @@ pub(crate) mod test_support {
 
         struct Head;
 
-        impl Head {
-            fn marked(ctx: &IntegrationHtmlContext<'_>) -> bool {
-                ctx.document_state.get::<Mark>(ID).is_some()
-            }
-        }
-
-        impl IntegrationHeadInjector for Head {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                if !Self::marked(ctx) {
-                    return Vec::new();
-                }
-                vec![format!("<script>{HEAD_FLAG}</script>")]
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
             }
 
-            fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                if !Self::marked(ctx) {
-                    return Vec::new();
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                if context.document_state.get::<Mark>(ID).is_none() {
+                    return MiddlewareAction::pass();
                 }
                 let module = JsModulePart {
                     id: ID,
                     source: JS,
                     sha256: JS_SHA256,
                 };
-                vec![format!(
-                    "<script src=\"{}\"></script>",
-                    crate::tsjs::tsjs_single_module_script_src(&module)
-                )]
+                MiddlewareAction {
+                    head_inserts: vec![format!("<script>{HEAD_FLAG}</script>")],
+                    after_bundle_inserts: vec![format!(
+                        "<script src=\"{}\"></script>",
+                        crate::tsjs::tsjs_single_module_script_src(&module)
+                    )],
+                    ..MiddlewareAction::pass()
+                }
             }
+        }
+
+        /// Has `settings` select the stand-in and run its middleware, and no
+        /// other, on every reader's copy of a page.
+        pub(crate) fn select_and_place(settings: &mut Settings) {
+            settings.select_module("testing", MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Serve,
+                &[MODULE],
+            );
         }
 
         fn register(
@@ -3018,7 +3025,7 @@ pub(crate) mod test_support {
                         sha256: JS_SHA256,
                     })
                     .with_standalone_js()
-                    .with_head_injector(Arc::new(Head))
+                    .with_middleware(Arc::new(Head))
                     .with_request_filter(Arc::new(Filter))
                     .build(),
             ))
