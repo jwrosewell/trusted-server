@@ -3264,6 +3264,63 @@ service-scoped `__KEY` entry in `edgezero_runtime_env`. Changing that entry affe
 the active service immediately. Do not point the production selector at a
 staging key; staged deployments need their own runtime-env store.
 
+### One blob for each host
+
+One Fastly service can serve several publishers, each from an application
+config of its own. Write `{host}` in the `__KEY` selector and the runtime
+replaces it with the host of each request before it reads any settings, so
+every host reads the blob stored under its own name.
+
+Push a blob for each host the service answers for, then set the selector.
+
+```bash
+ts config push --adapter fastly --key www.publisher-a.example --app-config publisher-a.toml
+ts config push --adapter fastly --key www.publisher-b.example --app-config publisher-b.toml
+
+fastly config-store-entry update --upsert \
+  --store-id <runtime-env-store-id> \
+  --key "EDGEZERO__SERVICES__${FASTLY_SERVICE_ID}__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY" \
+  --value '{host}'
+```
+
+The selector takes effect on the active service as soon as it is written, as
+any entry of its `edgezero_runtime_env` store does, so the blobs come first.
+
+| A request for                                               | Reads the blob at         | Is answered                      |
+| ----------------------------------------------------------- | ------------------------- | -------------------------------- |
+| `www.publisher-a.example`                                   | `www.publisher-a.example` | From publisher A's config        |
+| `WWW.Publisher-A.example:443` or `www.publisher-a.example.` | `www.publisher-a.example` | From publisher A's config        |
+| `www.publisher-b.example`                                   | `www.publisher-b.example` | From publisher B's config        |
+| A host with no blob                                         | None                      | `421 Misdirected Request`        |
+| A `Host` that is not a host name, or no `Host`              | None                      | `421 Misdirected Request`        |
+| `/health`, for any host                                     | None                      | `200`, before any config is read |
+
+A host with no blob is never answered from the logical store ID or from
+another host's blob, because a shared fallback is how a host nobody configured
+comes to be served another publisher's site. A host name is letters, digits
+and hyphens in labels joined by single dots. Nothing else is looked up, so a
+request cannot name the logical store ID or a part of a stored blob, each of
+which carries an underscore.
+
+- A publisher with several names has a blob under each. `www.publisher.example`
+  and `publisher.example` are two keys, and what each serves is for the
+  publisher to decide.
+- The selector may carry text around the placeholder, such as `{host}_staging`.
+  Each key is then pushed in full, with `--key www.publisher-a.example_staging`.
+- Every blob resolves its secret references in the one secret store the service
+  maps, so each publisher's blob names keys of its own.
+- Request signing keys belong to the service, so every publisher on it signs
+  with the same keys.
+- `ts deploy --staging` points a staged version's selector at
+  `<logical-store-id>_staging`, which carries no placeholder. A staged version
+  therefore reads that one blob for every host and never a production blob.
+- Only the Fastly adapter reads the placeholder. The Axum, Cloudflare and Spin
+  adapters read one application config.
+
+`./scripts/config-by-host-local-test.sh` serves two publishers from one local
+Viceroy instance. It checks that each host is answered from its own blob and
+that a host with none is refused.
+
 ### Local development
 
 The repository's Viceroy configuration uses the default logical app-config name
