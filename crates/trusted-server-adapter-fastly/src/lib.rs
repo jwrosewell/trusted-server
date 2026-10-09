@@ -252,7 +252,7 @@ fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
     let body = serde_json::json!({
         "instance": instance_id(),
         "ordinal": ordinal,
-        "builds": sandbox.initialization_attempts(),
+        "builds": crate::sandbox::build_attempts(sandbox),
     });
 
     FastlyResponse::from_status(fastly::http::StatusCode::OK)
@@ -416,36 +416,36 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             }
         };
 
-    // Build lazily, once per sandbox. Reached only past the health, JA4, and
-    // counters short-circuits, so none of those pays for construction.
+    // Build lazily, once per sandbox for each app-config key it is asked for.
+    // Reached only past the health, JA4, and counters short-circuits, so none
+    // of those pays for construction.
     //
-    // `initialize` builds only when the sandbox is empty, retains only
-    // success, and returns the error unchanged. A failed build hands back its
-    // error router as the error payload: that serves this request and is then
-    // dropped, so a transient config-store failure cannot pin the sandbox into
-    // permanent error mode, and the next callback retries construction.
-    let failed_build = sandbox
-        .initialize(|| {
-            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
-            match state {
-                Some(state) => Ok(RetainedApp { app, state }),
-                None => Err(app),
-            }
-        })
-        .err();
+    // `get_or_build` builds only when the sandbox holds no application for
+    // this key, retains only success, and returns the error unchanged. A
+    // failed build hands back its error router as the error payload: that
+    // serves this request and is then dropped, so a transient config-store
+    // failure cannot pin the sandbox into permanent error mode, and the next
+    // callback retries construction.
+    crate::sandbox::hold_applications(sandbox);
+    let Some(apps) = sandbox.state() else {
+        log::error!("no application holder available after initialization");
+        FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .with_body_text_plain("Internal Server Error")
+            .send_to_client();
+        return;
+    };
+    let built = apps.get_or_build(&runtime_stores.config_key, || {
+        let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+        match state {
+            Some(state) => Ok(RetainedApp { app, state }),
+            None => Err(app),
+        }
+    });
 
-    let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
-        match (failed_build.as_ref(), sandbox.state()) {
-            (Some(app), _) => (app, None),
-            (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
-            (None, None) => {
-                log::error!("no application available after initialization");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-                return;
-            }
-        };
+    let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) = match &built {
+        Ok(retained) => (&retained.app, Some(Arc::clone(&retained.state))),
+        Err(error_app) => (error_app, None),
+    };
 
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
     let counters =
