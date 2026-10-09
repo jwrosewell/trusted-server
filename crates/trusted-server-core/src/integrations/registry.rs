@@ -788,6 +788,10 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it run, because a middleware changes a
     /// page only where an entry of the settings names it.
     pub middleware: Vec<Arc<dyn Middleware>>,
+    /// Attributes this registration puts on the script bundle's tag, each a
+    /// name and a value, for a browser module that reads a setting from the
+    /// tag it was loaded by.
+    pub bundle_tag_attributes: Vec<(&'static str, &'static str)>,
     /// Geo module this registration supplies, with the name `[geo] module`
     /// selects it by.
     ///
@@ -837,6 +841,7 @@ impl IntegrationRegistrationBuilder {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -895,6 +900,19 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
         self.registration.middleware.push(middleware);
+        self
+    }
+
+    /// Put an attribute on the script bundle's tag, on every page the bundle
+    /// is written into.
+    ///
+    /// The name is lower case letters, digits and hyphens, and the value
+    /// holds none of `"`, `&`, `<` and `>`, or startup is refused. Where two
+    /// registrations give one name different values the first is kept, and
+    /// the other is logged as a warning.
+    #[must_use]
+    pub fn with_bundle_tag_attribute(mut self, name: &'static str, value: &'static str) -> Self {
+        self.registration.bundle_tag_attributes.push((name, value));
         self
     }
 
@@ -1020,6 +1038,10 @@ struct IntegrationRegistryInner {
     // The middleware the running registrations supply, each against the
     // integration that supplied it, in registration order.
     middleware: Vec<(&'static str, Arc<dyn Middleware>)>,
+    // The attributes the running registrations put on the script bundle's
+    // tag, each against the integration that asked for it, in registration
+    // order.
+    bundle_tag_attributes: Vec<(&'static str, (&'static str, &'static str))>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
@@ -1072,6 +1094,7 @@ impl Default for IntegrationRegistryInner {
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
             middleware: Vec::new(),
+            bundle_tag_attributes: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
             response_finalizers: Vec::new(),
@@ -1808,6 +1831,31 @@ impl IntegrationRegistry {
                     .middleware
                     .push((registration.integration_id, middleware));
             }
+            for (name, value) in registration.bundle_tag_attributes {
+                // The tag is written as markup with no escaping, so a name
+                // or a value that could end the attribute is refused.
+                let name_is_plain = !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    });
+                let value_is_plain = !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>'));
+                if !name_is_plain || !value_is_plain {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "integration `{}` puts the attribute `{name}` on the script \
+                             bundle's tag with the value `{value}`. A name is lower case \
+                             letters, digits and hyphens, and a value holds none of `\"`, `&`, \
+                             `<` and `>`",
+                            registration.integration_id
+                        ),
+                    }));
+                }
+                inner
+                    .bundle_tag_attributes
+                    .push((registration.integration_id, (name, value)));
+            }
             if let Some((name, module)) = registration.geo_module {
                 claim_module_name(&mut claimed, "geo", name, registration.integration_id)?;
                 inner.geo_modules.push((name, module));
@@ -2218,25 +2266,32 @@ impl IntegrationRegistry {
             .collect()
     }
 
-    /// Collect static attributes for the publisher TSJS bundle tag.
+    /// Collect static attributes for the publisher TSJS bundle tag, being
+    /// those the head injectors ask for and then those the registrations
+    /// state, each keeping the first value a name is given.
     #[must_use]
     pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        let from_injectors = self.inner.head_injectors.iter().flat_map(|injector| {
+            injector
+                .tsjs_script_tag_attributes()
+                .into_iter()
+                .map(|attribute| (injector.integration_id(), attribute))
+        });
         let mut attributes: Vec<(&'static str, &'static str)> = Vec::new();
-        for injector in &self.inner.head_injectors {
-            for attribute in injector.tsjs_script_tag_attributes() {
-                let existing = attributes
-                    .iter()
-                    .find(|(name, _)| *name == attribute.0)
-                    .copied();
-                match existing {
-                    None => attributes.push(attribute),
-                    Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
-                        "Integration `{}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
-                        injector.integration_id(),
-                        attribute.0
-                    ),
-                    Some(_) => {}
-                }
+        for (integration, attribute) in
+            from_injectors.chain(self.inner.bundle_tag_attributes.iter().copied())
+        {
+            let existing = attributes
+                .iter()
+                .find(|(name, _)| *name == attribute.0)
+                .copied();
+            match existing {
+                None => attributes.push(attribute),
+                Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
+                    "Integration `{integration}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
+                    attribute.0
+                ),
+                Some(_) => {}
             }
         }
         attributes
@@ -2501,6 +2556,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2545,6 +2601,7 @@ impl IntegrationRegistry {
                 head_injectors,
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2585,6 +2642,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters,
                 middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2665,6 +2723,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -3331,9 +3390,7 @@ pub(crate) mod test_support {
 
         impl crate::settings::IntegrationConfig for FixtureSettings {}
 
-        struct Tag {
-            mark_bundle: bool,
-        }
+        struct Tag;
 
         impl IntegrationHeadInjector for Tag {
             fn integration_id(&self) -> &'static str {
@@ -3342,14 +3399,6 @@ pub(crate) mod test_support {
 
             fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
                 vec![format!("<script>{HEAD_FLAG}</script>")]
-            }
-
-            fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-                if self.mark_bundle {
-                    vec![(BUNDLE_ATTRIBUTE, "true")]
-                } else {
-                    Vec::new()
-                }
             }
         }
 
@@ -3382,16 +3431,15 @@ pub(crate) mod test_support {
             let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
                 return Ok(None);
             };
-            let tag = Arc::new(Tag {
-                mark_bundle: config.mark_bundle,
-            });
-            Ok(Some(
-                IntegrationRegistration::builder(ID)
-                    .without_js()
-                    .with_attribute_rewriter(tag.clone())
-                    .with_head_injector(tag)
-                    .build(),
-            ))
+            let tag = Arc::new(Tag);
+            let mut registration = IntegrationRegistration::builder(ID)
+                .without_js()
+                .with_attribute_rewriter(tag.clone())
+                .with_head_injector(tag);
+            if config.mark_bundle {
+                registration = registration.with_bundle_tag_attribute(BUNDLE_ATTRIBUTE, "true");
+            }
+            Ok(Some(registration.build()))
         }
 
         fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
@@ -6654,6 +6702,117 @@ mod tests {
                 && message.contains("`testing.shared-name`"),
             "should name both suppliers and the name: {message}"
         );
+    }
+
+    fn marking_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("marking")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "first")
+                .with_bundle_tag_attribute("data-example-flag", "true")
+                .build(),
+        ))
+    }
+
+    fn disagreeing_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("disagreeing")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "second")
+                .with_bundle_tag_attribute("data-example-other", "kept")
+                .build(),
+        ))
+    }
+
+    fn unsafe_name_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("unsafe_name")
+                .without_js()
+                .with_bundle_tag_attribute("onload=alert(1) data-x", "true")
+                .build(),
+        ))
+    }
+
+    fn unsafe_value_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("unsafe_value")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "\"><script>")
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn a_registration_s_attributes_reach_the_bundle_s_tag_in_registration_order() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            selected_supplier(
+                &mut settings,
+                "marking",
+                "testing.marking",
+                marking_registration,
+            ),
+            selected_supplier(
+                &mut settings,
+                "disagreeing",
+                "testing.disagreeing",
+                disagreeing_registration,
+            ),
+        ];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry");
+
+        assert_eq!(
+            registry.tsjs_script_tag_attributes(),
+            vec![
+                ("data-example-mode", "first"),
+                ("data-example-flag", "true"),
+                ("data-example-other", "kept"),
+            ],
+            "should keep the first value a name is given and the order the registrations \
+             gave them in"
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_could_end_the_bundle_s_tag_is_refused() {
+        for (id, module, register, shown) in [
+            (
+                "unsafe_name",
+                "testing.unsafe-name",
+                unsafe_name_registration as crate::integrations::IntegrationBuilderFn,
+                "`onload=alert(1) data-x`",
+            ),
+            (
+                "unsafe_value",
+                "testing.unsafe-value",
+                unsafe_value_registration,
+                "`\"><script>`",
+            ),
+        ] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            let extra = [selected_supplier(&mut settings, id, module, register)];
+
+            let error = IntegrationRegistry::with_registrations(&settings, &extra)
+                .err()
+                .expect("should refuse an attribute that is not plain");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("integration `{id}` puts the attribute"))
+                    && message.contains(shown),
+                "should name the integration and show what it asked for: {message}"
+            );
+        }
     }
 
     #[test]

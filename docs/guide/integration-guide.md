@@ -300,22 +300,23 @@ this repository that leaves the declaration out.
 The build function returns an `IntegrationRegistration`, built with the
 builder every integration uses.
 
-| Declaration                                           | What it does                                                                        |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                 |
-| `.with_head_injector(...)`                            | Emits markup at the start of `<head>` and, if it chooses, after the script bundle   |
-| `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                         |
-| `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
-| `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
-| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                |
-| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name               |
-| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`     |
-| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
-| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
-| `.without_js()`                                       | Ships no browser script                                                             |
-| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name             |
-| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                     |
-| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name               |
+| Declaration                                           | What it does                                                                                    |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                             |
+| `.with_head_injector(...)`                            | Emits markup at the start of `<head>` and, if it chooses, after the script bundle               |
+| `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                                     |
+| `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                                 |
+| `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                             |
+| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                            |
+| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                           |
+| `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it |
+| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                 |
+| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle                 |
+| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag             |
+| `.without_js()`                                       | Ships no browser script                                                                         |
+| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
+| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
+| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
 
 The three script delivery choices are exclusive and the last call wins.
 
