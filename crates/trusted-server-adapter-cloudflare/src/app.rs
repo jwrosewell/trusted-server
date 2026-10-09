@@ -8,6 +8,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
@@ -979,6 +980,30 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 legacy_admin_deny.clone(),
             );
             router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
+        }
+
+        // The attestation pages answer at the address the settings choose, so
+        // they are registered here rather than with the fixed routes. Reads reach
+        // the handler, and other methods reach the publisher's origin unless the
+        // deployment owns the prefix.
+        let routes = prefix_routes(&state.settings);
+        if !routes.is_empty() {
+            let attestation = make_handler(Arc::clone(&state), |s, _services, req| async move {
+                Ok(handle_prefix(
+                    &s.settings,
+                    &PlatformIdentity::named("cloudflare"),
+                    &req,
+                ))
+            });
+            for route in &routes {
+                for method in publisher_fallback_methods() {
+                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
+                        router = router.route(&route.path, method, attestation.clone());
+                    } else {
+                        router = router.route(&route.path, method, fallback.clone());
+                    }
+                }
+            }
         }
 
         for method in publisher_fallback_methods() {
