@@ -907,3 +907,162 @@ fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// robots.txt
+// ---------------------------------------------------------------------------
+
+/// The route test settings with a `[robots-txt]` section that refuses every
+/// crawler and keeps one path open.
+fn router_refusing_every_crawler() -> RouterService {
+    let settings = Settings::from_toml(
+        r#"
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "route-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+        "#,
+    )
+    .expect("should parse route test settings");
+
+    TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router from test settings")
+}
+
+fn robots_request(method: &str, path: &str) -> Request {
+    request_builder()
+        .method(method)
+        .uri(path)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request")
+}
+
+fn robots_tag(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get("x-robots-tag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refusing_every_crawler_serves_the_refusal_and_tags_every_response() {
+    let file = route(
+        router_refusing_every_crawler(),
+        robots_request("GET", "/robots.txt"),
+    )
+    .await;
+
+    assert_eq!(
+        file.status().as_u16(),
+        200,
+        "the refusal should be served here"
+    );
+    assert_eq!(robots_tag(&file).as_deref(), Some("noindex, nofollow"));
+    let body = file.into_body().into_bytes().unwrap_or_default();
+    assert_eq!(&body[..], b"User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+    let other = route(
+        router_refusing_every_crawler(),
+        robots_request("GET", "/.well-known/trusted-server.json"),
+    )
+    .await;
+
+    assert_eq!(
+        robots_tag(&other).as_deref(),
+        Some("noindex, nofollow"),
+        "no route may be the one page a crawler is allowed to index"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_of_robots_txt_is_answered_here_with_no_body() {
+    let response = route(
+        router_refusing_every_crawler(),
+        robots_request("HEAD", "/robots.txt"),
+    )
+    .await;
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "a HEAD should be answered here as a GET is"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    let body = response.into_body().into_bytes().unwrap_or_default();
+    assert!(body.is_empty(), "a HEAD carries no body");
+}
+
+/// A method that is neither `GET` nor `HEAD` is the publisher's, as it is on
+/// any other path, so it is not answered with the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_method_on_robots_txt_is_not_answered_with_the_file() {
+    let response = route(
+        router_refusing_every_crawler(),
+        robots_request("POST", "/robots.txt"),
+    )
+    .await;
+
+    let body = response.into_body().into_bytes().unwrap_or_default();
+    assert!(
+        !body.starts_with(b"User-agent:"),
+        "a POST should reach the publisher fallback and not be given the file"
+    );
+}
+
+#[test]
+fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
+    let registered = |router: RouterService| -> Vec<(String, String)> {
+        router
+            .routes()
+            .into_iter()
+            .map(|route| (route.method().to_string(), route.path().to_string()))
+            .collect()
+    };
+
+    let without = registered(test_router());
+    assert!(
+        !without.iter().any(|(_, path)| path == "/robots.txt"),
+        "without the section the path is the publisher's: {without:?}"
+    );
+
+    let with = registered(router_refusing_every_crawler());
+    for method in ["GET", "HEAD"] {
+        assert!(
+            with.iter()
+                .any(|(registered, path)| registered == method && path == "/robots.txt"),
+            "{method} /robots.txt should be answered here: {with:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_carries_no_blanket_rule_without_the_section() {
+    let response = route(
+        test_router(),
+        robots_request("GET", "/.well-known/trusted-server.json"),
+    )
+    .await;
+
+    assert_eq!(robots_tag(&response), None);
+}

@@ -1,0 +1,461 @@
+//! The file served at `/robots.txt`, held as a document rather than as text.
+//!
+//! Contributors hand core groups of records, and core writes every byte. So a
+//! contributor cannot produce a malformed file, and the rules that have to hold
+//! whatever a contributor says are applied here, in one place.
+//!
+//! 1. A refusal cannot be loosened. When `refuse_all` is selected the file is
+//!    the refusal and nothing else, see [`refusal`].
+//! 2. A path in `always_allow` stays open to every crawler a contribution
+//!    refuses the whole site to, see [`assemble`].
+//! 3. The publisher's own text and the `Sitemap` line go where the publisher
+//!    put them, around what the contributors gave.
+//!
+//! The record names in a contribution are written in one spelling,
+//! `User-Agent`, `Allow` and `Disallow`, and everything else is written back
+//! exactly as it was read. A contributor that reads a finished file in that
+//! spelling and hands it over as a [`Contribution`] therefore changes nothing in
+//! its bytes, which is what lets another implementation agree with this one byte
+//! for byte. The [`refusal`] is written whole rather than from contributions,
+//! and spells its first record `User-agent`.
+
+use serde::{Deserialize, Serialize};
+
+use super::RobotsTxtConfig;
+
+/// One record in a group, in the order it was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Record {
+    /// A path the group's crawlers may fetch.
+    Allow(String),
+    /// A path the group's crawlers may not fetch.
+    Disallow(String),
+    /// A line of explanation, without its leading `#`.
+    Comment(String),
+    /// Any other `name: value` record, kept where it was given, a Terms
+    /// Document Locator for example.
+    Other {
+        /// The record's name, as it was written.
+        name: String,
+        /// Its value.
+        value: String,
+    },
+}
+
+impl Record {
+    fn line(&self) -> String {
+        match self {
+            Self::Allow(path) => format!("Allow: {path}"),
+            Self::Disallow(path) => format!("Disallow: {path}"),
+            Self::Comment(text) => format!("#{text}"),
+            Self::Other { name, value } => format!("{name}: {value}"),
+        }
+    }
+
+    fn refuses_the_whole_site(&self) -> bool {
+        matches!(self, Self::Disallow(path) if path == "/")
+    }
+}
+
+/// The crawlers a group is for, and the records that apply to them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    /// Each written on its own `User-Agent` line. An empty name is kept as it
+    /// was given, because the file is written back as it was read.
+    pub user_agents: Vec<String>,
+    /// The group's records, in order.
+    pub records: Vec<Record>,
+}
+
+/// What one contributor adds to the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contribution {
+    /// Records before the first group, such as a comment introducing the rules.
+    pub preamble: Vec<Record>,
+    /// The groups, in order.
+    pub groups: Vec<Group>,
+}
+
+impl Contribution {
+    /// A contribution read from `robots.txt` text, keeping every group, record
+    /// and comment in the order it came.
+    ///
+    /// A `User-Agent` line after a group's records starts the next group, and
+    /// consecutive `User-Agent` lines name the crawlers of one group, as RFC
+    /// 9309 section 2.1 describes. Blank lines and lines with no `:` carry
+    /// nothing and are passed over. A record before the first group is kept in
+    /// the preamble rather than dropped, so nothing given is lost.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        let mut contribution = Self::default();
+        let mut current: Option<Group> = None;
+        for raw in text.split('\n') {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(comment) = line.strip_prefix('#') {
+                push(
+                    &mut contribution,
+                    &mut current,
+                    Record::Comment(comment.to_owned()),
+                );
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim().to_owned());
+            match name.to_ascii_lowercase().as_str() {
+                "user-agent" => {
+                    if current
+                        .as_ref()
+                        .is_some_and(|group| !group.records.is_empty())
+                        && let Some(finished) = current.take()
+                    {
+                        contribution.groups.push(finished);
+                    }
+                    current
+                        .get_or_insert_with(Group::default)
+                        .user_agents
+                        .push(value);
+                }
+                "allow" => push(&mut contribution, &mut current, Record::Allow(value)),
+                "disallow" => push(&mut contribution, &mut current, Record::Disallow(value)),
+                _ => push(
+                    &mut contribution,
+                    &mut current,
+                    Record::Other {
+                        name: name.to_owned(),
+                        value,
+                    },
+                ),
+            }
+        }
+        if let Some(group) = current {
+            contribution.groups.push(group);
+        }
+        contribution
+    }
+
+    /// Whether this contribution has anything to write.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.preamble.is_empty() && self.groups.is_empty()
+    }
+
+    /// The contribution as text, with a blank line between its parts and none
+    /// at either end.
+    fn write(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.preamble.is_empty() {
+            parts.push(
+                self.preamble
+                    .iter()
+                    .map(Record::line)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        for group in &self.groups {
+            let mut lines: Vec<String> = group
+                .user_agents
+                .iter()
+                .map(|agent| format!("User-Agent: {agent}"))
+                .collect();
+            lines.extend(group.records.iter().map(Record::line));
+            parts.push(lines.join("\n"));
+        }
+        parts.join("\n\n")
+    }
+}
+
+fn push(contribution: &mut Contribution, current: &mut Option<Group>, record: Record) {
+    match current {
+        Some(group) => group.records.push(record),
+        None => contribution.preamble.push(record),
+    }
+}
+
+/// What `allow_all` contributes, which is every crawler allowed everywhere.
+///
+/// Permission the document says, rather than permission that follows from a
+/// lookup coming back empty. The two produce the same bytes, and only one of
+/// them was meant.
+#[must_use]
+pub fn allow_all() -> Contribution {
+    Contribution {
+        preamble: Vec::new(),
+        groups: vec![Group {
+            user_agents: vec!["*".to_owned()],
+            records: vec![Record::Allow("/".to_owned())],
+        }],
+    }
+}
+
+/// The file `refuse_all` serves, which refuses every crawler except for the
+/// paths in `always_allow`.
+///
+/// Nothing a contributor gives, and none of the publisher's own text, is
+/// added, because a refusal cannot be loosened. `Allow` beats `Disallow` on
+/// the longest match under RFC 9309 section 2.2.2, so each allowance lets that
+/// one path through.
+///
+/// A publisher selling advertising should allow `/ads.txt`, because the
+/// advertising platforms may ignore an `ads.txt` that robots.txt disallows,
+/// and a blanket `Disallow: /` is exactly that case. It is not added by
+/// default, because a domain with no `ads.txt` would be inviting crawlers to
+/// a path it does not have. The configuration guide quotes one platform's own
+/// statement of this.
+#[must_use]
+pub fn refusal(always_allow: &[String]) -> String {
+    let mut file = String::from("User-agent: *");
+    for path in always_allow {
+        file.push_str("\nAllow: ");
+        file.push_str(path);
+    }
+    file.push_str("\nDisallow: /\n");
+    file
+}
+
+/// The whole file, being the publisher's text above, each contribution in the
+/// order `modules` names it, the group that keeps `always_allow` open, the
+/// `Sitemap` line, and the publisher's text below.
+#[must_use]
+pub fn assemble(config: &RobotsTxtConfig, contributions: &[Contribution]) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(top) = config
+        .top_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        sections.push(top.trim_end().to_owned());
+    }
+    for contribution in contributions.iter().filter(|c| !c.is_empty()) {
+        sections.push(contribution.write());
+    }
+    if let Some(segment) = kept_open(contributions, &config.always_allow) {
+        sections.push(segment);
+    }
+    if let Some(sitemap) = &config.sitemap {
+        sections.push(format!("Sitemap: {sitemap}"));
+    }
+    if let Some(bottom) = config
+        .bottom_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        sections.push(bottom.trim_end().to_owned());
+    }
+    let mut file = sections.join("\n\n");
+    file.push('\n');
+    file
+}
+
+/// Every crawler the contributions refuse the whole site to, by the name on
+/// its `User-Agent` line, in order and without repeats. `*` is included, so
+/// the paths stay open to the crawlers no group names. A group with no name
+/// is passed over, because there is nothing to address a rule to.
+fn refused_entirely(contributions: &[Contribution]) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for group in contributions.iter().flat_map(|c| c.groups.iter()) {
+        if !group.records.iter().any(Record::refuses_the_whole_site) {
+            continue;
+        }
+        for name in &group.user_agents {
+            if !name.is_empty() && !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// A group of core's own that keeps each path in `always_allow` open to the
+/// crawlers the contributions refuse the whole site to, or `None` when there is
+/// nothing to keep open.
+///
+/// **The contributions are never edited.** RFC 9309 section 2.2.1 has a
+/// crawler combine every group that matches it, and section 2.2.2 gives the
+/// match with the most octets, so a second group naming the same crawlers with
+/// an `Allow` for the path beats `Disallow: /` for that path alone.
+///
+/// It goes below the contributions. A crawler that obeys only the first group
+/// it finds then still meets `Disallow: /` first, so the worst it can do is
+/// fail to read the one page. Written above, it would read the whole site.
+fn kept_open(contributions: &[Contribution], paths: &[String]) -> Option<String> {
+    let names = refused_entirely(contributions);
+    if names.is_empty() || paths.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = names
+        .iter()
+        .map(|name| format!("User-Agent: {name}"))
+        .collect();
+    lines.extend(paths.iter().map(|path| format!("Allow: {path}")));
+    Some(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> RobotsTxtConfig {
+        RobotsTxtConfig {
+            modules: vec!["a_contributor".to_owned()],
+            ..RobotsTxtConfig::refuse_all()
+        }
+    }
+
+    /// Text a contributor might read from somewhere else, with the shapes the
+    /// file has to survive: a record inside a group, crawlers sharing a group,
+    /// and a group with no name.
+    const GIVEN: &str = "User-Agent: ExampleBot\nDisallow: /\n\nUser-Agent: \nDisallow: /\n\n\
+                         User-Agent: OtherBot\nDisallow: /private/\n\nUser-Agent: ThirdBot\n\
+                         User-Agent: FourthBot\nDisallow: /\n\nUser-Agent: *\n\
+                         TDL: https://terms.example.com/socw/2.txt\nAllow: /";
+
+    #[test]
+    fn a_contribution_is_written_back_exactly_as_it_was_read() {
+        assert_eq!(Contribution::parse(GIVEN).write(), GIVEN);
+    }
+
+    #[test]
+    fn crawlers_named_together_share_one_group_and_a_record_keeps_its_place() {
+        let parsed = Contribution::parse(GIVEN);
+
+        assert_eq!(parsed.groups.len(), 5);
+        assert_eq!(parsed.groups[3].user_agents, vec!["ThirdBot", "FourthBot"]);
+        assert_eq!(
+            parsed.groups[4].records,
+            vec![
+                Record::Other {
+                    name: "TDL".to_owned(),
+                    value: "https://terms.example.com/socw/2.txt".to_owned(),
+                },
+                Record::Allow("/".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_lines_at_either_end_are_not_part_of_the_file() {
+        let parsed = Contribution::parse("\nUser-Agent: ExampleBot\nDisallow: /\n\n\n");
+
+        assert_eq!(parsed.write(), "User-Agent: ExampleBot\nDisallow: /");
+    }
+
+    #[test]
+    fn a_comment_and_a_record_before_any_group_are_kept() {
+        let parsed = Contribution::parse("# rules for crawlers\nUser-Agent: *\nAllow: /");
+
+        assert_eq!(
+            parsed.preamble,
+            vec![Record::Comment(" rules for crawlers".to_owned())]
+        );
+        assert_eq!(
+            parsed.write(),
+            "# rules for crawlers\n\nUser-Agent: *\nAllow: /"
+        );
+    }
+
+    #[test]
+    fn the_publishers_text_and_the_sitemap_go_around_the_contributions() {
+        let mut settings = config();
+        settings.top_text = Some("# top".to_owned());
+        settings.sitemap = Some("https://publisher.example.com/sitemap.xml".to_owned());
+        settings.bottom_text = Some("# bottom".to_owned());
+
+        assert_eq!(
+            assemble(
+                &settings,
+                &[Contribution::parse("User-agent: *\nAllow: /\n")]
+            ),
+            "# top\n\nUser-Agent: *\nAllow: /\n\n\
+             Sitemap: https://publisher.example.com/sitemap.xml\n\n# bottom\n",
+        );
+    }
+
+    /// The page a refused crawler is sent to stays open, by a group of core's
+    /// own below the contributions, which are not edited.
+    #[test]
+    fn an_always_allowed_path_is_kept_open_to_every_crawler_refused_the_site() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ai-notice/".to_owned()];
+
+        let file = assemble(&settings, &[Contribution::parse(GIVEN)]);
+
+        assert!(
+            file.starts_with(GIVEN),
+            "the contribution is not edited: {file}"
+        );
+        assert!(
+            file.ends_with(
+                "\n\nUser-Agent: ExampleBot\nUser-Agent: ThirdBot\nUser-Agent: FourthBot\n\
+                 Allow: /ai-notice/\n"
+            ),
+            "the group naming every crawler refused the whole site goes last: {file}"
+        );
+    }
+
+    /// The path is kept open to `*` as it is to a crawler refused by name, so
+    /// the crawlers no group names can still read it.
+    #[test]
+    fn an_always_allowed_path_is_kept_open_when_every_crawler_is_refused() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ai-notice/".to_owned()];
+
+        assert_eq!(
+            assemble(
+                &settings,
+                &[Contribution::parse("User-Agent: *\nDisallow: /")]
+            ),
+            "User-Agent: *\nDisallow: /\n\nUser-Agent: *\nAllow: /ai-notice/\n",
+            "a group for `*` below the contribution keeps the path open"
+        );
+    }
+
+    #[test]
+    fn nothing_is_kept_open_when_nothing_is_refused() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ai-notice/".to_owned()];
+
+        assert_eq!(
+            assemble(&settings, &[allow_all()]),
+            "User-Agent: *\nAllow: /\n"
+        );
+    }
+
+    #[test]
+    fn contributions_appear_in_the_order_given() {
+        let first = Contribution::parse("User-Agent: FirstBot\nDisallow: /");
+        let second = Contribution::parse("User-Agent: SecondBot\nDisallow: /");
+
+        assert_eq!(
+            assemble(&config(), &[first, second]),
+            "User-Agent: FirstBot\nDisallow: /\n\nUser-Agent: SecondBot\nDisallow: /\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_contribution_leaves_no_gap() {
+        assert_eq!(
+            assemble(&config(), &[Contribution::default(), allow_all()]),
+            "User-Agent: *\nAllow: /\n"
+        );
+    }
+
+    #[test]
+    fn refusing_with_no_allowances_refuses_everything() {
+        assert_eq!(refusal(&[]), "User-agent: *\nDisallow: /\n");
+    }
+
+    #[test]
+    fn each_allowance_is_written_in_order_ahead_of_the_refusal() {
+        assert_eq!(
+            refusal(&["/ads.txt".to_owned(), "/ai-notice/".to_owned()]),
+            "User-agent: *\nAllow: /ads.txt\nAllow: /ai-notice/\nDisallow: /\n"
+        );
+    }
+}
