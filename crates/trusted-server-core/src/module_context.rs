@@ -165,6 +165,15 @@ impl ResolvedRequest {
         }
     }
 
+    /// The same request with no query, for an answer that is held and served
+    /// to every caller, which must not depend on what one caller put in the
+    /// address.
+    #[must_use]
+    pub fn without_query(mut self) -> Self {
+        self.query.clear();
+        self
+    }
+
     /// The borrowed view a context carries.
     #[must_use]
     pub fn view(&self) -> ModuleRequest<'_> {
