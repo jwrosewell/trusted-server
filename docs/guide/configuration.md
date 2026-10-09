@@ -1636,6 +1636,7 @@ validation knows is listed below.
 | `[tag.google-tag-manager]`    | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
 | `[ad-tag.google]`             | [GPT](/guide/integrations/gpt)                                     |
 | `[ad-tag.google.diagnostics]` | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
+| `[cmp.inmobi]`                | [InMobi Choice](/guide/integrations/inmobi)                        |
 | `[proxy.js_asset_proxy]`      | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
 | `[identity.lockr]`            | [lockr](/guide/integrations/lockr)                                 |
 | `[framework.nextjs]`          | [Next.js](/guide/integrations/nextjs)                              |
@@ -1659,7 +1660,7 @@ module = "nextjs"
 ```
 
 The modules this repository ships, by section, are `[cmp]` `didomi`,
-`sourcepoint` and `osano`; `[tag]` `google-tag-manager`; `[ad-tag]` `google`
+`inmobi`, `sourcepoint` and `osano`; `[tag]` `google-tag-manager`; `[ad-tag]` `google`
 and `google.diagnostics`; `[bot-protection]` `datadome`; `[identity]`
 `lockr`; `[audience]` `permutive`; `[framework]` `nextjs`; `[auction]`
 `prebid` and `testing.testlight`; and `[proxy]` `js_asset_proxy`. A name
@@ -1748,6 +1749,7 @@ the names in and the order `trusted-server.example.toml` shows them in.
 | `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                          |
 | `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                  |
 | `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                       |
+| `cmp.inmobi`                  | `[[fetch]]` | Writes the IAB TCF stub, InMobi's GPP stub and the deferred Choice loader into the head, in that order                                                                                                            |
 | `cmp.sourcepoint`             | `[[fetch]]` | Writes `window.__tsjs_sourcepoint` into the head and, when `rewrite_sdk` is set, the trap on `window._sp_`, and points a `src` or `href` on Sourcepoint's CDN at `/integrations/sourcepoint/cdn`                  |
 | `tag.google-tag-manager`      | `[[fetch]]` | Points Google Tag Manager and Google Analytics addresses at `/integrations/google_tag_manager`, in `src` and `href` attributes and in the text of inline scripts                                                  |
 | `bot-protection.datadome`     | `[[fetch]]` | Points a `src` or `href` that is a DataDome script's address at `/integrations/datadome`, when `rewrite_sdk` is set                                                                                               |
@@ -1825,6 +1827,21 @@ to new configurations.
 | `api_origin` | URL            | `https://api.privacy-center.org` | API upstream                                                        |
 
 See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
+
+### InMobi Choice Integration
+
+**Section**: `[cmp.inmobi]`
+
+| Field        | Type   | Default  | Contract                                                                                                    |
+| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password |
+| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier the GPP stub answers `ping` with while the prompt loads                   |
+
+The table refuses a field it does not read. Selecting the module with no
+`[[fetch]]` entry naming `cmp.inmobi` is refused, because the
+prompt would never be written, and the entry names it before any middleware
+that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
+for the tag's parts and what the module keeps to.
 
 ### Google Tag Manager Integration
 
