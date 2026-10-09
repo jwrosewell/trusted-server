@@ -1789,12 +1789,13 @@ The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
 takes one entry, and the order written is the order they run in.
 
-| Middleware           | Phase       | What it changes                                                                                                          |
-| -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `testing.testlight`  | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                            |
-| `audience.permutive` | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set |
-| `identity.lockr`     | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set         |
-| `cmp.didomi`         | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under              |
+| Middleware           | Phase       | What it changes                                                                                                                                                                                  |
+| -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `testing.testlight`  | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                    |
+| `audience.permutive` | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                         |
+| `identity.lockr`     | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                 |
+| `cmp.didomi`         | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                      |
+| `cmp.sourcepoint`    | `[[fetch]]` | Writes `window.__tsjs_sourcepoint` into the head and, when `rewrite_sdk` is set, the trap on `window._sp_`, and points a `src` or `href` on Sourcepoint's CDN at `/integrations/sourcepoint/cdn` |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

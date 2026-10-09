@@ -3,3 +3,7 @@ modules = ["sourcepoint"]
 
 [cmp.sourcepoint]
 rewrite_sdk = true
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["cmp.sourcepoint"]
