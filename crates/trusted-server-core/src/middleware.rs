@@ -382,7 +382,7 @@ impl PhaseEntries {
     }
 
     /// Checks each entry's media type, path and names, and that no entry is
-    /// hidden behind an earlier one.
+    /// hidden behind an earlier one, or covers the same pages as one.
     ///
     /// # Errors
     ///
@@ -437,12 +437,21 @@ impl PhaseEntries {
                         (Some(_), None) => false,
                     }
             }) {
-                return Err(format!(
-                    "{at} is never reached, because [[{phase}]] entry {} covers every response \
-                     it covers and a response takes the first entry that covers it. Put the \
-                     entry with the longer path first",
-                    earlier + 1
-                ));
+                return Err(if self.0[earlier].path == entry.path {
+                    format!(
+                        "{at} covers the same pages as [[{phase}]] entry {}, and a response \
+                         takes the first entry that covers it, so this one is never reached. \
+                         Name every middleware for those pages in one entry's list",
+                        earlier + 1
+                    )
+                } else {
+                    format!(
+                        "{at} is never reached, because [[{phase}]] entry {} covers every \
+                         response it covers and a response takes the first entry that covers \
+                         it. Put the entry with the longer path first",
+                        earlier + 1
+                    )
+                });
             }
         }
         Ok(())

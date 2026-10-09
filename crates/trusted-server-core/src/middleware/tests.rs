@@ -373,19 +373,35 @@ fn an_entry_naming_something_that_is_no_name_is_refused() {
 #[test]
 fn an_entry_hidden_behind_an_earlier_one_is_refused() {
     let cases = [
-        // The same path twice.
-        vec![
-            entry(Some("/news/"), &["example.a"]),
-            entry(Some("/news/"), &["example.b"]),
-        ],
         // A longer path after the shorter one that covers it.
         vec![
             entry(Some("/news/"), &["example.a"]),
             entry(Some("/news/sport/"), &["example.b"]),
         ],
-        // Anything after the entry covering every path.
+        // A path after the entry covering every path.
         vec![
             entry(None, &["example.a"]),
+            entry(Some("/news/"), &["example.b"]),
+        ],
+    ];
+
+    for entries in cases {
+        let message = refusal(entries);
+        assert!(
+            message.contains("[[fetch]] entry 2 is never reached")
+                && message.contains("[[fetch]] entry 1 covers every response it covers")
+                && message.contains("Put the entry with the longer path first"),
+            "should name the hidden entry and the one hiding it: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_entry_for_the_same_pages_as_an_earlier_one_is_told_to_share_its_list() {
+    // What an operator writes who gives each module an entry of its own.
+    let cases = [
+        vec![
+            entry(Some("/news/"), &["example.a"]),
             entry(Some("/news/"), &["example.b"]),
         ],
         vec![entry(None, &["example.a"]), entry(None, &["example.b"])],
@@ -394,9 +410,9 @@ fn an_entry_hidden_behind_an_earlier_one_is_refused() {
     for entries in cases {
         let message = refusal(entries);
         assert!(
-            message.contains("[[fetch]] entry 2 is never reached")
-                && message.contains("[[fetch]] entry 1 covers every response it covers"),
-            "should name the hidden entry and the one hiding it: {message}"
+            message.contains("[[fetch]] entry 2 covers the same pages as [[fetch]] entry 1")
+                && message.contains("Name every middleware for those pages in one entry's list"),
+            "should say the two lists belong in one entry: {message}"
         );
     }
 }
