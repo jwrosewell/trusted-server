@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use edgezero_core::manifest::ManifestLoader;
 
+mod build_time;
+mod key_schedule;
+
 /// Source file that must stay out of the generated list.
 ///
 /// `migration_guards.rs` holds the banned pattern itself, as the regex literal
@@ -15,6 +18,75 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     write_default_config_store_id();
     write_migration_guard_sources();
+    write_build_time();
+    write_build_identity();
+    write_attestation_keys();
+}
+
+/// Embeds the attestation signing key schedule in the file
+/// `TRUSTED_SERVER_ATTESTATION_KEYS` names, or an empty schedule.
+///
+/// The schedule is compiled into the binary, so no signing key sits in a
+/// store the service reads when it runs. See [`key_schedule::constant_source`]
+/// for what a schedule holds.
+fn write_attestation_keys() {
+    println!("cargo:rerun-if-env-changed=TRUSTED_SERVER_ATTESTATION_KEYS");
+    let schedule = env::var_os("TRUSTED_SERVER_ATTESTATION_KEYS")
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = PathBuf::from(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+            fs::read_to_string(&path).expect("should read the attestation key schedule")
+        });
+    let source = match key_schedule::constant_source(schedule.as_deref()) {
+        Ok(source) => source,
+        Err(reason) => {
+            println!("cargo::error=the attestation key schedule is refused, because {reason}");
+            std::process::exit(1);
+        }
+    };
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should read OUT_DIR"));
+    fs::write(out_dir.join("attestation_keys.rs"), source)
+        .expect("should write the attestation key schedule");
+}
+
+/// Bakes the build time into the binary as `TRUSTED_SERVER_BUILT_AT`.
+///
+/// Some hosts give a WebAssembly guest no custom environment variable when it
+/// runs, so the time a build was made has to be in the binary or it cannot be
+/// reported at all.
+///
+/// `SOURCE_DATE_EPOCH` is honored where it is set, so a reproducible build
+/// stays reproducible rather than differing only by this string.
+fn write_build_time() {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let seconds = env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or_default())
+                .unwrap_or_default()
+        });
+    println!(
+        "cargo:rustc-env=TRUSTED_SERVER_BUILT_AT={}",
+        build_time::rfc3339_utc(seconds)
+    );
+}
+
+/// Bakes in the commit and the build run the builder names, as
+/// `TRUSTED_SERVER_COMMIT` and `TRUSTED_SERVER_BUILD_RUN`, or `unknown`.
+fn write_build_identity() {
+    for name in ["TRUSTED_SERVER_COMMIT", "TRUSTED_SERVER_BUILD_RUN"] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!("cargo:rustc-env={name}={value}");
+    }
 }
 
 /// Keeps every adapter's compiled default synchronized with the repository
