@@ -1789,9 +1789,10 @@ The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
 takes one entry, and the order written is the order they run in.
 
-| Middleware          | Phase       | What it changes                                                                               |
-| ------------------- | ----------- | --------------------------------------------------------------------------------------------- |
-| `testing.testlight` | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set |
+| Middleware           | Phase       | What it changes                                                                                                          |
+| -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `testing.testlight`  | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                            |
+| `audience.permutive` | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
