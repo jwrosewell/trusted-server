@@ -3,3 +3,7 @@ modules = ["nextjs"]
 
 [framework.nextjs]
 rewrite_attributes = ["href", "link", "url"]
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["framework.nextjs"]

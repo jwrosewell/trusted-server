@@ -34,6 +34,17 @@ rewrite_attributes = ["href", "link", "url"]
 max_combined_payload_bytes = 10485760
 ```
 
+What the integration changes in a page is the middleware `framework.nextjs`, which runs
+on the pages a `[[fetch]]` entry names it for:
+
+```toml
+[[fetch]]
+media_type = "text/html"
+middleware = ["framework.nextjs"]
+```
+
+See [Placing page changes](/guide/configuration#placing-page-changes).
+
 ### Configuration Options
 
 | Field                        | Type    | Default                   | Description                                     |

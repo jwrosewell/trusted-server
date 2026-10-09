@@ -3807,7 +3807,12 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             )
             .expect("should update nextjs config");
 
-        // Next.js first, as a stock build orders the two.
+        // Both modules change the page, Next.js first.
+        place_on_every_page(
+            &mut settings,
+            MiddlewarePhase::Fetch,
+            &[trusted_server_framework_nextjs::MODULE, MODULE],
+        );
         let registry = IntegrationRegistry::with_registrations(
             &settings,
             &[trusted_server_framework_nextjs::builder(), builder()],
@@ -3878,7 +3883,12 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             )
             .expect("should update nextjs config");
 
-        // Next.js first, as a stock build orders the two.
+        // Both modules change the page, Next.js first.
+        place_on_every_page(
+            &mut settings,
+            MiddlewarePhase::Fetch,
+            &[trusted_server_framework_nextjs::MODULE, MODULE],
+        );
         let registry = IntegrationRegistry::with_registrations(
             &settings,
             &[trusted_server_framework_nextjs::builder(), builder()],
