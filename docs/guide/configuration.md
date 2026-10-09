@@ -236,7 +236,7 @@ fail and the service will return its startup-error response.
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module          |
 | `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                             |
-| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing and management-store IDs                                   |
+| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                            |
 | `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                   |
 | `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                          |
 | `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                   |
@@ -265,8 +265,6 @@ passphrase = "ec_passphrase"
 
 [request_signing]
 enabled = true
-config_store_id = "01GXXX"
-secret_store_id = "01GYYY"
 
 [auction.prebid]
 client_side_bidders = ["example-browser-bidder"]
@@ -683,14 +681,14 @@ with `[]` for every element of a list and `[N]` for one, such as
 
 A masked value shows as `XXXX`, and the page lists every masked path.
 
-| What                                                                                                             | Masked     | Can `show` reveal it             |
-| ---------------------------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
-| A secret, meaning a value the settings loader fills from the secret store                                        | Always     | No                               |
-| `publisher.origin_url` and `publisher.origin_host_header_override`                                               | By default | Yes                              |
-| `proxy.asset_routes[].origin_url`                                                                                | By default | Yes                              |
-| `handlers[].path` and `handlers[].username`                                                                      | By default | Yes                              |
-| `ec.ec_store`, `request_signing.config_store_id`, `request_signing.secret_store_id` and `auction.creative_store` | By default | Yes                              |
-| Anything `hide` names                                                                                            | When named | It is the publisher's own choice |
+| What                                                                      | Masked     | Can `show` reveal it             |
+| ------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| A secret, meaning a value the settings loader fills from the secret store | Always     | No                               |
+| `publisher.origin_url` and `publisher.origin_host_header_override`        | By default | Yes                              |
+| `proxy.asset_routes[].origin_url`                                         | By default | Yes                              |
+| `handlers[].path` and `handlers[].username`                               | By default | Yes                              |
+| `ec.ec_store` and `auction.creative_store`                                | By default | Yes                              |
+| Anything `hide` names                                                     | When named | It is the publisher's own choice |
 
 A pattern that would not be honored as written refuses the configuration,
 both when a deployment is validated and when the settings load. That is a
@@ -1033,31 +1031,31 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 ## Request Signing
 
-Configuration for Ed25519 request signing and JWKS management.
+Configuration for Ed25519 request signing.
 
 ### `[request_signing]`
 
-| Field             | Type    | Required            | Description                             |
-| ----------------- | ------- | ------------------- | --------------------------------------- |
-| `enabled`         | Boolean | No (default: false) | Enable request signing features         |
-| `config_store_id` | String  | If enabled          | Fastly Config Store ID for JWKS         |
-| `secret_store_id` | String  | If enabled          | Fastly Secret Store ID for private keys |
+| Field     | Type    | Required            | Description                     |
+| --------- | ------- | ------------------- | ------------------------------- |
+| `enabled` | Boolean | No (default: false) | Enable request signing features |
 
 **Example**:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "01GXXX"  # From Fastly dashboard
-secret_store_id = "01GYYY"  # From Fastly dashboard
 ```
+
+The service reads its keys from the stores linked as `jwks_store` and
+`signing_keys`, so the section holds no store id. The ids are given to
+[`ts keys`](./cli.md#request-signing-keys) on its command line, and a
+configuration that still carries `config_store_id` or `secret_store_id` is
+refused when it is validated and when the service starts.
 
 **Environment Override**:
 
 ```bash
 TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=true
-TRUSTED_SERVER__REQUEST_SIGNING__CONFIG_STORE_ID=01GXXX
-TRUSTED_SERVER__REQUEST_SIGNING__SECRET_STORE_ID=01GYYY
 ```
 
 ### Store Setup

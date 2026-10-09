@@ -1082,8 +1082,7 @@ mod tests {
             assume_single_jurisdiction = true
 
             [request_signing]
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
+            enabled = false
 
             [proxy]
             modules = ["js_asset_proxy"]

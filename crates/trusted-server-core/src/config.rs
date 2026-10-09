@@ -453,14 +453,6 @@ fn validate_non_secret_deploy_placeholders(
     if crate::settings::Publisher::is_placeholder_origin_url(&settings.publisher.origin_url) {
         insecure_fields.push("publisher.origin_url");
     }
-    if let Some(request_signing) = &settings.request_signing {
-        if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
-            insecure_fields.push("request_signing.config_store_id");
-        }
-        if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
-            insecure_fields.push("request_signing.secret_store_id");
-        }
-    }
 
     if insecure_fields.is_empty() {
         return Ok(());
@@ -1266,90 +1258,6 @@ password = "production-admin-password-32-bytes"
                 && text.contains("publisher.cookie_domain")
                 && text.contains("publisher.origin_url"),
             "should flag all three example publisher placeholders: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: true,
-            config_store_id: "<management-config-store-id>".to_string(),
-            secret_store_id: "<management-secret-store-id>".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject placeholder request-signing store ids when enabled");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    /// The rotate/deactivate admin routes are registered unconditionally and
-    /// read the store IDs without consulting `enabled`, so a disabled block with
-    /// placeholder IDs would still reach key management at runtime.
-    #[test]
-    fn deploy_validation_rejects_placeholder_store_ids_while_request_signing_is_disabled() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: false,
-            config_store_id: "<management-config-store-id>".to_string(),
-            secret_store_id: "<management-secret-store-id>".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings).expect_err(
-            "should reject placeholder store ids even while request signing is disabled",
-        );
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_empty_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: true,
-            config_store_id: String::new(),
-            secret_store_id: "   ".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject empty and whitespace-only store ids");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_padded_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: false,
-            config_store_id: " management-config-store ".to_string(),
-            secret_store_id: "management-secret-store ".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject store ids with surrounding whitespace");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both padded store ids: {err:?}"
         );
     }
 

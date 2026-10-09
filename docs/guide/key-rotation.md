@@ -61,7 +61,7 @@ The running service only reads these stores, so it needs no Fastly API token of 
 # Create the config store
 fastly config-store create --name=jwks_store
 
-# Get the store ID (you'll need this for configuration)
+# Get the store ID (you'll need this for `ts keys`)
 fastly config-store list
 ```
 
@@ -128,17 +128,18 @@ For local testing, configure stores in `fastly.toml`:
 
 ### Configuration in trusted-server.toml
 
-Update `trusted-server.toml` with your store IDs:
+Switch request signing on in `trusted-server.toml`:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "<config-store-id>"  # Your jwks_store ID
-secret_store_id = "<secret-store-id"  # Your signing_keys ID
 ```
 
+The service finds the two stores by the names they are linked under, so the
+configuration holds no store id.
+
 ::: tip Getting Store IDs
-Use `fastly config-store list` and `fastly secret-store list` to retrieve your store IDs.
+`ts keys` takes the two store IDs on its command line. Use `fastly config-store list` and `fastly secret-store list` to retrieve them.
 :::
 
 ### Verification
@@ -218,8 +219,8 @@ directly.
 ```rust
 use trusted_server_core::request_signing::KeyRotationManager;
 
-// The management store IDs from `[request_signing]`. The stores are written
-// through the platform's `RuntimeServices`.
+// The IDs of the two stores. The stores are written through the platform's
+// `RuntimeServices`.
 let manager = KeyRotationManager::new("<config-store-id>", "<secret-store-id>");
 
 // Rotate with automatic kid

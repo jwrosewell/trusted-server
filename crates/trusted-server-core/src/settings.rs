@@ -1578,37 +1578,31 @@ impl Handler {
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    pub config_store_id: String,
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    pub secret_store_id: String,
+    /// The removed `config_store_id`. The field never holds a value, because
+    /// reading one always fails.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed key fails with directions"
+    )]
+    config_store_id: RemovedSigningStoreId,
+    /// The removed `secret_store_id`, refused as `config_store_id` is.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed key fails with directions"
+    )]
+    secret_store_id: RemovedSigningStoreId,
 }
 
 impl RequestSigning {
-    /// Reserved example store-id values from the config template, plus the
-    /// empty string, that must not be deployed while request signing is enabled.
-    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
-        "<management-config-store-id>",
-        "<management-secret-store-id>",
-    ];
-
-    /// Returns `true` if `store_id` is empty or a known template placeholder
-    /// (case-insensitive).
+    /// Request signing switched on or off.
     #[must_use]
-    pub fn is_placeholder_store_id(store_id: &str) -> bool {
-        let store_id = store_id.trim();
-        store_id.is_empty()
-            || Self::STORE_ID_PLACEHOLDERS
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(store_id))
-    }
-
-    /// Returns `true` if `store_id` cannot be deployed as-is: a placeholder, or
-    /// a value with surrounding whitespace that the key-management routes would
-    /// forward to the management API verbatim.
-    #[must_use]
-    pub fn is_unusable_store_id(store_id: &str) -> bool {
-        Self::is_placeholder_store_id(store_id) || store_id != store_id.trim()
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
     }
 }
 
@@ -3548,6 +3542,15 @@ refused_table! {
 }
 
 refused_table! {
+    /// A store id under `[request_signing]`, which the service does not read.
+    RemovedSigningStoreId => "`[request_signing]` does not take `config_store_id` or \
+        `secret_store_id`. The service reads its signing keys from the stores linked as \
+        `jwks_store` and `signing_keys` and writes neither. Remove both keys, and give the \
+        ids to `ts keys rotate` and `ts keys deactivate` as `--config-store-id` and \
+        `--secret-store-id`"
+}
+
+refused_table! {
     /// The `[permission_signal]` table, renamed `[permission-signal]`.
     RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
         `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
@@ -4210,22 +4213,6 @@ impl Settings {
         }
         if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
             insecure_fields.push("publisher.origin_url".to_owned());
-        }
-        // Checked whenever the block is present, not just when it is enabled:
-        // the key rotate/deactivate admin routes are registered unconditionally
-        // and read these store IDs without consulting `enabled`, so placeholder
-        // IDs behind a disabled block would still reach key management at
-        // runtime. Surrounding whitespace is rejected too: the placeholder check
-        // trims for comparison but the raw value is what `signing_store_ids`
-        // forwards to `KeyRotationManager`, so a padded id would validate yet
-        // reach the management API unusable.
-        if let Some(request_signing) = &self.request_signing {
-            if RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
-                insecure_fields.push("request_signing.config_store_id".to_owned());
-            }
-            if RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
-                insecure_fields.push("request_signing.secret_store_id".to_owned());
-            }
         }
 
         if insecure_fields.is_empty() {
@@ -5743,6 +5730,69 @@ module = \"none\"",
                 "should name the placeholder trusted client IP shared secret field"
             );
         }
+    }
+
+    #[test]
+    fn toml_settings_refuse_a_signing_store_id_with_directions() {
+        for key in ["config_store_id", "secret_store_id"] {
+            let fixture = crate_test_settings_str();
+            assert!(
+                fixture.contains("[request_signing]\n"),
+                "the fixture should have the section the key is added to"
+            );
+            let toml = fixture.replace(
+                "[request_signing]\n",
+                &format!("[request_signing]\n{key} = \"01GEXAMPLE\"\n"),
+            );
+
+            let error = Settings::from_toml(&toml).expect_err("should refuse the removed key");
+
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains("does not take `config_store_id` or `secret_store_id`"),
+                "should say the key is not read, for {key}: {rendered}"
+            );
+            assert!(
+                rendered.contains("ts keys rotate"),
+                "should say where the ids go, for {key}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_settings_refuse_a_signing_store_id_with_directions() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["request_signing"]["secret_store_id"] = json!("01GEXAMPLE");
+
+        let error = Settings::from_json_value(value).expect_err("should refuse the removed key");
+
+        assert!(
+            format!("{error:?}").contains("--secret-store-id"),
+            "should say where the id goes: {error:?}"
+        );
+    }
+
+    #[test]
+    fn request_signing_is_written_as_enabled_alone() {
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        settings.request_signing = Some(RequestSigning::new(true));
+
+        let value = serde_json::to_value(&settings).expect("should serialize the settings");
+
+        assert_eq!(
+            value["request_signing"],
+            json!({ "enabled": true }),
+            "should write nothing a later read would refuse"
+        );
+        let read = Settings::from_json_value(value).expect("should read what was written");
+        assert!(
+            read.request_signing.is_some_and(|signing| signing.enabled),
+            "should keep request signing on across the round trip"
+        );
     }
 
     #[test]
@@ -7761,26 +7811,6 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
-        for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
-            assert!(
-                RequestSigning::is_unusable_store_id(placeholder),
-                "should reject placeholder store id '{placeholder}'"
-            );
-        }
-        for bad in ["", "   ", " 01GCFG ", "01GCFG "] {
-            assert!(
-                RequestSigning::is_unusable_store_id(bad),
-                "should reject unusable store id '{bad}'"
-            );
-        }
-        assert!(
-            !RequestSigning::is_unusable_store_id("01GCFG"),
-            "should accept a clean store id"
-        );
-    }
-
-    #[test]
     fn test_settings_empty_toml() {
         let toml_str = "";
         let settings = Settings::from_toml(toml_str);
@@ -9585,8 +9615,7 @@ source_domain = "partner.example.com"
             assume_single_jurisdiction = true
 
             [request_signing]
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
+            enabled = false
         "#
         .to_string()
     }

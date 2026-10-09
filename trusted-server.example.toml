@@ -208,17 +208,11 @@ pull_sync_concurrency = 3
 # [response_headers]
 # X-Robots-Tag = "noindex"
 
-# Sign outbound OpenRTB/API requests. These are platform management-API store
-# IDs used for key-rotation WRITES; the runtime reads keys from fixed store names
-# (`jwks_store` / `signing_keys`), not these. To keep signing OFF, leave this
-# whole block commented out. If you uncomment it - even with `enabled = false` -
-# both store IDs are required and must be REAL values: the key rotate/deactivate
-# admin routes read them regardless of `enabled`, so deploy validation rejects
-# the placeholders below (replace them before pushing).
+# Sign outbound OpenRTB/API requests. The runtime reads its keys from fixed
+# store names (`jwks_store` / `signing_keys`), and `ts keys` writes them. To keep
+# signing OFF, leave this whole block commented out.
 # [request_signing]
 # enabled = false
-# config_store_id = "<management-config-store-id>"
-# secret_store_id = "<management-secret-store-id>"
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]

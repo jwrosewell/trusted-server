@@ -8,7 +8,7 @@ use crate::integrations::{IntegrationBuilder, ModuleSecretSetting};
 use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 use crate::redacted::Redacted;
 use crate::secret_resolution::ResolvedSecrets;
-use crate::settings::{ProxyAssetRoute, RequestSigning};
+use crate::settings::ProxyAssetRoute;
 use crate::test_support::tests::crate_test_settings_str;
 
 /// Every value this store hands back starts with this, so a view can be
@@ -359,8 +359,6 @@ fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'stat
         ("handlers[0].path", "^/path-canary"),
         ("handlers[0].username", "username-canary"),
         ("ec.ec_store", "identity-store-canary"),
-        ("request_signing.config_store_id", "config-store-canary"),
-        ("request_signing.secret_store_id", "secret-store-canary"),
         ("auction.creative_store", "creative-store-canary"),
     ];
     let value = |path: &str| {
@@ -381,11 +379,6 @@ fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'stat
     settings.handlers[0].path = value("handlers[0].path");
     settings.handlers[0].username = Redacted::new(value("handlers[0].username"));
     settings.ec.ec_store = Some(value("ec.ec_store"));
-    settings.request_signing = Some(RequestSigning {
-        enabled: false,
-        config_store_id: value("request_signing.config_store_id"),
-        secret_store_id: value("request_signing.secret_store_id"),
-    });
     settings.auction.creative_store = value("auction.creative_store");
     (settings, expected)
 }

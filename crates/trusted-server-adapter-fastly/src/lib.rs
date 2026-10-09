@@ -1133,8 +1133,6 @@ mod tests {
 
             [request_signing]
             enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
             "#,
         )
         .expect("should parse test settings")

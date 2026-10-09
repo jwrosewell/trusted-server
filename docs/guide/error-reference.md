@@ -499,13 +499,11 @@ Config store not found: jwks_store
    - Service → Configuration → Config Stores
    - Add store with exact name from configuration
 
-3. Update `trusted-server.toml`:
+3. Switch request signing on in `trusted-server.toml`:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "your-config-store-id"  # From Fastly dashboard
-secret_store_id = "your-secret-store-id"
 ```
 
 ---
