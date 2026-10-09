@@ -50,7 +50,6 @@ mod config_selection;
 mod ec_kv;
 mod esi_assembly;
 mod logging;
-mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;

@@ -53,12 +53,11 @@ Native Axum dev/test adapter (native binary):
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                    | Axum dev server                                                                                                                              |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KV store                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
-| Geo lookup                 | Always returns `None`                                                                                                                        |
-| Config/secret-store writes | Return an error (read-only via env vars)                                                                                                     |
-| Auction fan-out ordering   | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
+| Feature                  | Axum dev server                                                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KV store                 | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
+| Geo lookup               | Always returns `None`                                                                                                                        |
+| Auction fan-out ordering | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
 
 ### trusted-server-adapter-spin
 

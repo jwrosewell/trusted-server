@@ -129,8 +129,8 @@ ephemeral secret-store values only into the current shell; do not put secret
 values in the TOML config, config-store blob, or a source-controlled environment
 file.
 
-> **Dev server limitations:** The Axum adapter does not support KV store,
-> geo lookup, or config/secret-store writes.
+> **Dev server limitations:** The Axum adapter does not support KV store or
+> geo lookup.
 > See [Architecture](/guide/architecture) for the full list.
 
 ### Build the Project

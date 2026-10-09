@@ -45,10 +45,6 @@ build = """
             key = "ts-2025-10-A"
             data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
 
-        [[local_server.secret_stores.api-keys]]
-            key = "api_key"
-            env = "FASTLY_KEY"
-
         # Local-only values for the three secret references in
         # trusted-server.example.toml. These are public development fixtures.
         [[local_server.secret_stores.ts_secrets]]
