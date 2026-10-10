@@ -44,9 +44,38 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
 use crate::streaming_processor::StreamProcessor;
 
-/// The media type a document is matched as, and the only one a middleware
-/// runs on.
+/// The media type a document is matched as, and the one a middleware runs on
+/// unless it says it handles another.
 pub const HTML_MEDIA_TYPE: &str = "text/html";
+
+/// Whether a middleware may run on a response of `media_type`, written as a
+/// bare `type/subtype` in lower case.
+///
+/// HTML and the text assets that stream through core as text: every `text/`
+/// type except `text/x-component`, whose rows are length prefixed, and
+/// JavaScript, JSON and SVG. Anything else passes through untouched.
+#[must_use]
+pub fn is_dispatched_media_type(media_type: &str) -> bool {
+    media_type != "text/x-component"
+        && (media_type.starts_with("text/")
+            || matches!(
+                media_type,
+                "application/javascript" | "application/json" | "image/svg+xml"
+            ))
+}
+
+/// The type and subtype of a content type header, in lower case and without
+/// parameters, which is what an entry's `media_type` is matched against.
+/// `text/html; charset=utf-8` gives `text/html`.
+#[must_use]
+pub fn media_type_of(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
 
 /// When a middleware runs, relative to the store of shared templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -241,11 +270,17 @@ impl MiddlewareAction {
     /// Whether the action leaves the document as it arrived.
     #[must_use]
     pub fn is_pass(&self) -> bool {
+        self.is_stream_only() && self.stream.is_none()
+    }
+
+    /// Whether the action decides nothing about HTML, so it can run on a
+    /// media type that is not HTML.
+    #[must_use]
+    pub fn is_stream_only(&self) -> bool {
         self.head_inserts.is_empty()
             && self.after_bundle_inserts.is_empty()
             && self.element_handlers.is_empty()
             && self.text_handlers.is_empty()
-            && self.stream.is_none()
     }
 
     /// Checks every handler's selector parses, before a rewriter is built
@@ -308,6 +343,16 @@ pub trait Middleware: Send + Sync {
     /// part of its own after it when the module supplies several, and core
     /// names its own by a bare word.
     fn middleware_id(&self) -> &'static str;
+
+    /// Whether this middleware works on a response of `media_type`, given as
+    /// a bare `type/subtype`. HTML alone unless a middleware says otherwise,
+    /// and an entry naming it under a media type it does not handle is
+    /// refused when the registry is built. On a media type other than HTML
+    /// an action's stream processor alone runs, because head markup and the
+    /// element and text handlers are decisions about HTML.
+    fn handles_media_type(&self, media_type: &str) -> bool {
+        media_type == HTML_MEDIA_TYPE
+    }
 
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
@@ -406,10 +451,15 @@ impl PhaseEntries {
     pub fn validate(&self, phase: MiddlewarePhase) -> Result<(), String> {
         for (index, entry) in self.0.iter().enumerate() {
             let at = format!("[[{phase}]] entry {}", index + 1);
-            if entry.media_type != HTML_MEDIA_TYPE {
+            if entry.media_type != entry.media_type.to_ascii_lowercase()
+                || entry.media_type.contains([';', ' ', '*'])
+                || !is_dispatched_media_type(&entry.media_type)
+            {
                 return Err(format!(
-                    "{at} covers `{}`, and a middleware runs on `{HTML_MEDIA_TYPE}` alone. Write \
-                     media_type = \"{HTML_MEDIA_TYPE}\", in lower case with no parameters",
+                    "{at} covers `{}`, which is not a media type a middleware runs on. Write a \
+                     bare `type/subtype` in lower case with no parameters, being `text/html`, \
+                     another `text/` type other than `text/x-component`, \
+                     `application/javascript`, `application/json` or `image/svg+xml`",
                     entry.media_type
                 ));
             }
@@ -498,10 +548,12 @@ impl Serialize for PhaseEntries {
     }
 }
 
-/// The middleware one entry selects, in the order they run.
+/// The middleware one entry selects, in the order they run, for one media
+/// type.
 #[derive(Clone)]
 pub struct MiddlewareChain {
     phase: MiddlewarePhase,
+    media_type: String,
     middleware: Vec<Arc<dyn Middleware>>,
 }
 
@@ -510,22 +562,38 @@ impl fmt::Debug for MiddlewareChain {
         formatter
             .debug_struct("MiddlewareChain")
             .field("phase", &self.phase)
+            .field("media_type", &self.media_type)
             .field("middleware", &self.ids())
             .finish()
     }
 }
 
 impl MiddlewareChain {
-    /// A chain of middleware already in the order they run.
+    /// A chain of middleware already in the order they run, for responses of
+    /// `media_type`.
     #[must_use]
-    pub fn new(phase: MiddlewarePhase, middleware: Vec<Arc<dyn Middleware>>) -> Self {
-        Self { phase, middleware }
+    pub fn new(
+        phase: MiddlewarePhase,
+        media_type: &str,
+        middleware: Vec<Arc<dyn Middleware>>,
+    ) -> Self {
+        Self {
+            phase,
+            media_type: media_type.to_owned(),
+            middleware,
+        }
     }
 
     /// The phase this chain runs in.
     #[must_use]
     pub fn phase(&self) -> MiddlewarePhase {
         self.phase
+    }
+
+    /// The media type of the responses this chain runs on.
+    #[must_use]
+    pub fn media_type(&self) -> &str {
+        &self.media_type
     }
 
     /// The middleware names, in the order they run.
@@ -549,11 +617,14 @@ impl MiddlewareChain {
     /// middleware chooses its handlers for each document, so each is checked
     /// here. The caller refuses the response when one does not parse, because
     /// a change that silently does not happen is worse than a response that
-    /// fails.
+    /// fails. On a media type other than HTML an action may carry a stream
+    /// processor alone, and one that decides about HTML is refused the same
+    /// way.
     ///
     /// # Errors
     ///
-    /// A message naming the middleware and the selector that does not parse.
+    /// A message naming the middleware and the selector that does not parse,
+    /// or the HTML decision it made about a document that is not HTML.
     pub fn plan(&self, context: &MiddlewareContext<'_>) -> Result<MiddlewarePlan, String> {
         let mut plan = MiddlewarePlan::default();
         for middleware in &self.middleware {
@@ -565,6 +636,16 @@ impl MiddlewareChain {
                     middleware.middleware_id()
                 )
             })?;
+            if self.media_type != HTML_MEDIA_TYPE && !action.is_stream_only() {
+                return Err(format!(
+                    "the {} middleware `{}` cannot run on `{}`, because it decides about HTML \
+                     and that is not HTML. On another media type an action carries a stream \
+                     processor alone",
+                    self.phase,
+                    middleware.middleware_id(),
+                    self.media_type
+                ));
+            }
             plan.head_inserts.extend(action.head_inserts);
             plan.after_bundle_inserts
                 .extend(action.after_bundle_inserts);

@@ -1407,6 +1407,13 @@ fn check_middleware(
                         phases_of(middleware).join(" and ")
                     )));
                 }
+                if !middleware.handles_media_type(&entry.media_type) {
+                    return Err(refuse(format!(
+                        "{at} covers `{}` and names `{name}`, which does not work on that media \
+                         type",
+                        entry.media_type
+                    )));
+                }
             }
         }
     }
@@ -1917,7 +1924,7 @@ impl IntegrationRegistry {
             .iter()
             .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
             .collect();
-        MiddlewareChain::new(phase, middleware)
+        MiddlewareChain::new(phase, media_type, middleware)
     }
 
     /// Every integration id the registry was built from, named or not, in
@@ -2924,6 +2931,12 @@ pub(crate) mod test_support {
         pub(crate) const LINK_TARGET: &str = "/fixture/link";
         /// The selector the broken middleware asks for.
         pub(crate) const BROKEN_SELECTOR: &str = "a[";
+        /// The name of the fetch middleware that works on `text/plain`.
+        pub(crate) const TEXT: &str = "testing.middleware-fixture.text";
+        /// The media type the text middleware works on.
+        pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
+        /// The line the text middleware adds at the end of a text body.
+        pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
 
         /// The builder core's test build lists beside its own.
         pub(crate) const BUILDER: IntegrationBuilder =
@@ -3045,6 +3058,46 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Passes a text body through and adds a line at its end.
+        struct AppendLine;
+
+        impl crate::streaming_processor::StreamProcessor for AppendLine {
+            fn process_chunk(
+                &mut self,
+                chunk: &[u8],
+                is_last: bool,
+            ) -> Result<Vec<u8>, std::io::Error> {
+                let mut output = chunk.to_vec();
+                if is_last {
+                    output.extend_from_slice(TEXT_LINE.as_bytes());
+                }
+                Ok(output)
+            }
+        }
+
+        struct Text;
+
+        impl Middleware for Text {
+            fn middleware_id(&self) -> &'static str {
+                TEXT
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == TEXT_MEDIA_TYPE
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    stream: Some(Box::new(AppendLine)),
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
         struct Broken;
 
         impl Middleware for Broken {
@@ -3084,6 +3137,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Broken))
                     .with_middleware(Arc::new(Reader))
                     .with_middleware(Arc::new(BrokenReader))
+                    .with_middleware(Arc::new(Text))
                     .build(),
             ))
         }
@@ -5989,12 +6043,18 @@ mod tests {
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
+                fixture::TEXT,
             ],
             "should list the middleware the selected module supplies"
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Fetch),
-            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            [
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::TEXT
+            ],
             "should list the middleware that run in the fetch phase"
         );
         assert_eq!(
@@ -6017,6 +6077,73 @@ mod tests {
             chain_for("text/css", "/news/site.css").is_empty(),
             "should run nothing on a media type no entry covers"
         );
+    }
+
+    /// An entry for `text/plain` naming the middleware that works on it.
+    fn text_entry(names: &[&str]) -> PhaseEntry {
+        PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_entry_runs_a_middleware_on_the_media_type_it_handles() {
+        let settings = fixture_settings_with_entries(vec![
+            html_entry(None, &[fixture::HEAD]),
+            text_entry(&[fixture::TEXT]),
+        ]);
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+
+        let chain_for = |media_type: &str| {
+            registry
+                .middleware_chain(
+                    &settings.fetch,
+                    MiddlewarePhase::Fetch,
+                    media_type,
+                    "/a.txt",
+                )
+                .ids()
+        };
+        assert_eq!(
+            chain_for(fixture::TEXT_MEDIA_TYPE),
+            [fixture::TEXT],
+            "should run the text middleware on a text response"
+        );
+        assert_eq!(
+            chain_for(HTML_MEDIA_TYPE),
+            [fixture::HEAD],
+            "should run the page middleware on a page and not the text one"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_middleware_under_a_media_type_it_does_not_handle_is_refused() {
+        for (media_type, name) in [
+            (fixture::TEXT_MEDIA_TYPE, fixture::HEAD),
+            (HTML_MEDIA_TYPE, fixture::TEXT),
+        ] {
+            let settings = fixture_settings_with_entries(vec![PhaseEntry {
+                media_type: media_type.to_owned(),
+                path: None,
+                middleware: vec![name.to_owned()],
+            }]);
+
+            let error = IntegrationRegistry::new(&settings)
+                .err()
+                .expect("should refuse a middleware under a media type it does not handle");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!(
+                    "[[fetch]] entry 1 covers `{media_type}` and names `{name}`, which does not \
+                     work on that media type"
+                )),
+                "should name the entry, the media type and the middleware: {message}"
+            );
+        }
     }
 
     #[test]
@@ -6047,12 +6174,13 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::READER,
-                fixture::BROKEN_READER
+                fixture::BROKEN_READER,
+                fixture::TEXT
             )),
             "should name the entry and list what could be named: {message}"
         );
@@ -6104,6 +6232,7 @@ mod tests {
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
+                fixture::TEXT,
             ],
             "should list every middleware when there are no entries"
         );
@@ -6112,7 +6241,12 @@ mod tests {
                 html_entry(Some("/news/"), &[fixture::LINKS]),
                 html_entry(None, &[fixture::HEAD]),
             ]),
-            [fixture::BROKEN, fixture::READER, fixture::BROKEN_READER],
+            [
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER,
+                fixture::TEXT
+            ],
             "should leave out a middleware any entry names"
         );
     }
@@ -6175,7 +6309,12 @@ mod tests {
             .collect();
         assert_eq!(
             unnamed,
-            [fixture::LINKS, fixture::BROKEN, fixture::BROKEN_READER],
+            [
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::BROKEN_READER,
+                fixture::TEXT
+            ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );
     }
