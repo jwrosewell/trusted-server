@@ -1,0 +1,618 @@
+//! `InMobi` Choice, a TCF consent prompt loaded from the publisher's own
+//! account, as a consent management platform module.
+//!
+//! The prompt is the first thing a visitor sees and no advertising may run
+//! before they answer it. Its tag is this module's middleware, written where
+//! a `[[fetch]]` entry names [`MODULE`], before any vendor's tag. The
+//! middleware writes the IAB TCF stub and `InMobi`'s GPP stub ahead of
+//! the deferred Choice loader, so a call to `__tcfapi` or `__gpp` made before
+//! the prompt arrives is answered or queued rather than thrown, and each stub
+//! steps aside where a page already has its interface. The prompt writes the
+//! reader's answer where the TCF permission signal reads it, so the answer
+//! reaches the server on the next request.
+//!
+//! # Why the script URL is checked rather than trusted
+//!
+//! A configuration value that becomes a `<script src>` on every page of a
+//! site is an injection route, and a settings document reaches the service
+//! from a config store rather than from a person reading it. So the URL must
+//! be `https`, must be on a host this module recognizes and must carry no
+//! user name or password, which every reader's browser would be sent. A typo
+//! that would have pointed every reader's browser at somebody else's script
+//! fails the deployment instead.
+
+use std::sync::Arc;
+
+use error_stack::Report;
+use serde::Deserialize;
+use validator::Validate;
+
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::middleware::{
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
+
+/// The id the prompt's registration carries.
+const INMOBI_INTEGRATION_ID: &str = "inmobi";
+
+/// The name `[cmp]` selects the prompt by and a `[[fetch]]` entry names its
+/// middleware by, from this crate's folder. Its settings are the table `[cmp.inmobi]`.
+pub const MODULE: &str = "cmp.inmobi";
+
+/// Hosts a Choice tag may be served from.
+///
+/// An allow list rather than a pattern, because the point is to refuse a URL
+/// nobody intended and a pattern is what lets one through.
+const ALLOWED_HOSTS: [&str; 2] = ["cmp.inmobi.com", "cdn.inmobi.com"];
+
+/// The IAB TCF v2 stub, written ahead of the loader so a call to `__tcfapi`
+/// made before the prompt arrives is queued rather than thrown. It creates the
+/// `__tcfapiLocator` frame, queues every call, answers `ping` with
+/// `cmpStatus` "stub" and `apiVersion` "2.2", relays calls posted from
+/// frames, and defines nothing where a `__tcfapi` already exists.
+/// `tests/tcf_stub.test.mjs` runs it in a stand-in for the browser, with
+/// Node's test runner.
+const TCF_STUB_SCRIPT: &str = include_str!("tcf_stub.js");
+
+/// `InMobi`'s GPP stub, written after the TCF stub and ahead of the loader, as
+/// `InMobi`'s own tag writes it, so a call to `__gpp` made before the prompt
+/// arrives is answered or queued rather than thrown. It answers `ping` and the
+/// other generic commands at once, with the CMP id in the ping data, queues
+/// every other call for the prompt, creates the `__gppLocator` frame, relays
+/// calls posted from frames, and defines nothing where a `__gpp` already
+/// exists. `tests/gpp_stub.test.mjs` runs it in a stand-in for the browser,
+/// with Node's test runner.
+const GPP_STUB_SCRIPT: &str = include_str!("gpp_stub.js");
+
+/// The stub as the head carries it, without the file's line ending, which a
+/// checkout may write as either form.
+fn tcf_stub() -> String {
+    format!("<script>{}</script>", TCF_STUB_SCRIPT.trim_end())
+}
+
+/// The GPP stub as the head carries it, told the CMP id. The page carries the
+/// same bytes whichever line ending a checkout gave the file.
+fn gpp_stub(cmp_id: u16) -> String {
+    let script = GPP_STUB_SCRIPT.trim_end().replace("\r\n", "\n");
+    format!("<script>{script}({cmp_id});</script>")
+}
+
+/// Configuration for the `InMobi` Choice consent prompt.
+#[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct InMobiChoiceConfig {
+    /// The account's Choice loader, which is per publisher and per site.
+    ///
+    /// Checked by [`validate_script_url`] rather than only by the type,
+    /// because this becomes a `<script src>` on every page.
+    pub script_url: String,
+
+    /// The IAB registered CMP identifier, which is 10 for `InMobi`.
+    ///
+    /// The GPP stub the middleware writes answers `ping` with it while the
+    /// prompt loads, as `InMobi`'s own tag does.
+    #[serde(default = "default_cmp_id")]
+    pub cmp_id: u16,
+}
+
+fn default_cmp_id() -> u16 {
+    10
+}
+
+impl IntegrationConfig for InMobiChoiceConfig {}
+
+/// Refuse a script URL that should never reach a reader's browser, being one
+/// that is empty, is not a URL, is not `https`, is not on an `InMobi` Choice host
+/// or carries a user name or password.
+fn validate_script_url(url: &str) -> Result<(), Report<TrustedServerError>> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err(Report::new(TrustedServerError::Settings {
+            message: "`script_url` in [cmp.inmobi] is empty".to_owned(),
+        }));
+    }
+    // Parsed rather than pattern matched, so a different scheme or a host
+    // that merely contains an allowed name is rejected on what it is rather
+    // than on what it looks like.
+    let parsed = url::Url::parse(trimmed).map_err(|error| {
+        Report::new(TrustedServerError::Settings {
+            message: format!("`script_url` in [cmp.inmobi] is not a URL: {error}"),
+        })
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(Report::new(TrustedServerError::Settings {
+            message: format!(
+                "`script_url` in [cmp.inmobi] is {:?}, and a consent prompt \
+                 loaded over anything but https can be replaced in transit \
+                 by whoever carries it",
+                parsed.scheme()
+            ),
+        }));
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !ALLOWED_HOSTS.contains(&host.as_str()) {
+        return Err(Report::new(TrustedServerError::Settings {
+            message: format!(
+                "`script_url` in [cmp.inmobi] points at {host:?}, which is not \
+                 an InMobi Choice host. This value becomes a script tag on \
+                 every page, so a host nobody recognizes is refused rather \
+                 than served. Allowed: {}",
+                ALLOWED_HOSTS.join(", ")
+            ),
+        }));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Report::new(TrustedServerError::Settings {
+            message: "`script_url` in [cmp.inmobi] carries a user name or password, \
+                      which every reader's browser would be sent"
+                .to_owned(),
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse a document that selects the prompt but names it in no entry, where
+/// it would load and never be written.
+fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.fetch.names().contains(&MODULE) {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Settings {
+        message: format!(
+            "[cmp] selects `inmobi`, but no [[fetch]] entry names `{MODULE}`, so the \
+             consent prompt would never be written. Add it to the entry for \
+             \"text/html\", before any middleware that writes a vendor's tag"
+        ),
+    }))
+}
+
+/// Validates the `InMobi` Choice configuration and reports whether a section
+/// selects the module.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be parsed, fails
+/// validation, carries a script URL that should not be served, or names the
+/// prompt in no entry.
+pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<InMobiChoiceConfig>(MODULE)? else {
+        return Ok(false);
+    };
+    validate_script_url(&config.script_url)?;
+    require_an_entry(settings)?;
+    Ok(true)
+}
+
+/// Registers the `InMobi` Choice prompt when a section selects it.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be parsed, carries a
+/// script URL that should not be served, or names the prompt in no entry.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<InMobiChoiceConfig>(MODULE)? else {
+        return Ok(None);
+    };
+    validate_script_url(&config.script_url)?;
+    require_an_entry(settings)?;
+    Ok(Some(
+        IntegrationRegistration::builder(INMOBI_INTEGRATION_ID)
+            // No browser module. The two stubs and the Choice script are the
+            // whole client side.
+            .without_js()
+            .with_middleware(Arc::new(Choice::new(&config.script_url, config.cmp_id)))
+            .build(),
+    ))
+}
+
+/// The builder a deployment installs to offer this prompt.
+#[must_use]
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(
+        INMOBI_INTEGRATION_ID,
+        env!("CARGO_PKG_NAME"),
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+}
+
+/// The Choice consent prompt's tag, being the TCF stub, the GPP stub and the
+/// loader.
+///
+/// The loader is deferred, so a slow consent vendor never holds up the page a
+/// reader came for, and it runs only once the whole page has been read. So it
+/// never finds `__tcfapi` or `__gpp` missing, and never runs ahead of a stub
+/// the publisher's own head carries, which would otherwise replace the
+/// prompt's real API with a stub again.
+///
+/// Core writes each middleware's head markup in the order the entry names
+/// them. Nothing advertising related may run before the visitor answers the
+/// prompt, so an entry must name this middleware before any that writes a
+/// vendor's tag.
+///
+/// The fetch phase, because the tag is the same for every reader and belongs
+/// in the page every reader is served from.
+#[derive(Debug)]
+pub struct Choice {
+    tag: Arc<str>,
+}
+
+impl Choice {
+    /// The prompt for an account's script URL, which the caller has checked
+    /// is `https` on an `InMobi` host, with the CMP id the GPP stub answers
+    /// `ping` with.
+    #[must_use]
+    pub fn new(script_url: &str, cmp_id: u16) -> Self {
+        Self {
+            tag: Arc::from(format!(
+                "{}{}<script defer src=\"{}\"></script>",
+                tcf_stub(),
+                gpp_stub(cmp_id),
+                escape_attribute(script_url.trim())
+            )),
+        }
+    }
+}
+
+impl Middleware for Choice {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec![self.tag.to_string()],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// Escapes a value for an HTML double quoted attribute.
+///
+/// The URL is checked before it reaches here, so this is the second of two
+/// checks, because a URL on the right host can still carry a quote in its
+/// query that would end the attribute early.
+fn escape_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trusted_server_core::html_processor::test_support::{
+        assert_page_is_recorded, page_settings,
+    };
+    use trusted_server_core::integrations::IntegrationDocumentState;
+    use trusted_server_core::middleware::MiddlewareChain;
+    use trusted_server_core::middleware::test_support::context;
+
+    const REAL: &str = "https://cmp.inmobi.com/choice/EXAMPLEacct00/www.publisher.example/choice.js?tag_version=V3";
+
+    /// `InMobi`'s registered CMP id.
+    const CMP_ID: u16 = 10;
+
+    /// A document selecting the prompt, named in a fetch entry.
+    fn settings_with(url: &str) -> Settings {
+        page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = {}\n\n\
+             [[fetch]]\nmedia_type = \"text/html\"\nmiddleware = [\"cmp.inmobi\"]\n",
+            serde_json::to_string(url).expect("a string")
+        ))
+    }
+
+    /// The head markup `middleware` write in `phase`, in the order written.
+    fn head_markup(phase: MiddlewarePhase, middleware: Vec<Arc<dyn Middleware>>) -> Vec<String> {
+        let document_state = IntegrationDocumentState::default();
+        MiddlewareChain::new(phase, middleware)
+            .plan(&context(phase, &document_state))
+            .expect("the chain should plan")
+            .head_inserts
+    }
+
+    /// The one piece of head markup the prompt writes in `phase`.
+    fn tag_in(phase: MiddlewarePhase, prompt: Choice) -> String {
+        let mut markup = head_markup(phase, vec![Arc::new(prompt)]);
+        assert_eq!(
+            markup.len(),
+            1,
+            "{phase}: the prompt writes one piece: {markup:?}"
+        );
+        markup.remove(0)
+    }
+
+    /// A stand-in for a vendor middleware that writes its own tag into the
+    /// head, such as a tag manager.
+    #[derive(Debug)]
+    struct VendorTag;
+
+    impl Middleware for VendorTag {
+        fn middleware_id(&self) -> &'static str {
+            "vendor.tag"
+        }
+
+        fn phases(&self) -> &[MiddlewarePhase] {
+            &MiddlewarePhase::ALL
+        }
+
+        fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+            MiddlewareAction {
+                head_inserts: vec![
+                    "<script src=\"https://vendor.example/tag.js\"></script>".to_owned(),
+                ],
+                ..MiddlewareAction::pass()
+            }
+        }
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    #[test]
+    fn an_unselected_module_does_not_register() {
+        let settings = page_settings("");
+        assert!(
+            register(&settings)
+                .expect("should read a document that selects nothing")
+                .is_none()
+        );
+        assert!(!validate(&settings).expect("should read a document that selects nothing"));
+    }
+
+    #[test]
+    fn the_prompt_runs_in_the_fetch_phase_alone() {
+        assert_eq!(
+            Choice::new(REAL, CMP_ID).phases(),
+            [MiddlewarePhase::Fetch],
+            "the tag is the same for every reader, so it belongs in the stored page"
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_offered_as_the_modules_middleware() {
+        let registration = register(&settings_with(REAL))
+            .expect("should parse")
+            .expect("should register");
+
+        assert!(
+            registration
+                .middleware
+                .iter()
+                .any(|middleware| middleware.middleware_id() == MODULE),
+            "the prompt should be offered for an entry to write"
+        );
+        assert!(
+            registration.js_disabled,
+            "the stubs and the Choice script are the whole client side"
+        );
+    }
+
+    /// Selected but named in no entry, the prompt would never be written.
+    #[test]
+    fn a_document_naming_the_prompt_in_no_entry_is_refused() {
+        let settings = page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\n"
+        ));
+
+        let refused = validate(&settings).expect_err("should refuse a prompt no entry names");
+        assert!(
+            format!("{refused:?}").contains("no [[fetch]] entry names `cmp.inmobi`"),
+            "{refused:?}"
+        );
+        assert!(register(&settings).is_err());
+    }
+
+    /// A script URL that should never reach a reader's browser is refused at
+    /// load and at registration, with a message naming the section and the
+    /// reason.
+    #[test]
+    fn a_script_url_that_should_never_be_served_is_refused_for_its_reason() {
+        // (case, script URL, the reason the refusal must give)
+        let cases = [
+            ("an empty URL", "   ", "is empty"),
+            (
+                "a value that is not a URL",
+                "cmp.inmobi.com/choice.js",
+                "is not a URL",
+            ),
+            (
+                "plain http, which whoever carries the page can replace",
+                "http://cmp.inmobi.com/choice/a/b/choice.js",
+                "is \"http\", and a consent prompt loaded over anything but https",
+            ),
+            (
+                "a host that is not InMobi's",
+                "https://evil.example.com/choice.js",
+                "points at \"evil.example.com\", which is not an InMobi Choice host",
+            ),
+            (
+                "a host that merely contains an allowed name",
+                "https://cmp.inmobi.com.evil.example/choice.js",
+                "points at \"cmp.inmobi.com.evil.example\", which is not an InMobi",
+            ),
+            (
+                "an allowed name before an `@`, which makes it a user name",
+                "https://cmp.inmobi.com@evil.example/choice.js",
+                "points at \"evil.example\", which is not an InMobi",
+            ),
+            (
+                "a user name and password on an allowed host",
+                "https://user:secret@cmp.inmobi.com/choice/a/b/choice.js",
+                "carries a user name or password",
+            ),
+            (
+                "a user name alone on an allowed host",
+                "https://user@cmp.inmobi.com/choice/a/b/choice.js",
+                "carries a user name or password",
+            ),
+            (
+                "a password alone on an allowed host",
+                "https://:secret@cmp.inmobi.com/choice/a/b/choice.js",
+                "carries a user name or password",
+            ),
+        ];
+        for (case, url, reason) in cases {
+            let settings = settings_with(url);
+            for (call, refusal) in [
+                ("validate", validate(&settings).err()),
+                ("register", register(&settings).err()),
+            ] {
+                let message = refusal
+                    .unwrap_or_else(|| panic!("{case}: {call} should refuse {url:?}"))
+                    .current_context()
+                    .to_string();
+                assert!(
+                    message.contains("`script_url` in [cmp.inmobi]") && message.contains(reason),
+                    "{case}: {call} should say {reason:?}, and said {message:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cmp_id_defaults_to_inmobis_registered_number() {
+        let config = settings_with(REAL)
+            .module_config::<InMobiChoiceConfig>(MODULE)
+            .expect("should read the table")
+            .expect("should select the module");
+        assert_eq!(config.cmp_id, CMP_ID);
+    }
+
+    /// The CMP id in `[cmp.inmobi]` is the one the GPP stub is told.
+    #[test]
+    fn the_configured_cmp_id_reaches_the_gpp_stub() {
+        let settings = page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\ncmp_id = 42\n\n\
+             [[fetch]]\nmedia_type = \"text/html\"\nmiddleware = [\"cmp.inmobi\"]\n"
+        ));
+        let registration = register(&settings)
+            .expect("should parse")
+            .expect("should register");
+
+        let markup = head_markup(MiddlewarePhase::Fetch, registration.middleware).join("");
+
+        assert!(markup.contains("})(42);</script>"), "{markup}");
+        assert!(!markup.contains("})(10);</script>"), "{markup}");
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_rather_than_ignored() {
+        let settings = page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\ntypo = true\n"
+        ));
+        assert!(
+            settings
+                .module_config::<InMobiChoiceConfig>(MODULE)
+                .is_err()
+        );
+    }
+
+    /// The tag is written once, deferred and carrying the account's URL.
+    #[test]
+    fn the_tag_is_deferred_and_carries_the_url() {
+        let tag = tag_in(MiddlewarePhase::Fetch, Choice::new(REAL, CMP_ID));
+
+        let loader = "<script defer src=\"https://cmp.inmobi.com/choice/EXAMPLEacct00/www.publisher.example/choice.js?tag_version=V3\"></script>";
+        assert_eq!(tag.matches(loader).count(), 1, "{tag}");
+        assert!(tag.ends_with(loader), "the loader comes last: {tag}");
+    }
+
+    /// The prompt's loader calls `__tcfapi` and `__gpp` as soon as it runs,
+    /// so each stub has to be ahead of the loader, once, the TCF stub first.
+    #[test]
+    fn the_stubs_go_ahead_of_the_loader_once_each_with_the_tcf_stub_first() {
+        let tag = tag_in(MiddlewarePhase::Fetch, Choice::new(REAL, 42));
+
+        let tcf = tcf_stub();
+        let gpp = gpp_stub(42);
+        assert!(gpp.ends_with("})(42);</script>"), "{gpp}");
+        assert_eq!(tag.matches(&tcf).count(), 1, "{tag}");
+        assert_eq!(tag.matches(&gpp).count(), 1, "{tag}");
+        let position = |needle: &str| {
+            tag.find(needle)
+                .unwrap_or_else(|| panic!("{needle} belongs in the tag: {tag}"))
+        };
+        assert!(
+            position(&tcf) < position(&gpp) && position(&gpp) < position("cmp.inmobi.com"),
+            "the order is TCF stub, GPP stub, loader: {tag}"
+        );
+    }
+
+    #[test]
+    fn ampersands_and_quotes_in_the_url_are_escaped() {
+        let tag = tag_in(
+            MiddlewarePhase::Fetch,
+            Choice::new(
+                "https://cmp.inmobi.com/choice/abc/site/choice.js?a=1&b=\"2\"",
+                CMP_ID,
+            ),
+        );
+
+        assert!(tag.contains("a=1&amp;b=&quot;2&quot;"), "{tag}");
+    }
+
+    /// The entry's order is the head's order, which is why the prompt must be
+    /// named before any vendor's tag.
+    #[test]
+    fn a_vendor_tag_named_after_the_prompt_is_written_after_it() {
+        let prompt_first = head_markup(
+            MiddlewarePhase::Fetch,
+            vec![Arc::new(Choice::new(REAL, CMP_ID)), Arc::new(VendorTag)],
+        )
+        .join("");
+        let vendor_first = head_markup(
+            MiddlewarePhase::Fetch,
+            vec![Arc::new(VendorTag), Arc::new(Choice::new(REAL, CMP_ID))],
+        )
+        .join("");
+
+        let position = |page: &str, needle: &str| {
+            page.find(needle)
+                .unwrap_or_else(|| panic!("{needle} should be written: {page}"))
+        };
+        assert!(
+            position(&prompt_first, "cmp.inmobi.com") < position(&prompt_first, "vendor.example"),
+            "named first, the prompt should load first: {prompt_first}"
+        );
+        assert!(
+            position(&vendor_first, "vendor.example") < position(&vendor_first, "cmp.inmobi.com"),
+            "named second, the prompt loads after the vendor's tag, so the order \
+             in the entry is what keeps it first: {vendor_first}"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
+        );
+    }
+}
