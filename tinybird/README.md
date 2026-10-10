@@ -19,8 +19,9 @@ directory, run `tb test`, inspect `tb deploy --dry-run`, and deploy with
 
 Create an APPEND token scoped to `auction_events_raw`, store its value in the
 platform secret store, and put only its key name in
-`tinybird.auction_token_secret`. The runtime sends directly to the regional
-Events API host configured by `tinybird.api_host`.
+`analytics.tinybird.auction_token_secret`. The runtime sends directly to the
+regional Events API host configured by `analytics.tinybird.api_host`, when
+`[analytics] module = "tinybird"` selects the module.
 
 For runtime behavior, limits, privacy properties, and the Fastly-only emission
 boundary, see [Auction Telemetry](../docs/guide/telemetry.md). For exact

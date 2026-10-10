@@ -105,16 +105,17 @@ pub fn settings_from_config_blob_with(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
+    // The telemetry module runs when [analytics] selects it. A table the
+    // section does not select is refused once the settings are read, and
+    // clearing its references here means that refusal is what an operator
+    // sees rather than a secret lookup failing first.
+    if !crate::settings::document_selects_telemetry(data)
+        && let Some(table) = data
+            .pointer_mut("/analytics/tinybird")
             .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        table.remove("auction_token_secret");
+        table.remove("access_token_secret");
     }
 
     if let Some(partners) = data
@@ -144,7 +145,8 @@ mod tests {
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
-        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
+        AnalyticsConfig, AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig,
+        TinybirdSettings, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
         crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_module,
@@ -510,10 +512,14 @@ mod tests {
     #[test]
     fn resolves_all_static_credentials_from_the_mapped_default_store() {
         let mut original = test_settings();
-        original.tinybird.enabled = true;
-        original.tinybird.api_host = "api.example.com".to_string();
-        original.tinybird.auction_token_secret =
-            Some(Redacted::new("tinybird-token-key".to_string()));
+        original.analytics = Some(AnalyticsConfig {
+            module: Some("analytics.tinybird".to_string()),
+            tinybird: Some(TinybirdSettings {
+                api_host: "api.example.com".to_string(),
+                auction_token_secret: Some(Redacted::new("tinybird-token-key".to_string())),
+                ..TinybirdSettings::default()
+            }),
+        });
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -541,9 +547,8 @@ mod tests {
 
         assert_eq!(
             reconstructed
-                .tinybird
-                .auction_token_secret
-                .as_ref()
+                .telemetry()
+                .and_then(|telemetry| telemetry.auction_token_secret.as_ref())
                 .map(Redacted::expose)
                 .map(String::as_str),
             Some("resolved-tinybird-token")
@@ -875,8 +880,6 @@ mod tests {
     #[test]
     fn inactive_optional_features_do_not_resolve_stale_secret_references() {
         let mut original = test_settings();
-        original.tinybird.auction_token_secret =
-            Some(Redacted::new("unused-tinybird-key".to_string()));
         original
             .ec
             .partners
@@ -889,8 +892,37 @@ mod tests {
         )
         .expect("should skip inactive optional feature references");
 
-        assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
+    }
+
+    #[test]
+    fn an_unselected_telemetry_table_is_refused_without_resolving_its_secret() {
+        let mut original = test_settings();
+        original.analytics = Some(AnalyticsConfig {
+            module: None,
+            tinybird: Some(TinybirdSettings {
+                api_host: "api.example.com".to_string(),
+                auction_token_secret: Some(Redacted::new("unused-telemetry-key".to_string())),
+                ..TinybirdSettings::default()
+            }),
+        });
+
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should refuse a table nothing selects");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[analytics] selects no module"),
+            "should name the section and why: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unused-telemetry-key") && !rendered.contains("secret reference"),
+            "should not have tried to resolve the stale secret reference: {rendered}"
+        );
     }
 
     /// A table for a module its section does not select is refused, and its
