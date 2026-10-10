@@ -39,7 +39,6 @@
 
 use std::sync::OnceLock;
 
-use trusted_server_core::constants::COOKIE_MTM_PREF;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
@@ -66,6 +65,13 @@ fn short() -> &'static str {
 
 /// The scheme, as a [`ValidSignal`] names it.
 pub const SCHEME: &str = "mtm";
+
+/// The cookie holding the preference, one of the three words `standard`,
+/// `personalized` and `non-marketing`. It is written as a first party cookie
+/// by whatever preference platform asked the visitor, and is not a Trusted
+/// Server name, so that anyone can build a platform that sets it. This module
+/// reads the cookie and never writes it.
+pub const COOKIE_MTM_PREF: &str = "__mtm_pref";
 
 /// The terms the data is available under when a word is present. Versioned,
 /// and never a page that can be edited, because whoever receives the data
