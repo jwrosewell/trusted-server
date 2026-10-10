@@ -596,7 +596,8 @@ impl DidomiIntegration {
 }
 
 /// Writes the browser module's settings into the head, on the pages a
-/// `[[fetch]]` entry names [`MODULE`] for.
+/// `[[fetch]]` or `[[serve]]` entry names [`MODULE`] for, in the phase the
+/// publisher chooses.
 struct ClientConfig(Arc<DidomiIntegration>);
 
 impl Middleware for ClientConfig {
@@ -605,7 +606,7 @@ impl Middleware for ClientConfig {
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
-        &[MiddlewarePhase::Fetch]
+        &MiddlewarePhase::ALL
     }
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
@@ -1370,6 +1371,16 @@ mod tests {
         assert!(validate_proxy_path("my-custom-path").is_ok());
         assert!(validate_proxy_path("nested/path/here").is_ok());
         assert!(validate_proxy_path("/leading-slash-ok").is_ok());
+    }
+
+    #[test]
+    fn the_page_change_may_run_in_either_phase() {
+        let integration = DidomiIntegration::new(Arc::new(config()));
+        assert_eq!(
+            ClientConfig(integration).phases(),
+            MiddlewarePhase::ALL,
+            "the publisher chooses the phase by the entry"
+        );
     }
 
     #[test]

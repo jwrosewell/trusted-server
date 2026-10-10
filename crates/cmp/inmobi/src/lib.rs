@@ -3,7 +3,8 @@
 //!
 //! The prompt is the first thing a visitor sees and no advertising may run
 //! before they answer it. Its tag is this module's middleware, written where
-//! a `[[fetch]]` entry names [`MODULE`], before any vendor's tag. The
+//! a `[[fetch]]` or `[[serve]]` entry names [`MODULE`], before any vendor's
+//! tag, in the phase the publisher chooses. The
 //! middleware writes the IAB TCF stub and `InMobi`'s GPP stub ahead of
 //! the deferred Choice loader, so a call to `__tcfapi` or `__gpp` made before
 //! the prompt arrives is answered or queued rather than thrown, and each stub
@@ -37,8 +38,8 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 /// The id the prompt's registration carries.
 const INMOBI_INTEGRATION_ID: &str = "inmobi";
 
-/// The name `[cmp]` selects the prompt by and a `[[fetch]]` entry names its
-/// middleware by, from this crate's folder. Its settings are the table `[cmp.inmobi]`.
+/// The name `[cmp]` selects the prompt by and an entry names its middleware
+/// by, from this crate's folder. Its settings are the table `[cmp.inmobi]`.
 pub const MODULE: &str = "cmp.inmobi";
 
 /// Hosts a Choice tag may be served from.
@@ -156,13 +157,16 @@ fn validate_script_url(url: &str) -> Result<(), Report<TrustedServerError>> {
 /// Refuse a document that selects the prompt but names it in no entry, where
 /// it would load and never be written.
 fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    if settings.fetch.names().contains(&MODULE) {
+    if [&settings.fetch, &settings.serve]
+        .iter()
+        .any(|entries| entries.names().contains(&MODULE))
+    {
         return Ok(());
     }
     Err(Report::new(TrustedServerError::Settings {
         message: format!(
-            "[cmp] selects `inmobi`, but no [[fetch]] entry names `{MODULE}`, so the \
-             consent prompt would never be written. Add it to the entry for \
+            "[cmp] selects `inmobi`, but no [[fetch]] or [[serve]] entry names `{MODULE}`, \
+             so the consent prompt would never be written. Add it to the entry for \
              \"text/html\", before any middleware that writes a vendor's tag"
         ),
     }))
@@ -235,8 +239,9 @@ pub fn builder() -> IntegrationBuilder {
 /// prompt, so an entry must name this middleware before any that writes a
 /// vendor's tag.
 ///
-/// The fetch phase, because the tag is the same for every reader and belongs
-/// in the page every reader is served from.
+/// Either phase, as the publisher chooses by the entry. The tag is the same
+/// for every reader, so the fetch phase stores it in the page every reader
+/// is served from, and the serve phase writes it on each reader's copy.
 #[derive(Debug)]
 pub struct Choice {
     tag: Arc<str>,
@@ -265,7 +270,7 @@ impl Middleware for Choice {
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
-        &[MiddlewarePhase::Fetch]
+        &MiddlewarePhase::ALL
     }
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
@@ -382,11 +387,30 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_runs_in_the_fetch_phase_alone() {
+    fn the_prompt_may_run_in_either_phase() {
         assert_eq!(
             Choice::new(REAL, CMP_ID).phases(),
-            [MiddlewarePhase::Fetch],
-            "the tag is the same for every reader, so it belongs in the stored page"
+            MiddlewarePhase::ALL,
+            "the publisher chooses the phase by the entry"
+        );
+    }
+
+    #[test]
+    fn a_prompt_named_in_a_serve_entry_alone_is_accepted() {
+        let settings = page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\n\n\
+             [[serve]]\nmedia_type = \"text/html\"\nmiddleware = [\"cmp.inmobi\"]\n"
+        ));
+        assert!(
+            validate(&settings).expect("should read"),
+            "a serve entry places the prompt"
+        );
+        let registration = register(&settings)
+            .expect("should parse")
+            .expect("should register");
+        assert_eq!(
+            head_markup(MiddlewarePhase::Serve, registration.middleware).len(),
+            1
         );
     }
 
@@ -418,7 +442,7 @@ mod tests {
 
         let refused = validate(&settings).expect_err("should refuse a prompt no entry names");
         assert!(
-            format!("{refused:?}").contains("no [[fetch]] entry names `cmp.inmobi`"),
+            format!("{refused:?}").contains("no [[fetch]] or [[serve]] entry names `cmp.inmobi`"),
             "{refused:?}"
         );
         assert!(register(&settings).is_err());

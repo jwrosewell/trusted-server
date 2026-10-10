@@ -1046,7 +1046,7 @@ impl Middleware for PageChange {
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
-        &[MiddlewarePhase::Fetch]
+        &MiddlewarePhase::ALL
     }
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
@@ -1503,6 +1503,16 @@ mod tests {
         assert!(!SourcepointIntegration::is_likely_javascript_path(
             "/consent/tcfv2"
         ));
+    }
+
+    #[test]
+    fn the_page_change_may_run_in_either_phase() {
+        let integration = SourcepointIntegration::new(Arc::new(config()));
+        assert_eq!(
+            PageChange(integration).phases(),
+            MiddlewarePhase::ALL,
+            "the publisher chooses the phase by the entry"
+        );
     }
 
     #[test]

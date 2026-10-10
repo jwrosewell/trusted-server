@@ -12,7 +12,8 @@
 
 InMobi Choice is a TCF consent prompt loaded from the publisher's own InMobi
 account. The module writes the prompt's tag into the head of each page a
-`[[fetch]]` entry names it for, in three parts and in this order:
+`[[fetch]]` or `[[serve]]` entry names it for, in three parts and in this
+order:
 
 1. The IAB TCF v2 stub, which creates the `__tcfapiLocator` frame, queues
    every `__tcfapi` call made before the prompt arrives, answers `ping` as a
@@ -57,16 +58,19 @@ The table refuses a field it does not read.
 
 ## Placing the prompt
 
-The prompt changes a page only where a `[[fetch]]` entry names `cmp.inmobi`,
-in the fetch phase alone, because the tag is the same for every reader and
-belongs in the page every reader is served from. Core writes each
+The prompt changes a page only where a `[[fetch]]` or `[[serve]]` entry
+names `cmp.inmobi`, in the phase the publisher chooses. The tag is the same
+for every reader, so the fetch phase stores it in the page every reader is
+served from, which is what `ts audit generate` writes, and the serve phase
+writes it on each reader's copy instead. Core writes each
 middleware's head markup in the order the entry names them, and nothing
 advertising related may run before the visitor answers the prompt, so name
 `cmp.inmobi` before any middleware that writes a vendor's tag, as the example
 above does ahead of Google Tag Manager.
 
-Selecting the module with no entry naming it is refused when the settings
-load and by `ts config validate`, because the prompt would never be written.
+Selecting the module with no entry of either phase naming it is refused
+when the settings load and by `ts config validate`, because the prompt would
+never be written.
 
 ## What is checked
 
@@ -86,7 +90,7 @@ reader is asked before anything else runs. This module keeps to the
 following, and they are what every `[cmp]` module is held to.
 
 1. The prompt is written before any vendor's tag, and the entry's order is
-   the head's order.
+   the head's order. Which phase it is written in is the publisher's choice.
 2. The IAB interfaces a page may call before the prompt arrives, `__tcfapi`
    and `__gpp`, are stubbed ahead of the loader and queue or answer every
    call, and a stub steps aside where the page already has the interface.

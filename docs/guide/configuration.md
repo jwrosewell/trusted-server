@@ -1813,7 +1813,10 @@ The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
 takes one entry, and the order written is the order they run in. The table
 is in the order the modules register, which is the order `ts audit` writes
-the names in and the order `trusted-server.example.toml` shows them in.
+the names in and the order `trusted-server.example.toml` shows them in. A
+consent management platform's middleware runs in either phase, as the
+publisher chooses, and is listed under `[[fetch]]`, which is the phase a
+generated configuration places it in.
 
 | Middleware                    | Phase       | What it changes                                                                                                                                                                                                   |
 | ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
