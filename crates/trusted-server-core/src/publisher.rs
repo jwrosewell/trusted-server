@@ -68,7 +68,8 @@ use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
-use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
+use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
+use crate::middleware::{MiddlewarePhase, media_type_of};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -652,6 +653,95 @@ struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
 }
 
+/// A response that is not HTML, as the middleware the entries covering it
+/// are told of it.
+struct TextDocument<'a> {
+    /// The type and subtype of the response, in lower case.
+    media_type: String,
+    request_path: &'a str,
+    request_host: &'a str,
+    request_scheme: &'a str,
+    origin_host: &'a str,
+    request_state: &'a IntegrationRequestState,
+    max_buffered_script_bytes: usize,
+}
+
+/// The stream processors the entries covering a response that is not HTML
+/// run on its body, phase by phase in the order given, or none when its
+/// media type is not one a middleware runs on or no entry covers it.
+///
+/// A fetch middleware is told nothing a request left, as on a page, and a
+/// serve middleware is told what this reader's request left.
+///
+/// # Errors
+///
+/// When a middleware decides about HTML on a document that is not HTML, or
+/// asks for a selector that does not parse.
+fn middleware_stream_processors(
+    document: &TextDocument<'_>,
+    phases: &[MiddlewarePhase],
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Vec<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
+    use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
+
+    if !is_dispatched_media_type(&document.media_type) {
+        return Ok(Vec::new());
+    }
+    let mut processors = Vec::new();
+    for phase in phases {
+        let chain = integration_registry.middleware_chain(
+            settings.phase_entries(*phase),
+            *phase,
+            &document.media_type,
+            document.request_path,
+        );
+        if chain.is_empty() {
+            continue;
+        }
+        let document_state = IntegrationDocumentState::default();
+        if *phase == MiddlewarePhase::Serve {
+            document.request_state.seed(&document_state);
+        }
+        let plan = chain
+            .plan(&MiddlewareContext {
+                phase: *phase,
+                request_host: document.request_host,
+                request_scheme: document.request_scheme,
+                origin_host: document.origin_host,
+                document_state: &document_state,
+                max_buffered_script_bytes: document.max_buffered_script_bytes,
+            })
+            .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        processors.extend(plan.processors);
+    }
+    Ok(processors)
+}
+
+/// A processor followed by the ones the entries add, each handed what the
+/// one before produced.
+struct WithStreamProcessors {
+    inner: Box<dyn StreamProcessor>,
+    processors: Vec<Box<dyn StreamProcessor>>,
+}
+
+impl StreamProcessor for WithStreamProcessors {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
+        let mut output = self.inner.process_chunk(chunk, is_last)?;
+        for processor in &mut self.processors {
+            output = processor.process_chunk(&output, is_last)?;
+        }
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        for processor in &mut self.processors {
+            processor.reset();
+        }
+    }
+}
+
 impl PublisherBodyProcessor {
     /// Build the body processor, returning any deferred inline seam token it
     /// installed alongside it.
@@ -699,12 +789,37 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
             ))
         } else {
-            Box::new(create_url_replacer(
-                &params.origin_host,
-                &params.origin_url,
-                &params.request_host,
-                &params.request_scheme,
-            ))
+            // The serve entry runs on each reader's copy of a stored response
+            // later, see `reader_serve_processor`, and here on one that is not
+            // stored.
+            let phases: &[MiddlewarePhase] = if params.template_cache_key.is_some() {
+                &[MiddlewarePhase::Fetch]
+            } else {
+                &MiddlewarePhase::ALL
+            };
+            let processors = middleware_stream_processors(
+                &TextDocument {
+                    media_type: media_type_of(&params.content_type),
+                    request_path: &params.request_path,
+                    request_host: &params.request_host,
+                    request_scheme: &params.request_scheme,
+                    origin_host: &params.origin_host,
+                    request_state: &params.request_state,
+                    max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+                },
+                phases,
+                settings,
+                integration_registry,
+            )?;
+            Box::new(WithStreamProcessors {
+                inner: Box::new(create_url_replacer(
+                    &params.origin_host,
+                    &params.origin_url,
+                    &params.request_host,
+                    &params.request_scheme,
+                )),
+                processors,
+            })
         };
 
         Ok((Self { inner }, inline_seam_token))
@@ -790,13 +905,35 @@ fn process_response_streaming<W: Write>(
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
-        let replacer = create_url_replacer(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-        StreamingPipeline::new(config, replacer)
+        let phases: &[MiddlewarePhase] = if params.shared_template_authorized {
+            &[MiddlewarePhase::Fetch]
+        } else {
+            &MiddlewarePhase::ALL
+        };
+        let processors = middleware_stream_processors(
+            &TextDocument {
+                media_type: media_type_of(params.content_type),
+                request_path: params.request_path,
+                request_host: params.request_host,
+                request_scheme: params.request_scheme,
+                origin_host: params.origin_host,
+                request_state: params.request_state,
+                max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
+            },
+            phases,
+            params.settings,
+            params.integration_registry,
+        )?;
+        let processor = WithStreamProcessors {
+            inner: Box::new(create_url_replacer(
+                params.origin_host,
+                params.origin_url,
+                params.request_host,
+                params.request_scheme,
+            )),
+            processors,
+        };
+        StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     }
@@ -1575,7 +1712,29 @@ fn reader_serve_processor(
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     if !is_html_content_type(&params.content_type) {
-        return Ok(None);
+        let origin_host = settings.publisher.origin_host();
+        let mut processors = middleware_stream_processors(
+            &TextDocument {
+                media_type: media_type_of(&params.content_type),
+                request_path: &params.request_path,
+                request_host: &params.request_host,
+                request_scheme: &params.request_scheme,
+                origin_host: &origin_host,
+                request_state: &params.request_state,
+                max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+            },
+            &[MiddlewarePhase::Serve],
+            settings,
+            integration_registry,
+        )?;
+        return Ok(match processors.len() {
+            0 => None,
+            1 => processors.pop(),
+            _ => Some(Box::new(WithStreamProcessors {
+                inner: processors.remove(0),
+                processors,
+            })),
+        });
     }
     let chain = integration_registry.middleware_chain(
         &settings.serve,
@@ -7780,6 +7939,7 @@ mod tests {
     use crate::integrations::{
         CarriedJsModule, IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
     };
+    use crate::middleware::{PhaseEntries, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
@@ -20581,6 +20741,160 @@ mod tests {
                 .with_standalone_js()
                 .build(),
         ))
+    }
+
+    /// The settings of a deployment running the middleware fixture, with the
+    /// `[[fetch]]` entry given.
+    fn settings_running_the_middleware_fixture(fetch: Vec<PhaseEntry>) -> Settings {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(fetch);
+        settings
+    }
+
+    /// A text body streamed through the publisher path, as a reader gets it.
+    fn text_body_through_the_publisher(settings: &Settings, body: &str) -> String {
+        let registry = IntegrationRegistry::new(settings).expect("should build a registry");
+        let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: "identity".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+        let mut output = Vec::new();
+        stream_publisher_body(
+            EdgeBody::from(body.as_bytes().to_vec()),
+            &mut output,
+            &params,
+            settings,
+            &registry,
+        )
+        .expect("should stream a text body");
+        String::from_utf8(output).expect("text")
+    }
+
+    #[test]
+    fn a_text_body_passes_through_the_middleware_of_the_entry_covering_it() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        let body = "User-agent: *\nSee https://origin.example.com/more\n";
+
+        let output = text_body_through_the_publisher(&settings, body);
+
+        assert_eq!(
+            output,
+            format!(
+                "User-agent: *\nSee https://proxy.example.com/more\n{}",
+                fixture::TEXT_LINE
+            ),
+            "should move the origin's address and then run the entry's middleware"
+        );
+    }
+
+    /// The same through the response path a streamed body takes, which
+    /// builds its processor apart from the buffered path's.
+    #[tokio::test]
+    async fn a_streamed_text_body_passes_through_the_middleware_of_the_entry_covering_it() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::platform::test_support::noop_services;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let services = noop_services();
+        let mut params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"User-agent: *\nSee https://origin.example.com/"),
+            bytes::Bytes::from_static(b"more\n"),
+        ]));
+        let mut output = Vec::new();
+
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream a text body");
+
+        assert_eq!(
+            String::from_utf8(output).expect("text"),
+            format!(
+                "User-agent: *\nSee https://proxy.example.com/more\n{}",
+                fixture::TEXT_LINE
+            ),
+            "should move the origin's address and then run the entry's middleware"
+        );
+    }
+
+    #[test]
+    fn a_text_body_no_entry_covers_is_left_as_it_was() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: Some("/elsewhere/".to_owned()),
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+
+        let output = text_body_through_the_publisher(&settings, "plain\n");
+
+        assert_eq!(
+            output, "plain\n",
+            "should run nothing on a path the entry does not cover"
+        );
     }
 
     #[test]
